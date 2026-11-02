@@ -1,0 +1,2607 @@
+diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
+index 423b8cc..191b8d7 100644
+--- a/apps/web/Dockerfile
++++ b/apps/web/Dockerfile
+@@ -94,6 +94,13 @@ RUN bun build apps/web/scripts/fleet-migrator.ts \
+     --bundle \
+     --outfile=/tmp/fleet-migrator.mjs
+ 
++# The support-erasure command (iPLAYCAFE overlay), bundled the same way: an
++# operator runs it in the container for one person's erasure request.
++RUN bun build apps/web/scripts/support-erase.ts \
++    --target=bun \
++    --bundle \
++    --outfile=/tmp/support-erase.mjs
++
+ # ============================================================================
+ # Production runner
+ # ============================================================================
+@@ -116,6 +123,7 @@ COPY --from=builder --chown=quackback:nodejs /app/apps/web/.output ./.output
+ COPY --from=builder --chown=quackback:nodejs /tmp/migrate.mjs ./migrate.mjs
+ COPY --from=builder --chown=quackback:nodejs /tmp/seed.mjs ./seed.mjs
+ COPY --from=builder --chown=quackback:nodejs /tmp/fleet-migrator.mjs ./fleet-migrator.mjs
++COPY --from=builder --chown=quackback:nodejs /tmp/support-erase.mjs ./support-erase.mjs
+ COPY --from=builder --chown=quackback:nodejs /app/packages/db/drizzle ./drizzle
+ 
+ # Copy entrypoint script
+diff --git a/apps/web/scripts/support-erase.ts b/apps/web/scripts/support-erase.ts
+new file mode 100644
+index 0000000..a13446f
+--- /dev/null
++++ b/apps/web/scripts/support-erase.ts
+@@ -0,0 +1,105 @@
++/**
++ * `support-erase` — erase one person's support data (iPLAYCAFE overlay).
++ *
++ * ```
++ * bun /app/support-erase.mjs plan  --external-id <sub> [--email <address>] [--delete-posts] [--include-removed-threads]
++ * bun /app/support-erase.mjs apply <the same selector and flags> --token <plan token>
++ * ```
++ *
++ * `plan` reads only and prints counts plus the token; `apply` erases only when
++ * the token still matches (see support-erasure.ts). Output is counts, the
++ * token and refusal or error classes, never content, names or addresses.
++ * Single-workspace installs only.
++ *
++ * Exit codes: 0 done, 1 refused or failed, 2 the invocation was wrong.
++ */
++import {
++  applySupportErasure,
++  planSupportErasure,
++  SupportErasureRefused,
++} from '@/lib/server/domains/conversation/support-erasure'
++import {
++  normaliseSelector,
++  type SupportErasureSelector,
++} from '@/lib/server/domains/conversation/support-data'
++
++const USAGE =
++  'support-erase <plan|apply> --external-id <sub> | --email <address> ' +
++  '[--delete-posts] [--include-removed-threads] [--token <token>]'
++const FLAGS = ['delete-posts', 'include-removed-threads']
++const VALUES = ['external-id', 'email', 'token']
++
++function parse(argv: string[]) {
++  const [command, ...rest] = argv
++  if (command !== 'plan' && command !== 'apply') throw new Error('command must be plan or apply')
++  const opts: Record<string, string | true> = {}
++  for (let i = 0; i < rest.length; i += 1) {
++    const arg = rest[i]!
++    if (!arg.startsWith('--')) throw new Error(`unexpected argument ${arg}`)
++    const name = arg.slice(2)
++    if (name in opts) throw new Error(`--${name} given twice`)
++    if (FLAGS.includes(name)) {
++      opts[name] = true
++    } else if (VALUES.includes(name)) {
++      const value = rest[i + 1]
++      if (value === undefined || value.startsWith('--')) throw new Error(`--${name} needs a value`)
++      opts[name] = value
++      i += 1
++    } else {
++      throw new Error(`unknown option --${name}`)
++    }
++  }
++  const selector: SupportErasureSelector = {
++    externalId: typeof opts['external-id'] === 'string' ? opts['external-id'] : undefined,
++    email: typeof opts.email === 'string' ? opts.email : undefined,
++    deletePosts: opts['delete-posts'] === true,
++    includeRemovedThreads: opts['include-removed-threads'] === true,
++  }
++  normaliseSelector(selector) // throws on an empty or malformed selector
++  const token = typeof opts.token === 'string' ? opts.token.trim() : undefined
++  if (command === 'apply' && !token) throw new Error('apply needs --token from a plan')
++  if (command === 'plan' && token) throw new Error('plan takes no --token')
++  return { command, selector, token }
++}
++
++async function main(): Promise<number> {
++  if (process.env.QUACKBACK_TENANCY === 'pooled') {
++    console.error(JSON.stringify({ refused: 'pooled tenancy is not supported' }))
++    return 2
++  }
++  let parsed
++  try {
++    parsed = parse(process.argv.slice(2))
++  } catch (err) {
++    console.error(`${(err as Error).message}\n${USAGE}`)
++    return 2
++  }
++  try {
++    const plan =
++      parsed.command === 'plan'
++        ? await planSupportErasure(parsed.selector)
++        : await applySupportErasure(parsed.selector, parsed.token!)
++    console.log(JSON.stringify({ command: parsed.command, ...plan }, null, 2))
++    return plan.refused && parsed.command === 'plan' ? 1 : 0
++  } catch (err) {
++    if (err instanceof SupportErasureRefused) {
++      console.error(JSON.stringify({ command: parsed.command, refused: err.message }))
++      return 1
++    }
++    // The class and a Postgres error code at most: messages can quote row data.
++    const code = (err as { code?: unknown }).code
++    console.error(
++      JSON.stringify({
++        command: parsed.command,
++        failed: (err as Error).name,
++        code: typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : undefined,
++      })
++    )
++    return 1
++  }
++}
++
++main().then(
++  (code) => process.exit(code),
++  () => process.exit(1)
++)
+diff --git a/apps/web/src/lib/server/domains/conversation/__tests__/conversation-support-retention.test.ts b/apps/web/src/lib/server/domains/conversation/__tests__/conversation-support-retention.test.ts
+new file mode 100644
+index 0000000..5afa2b0
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/__tests__/conversation-support-retention.test.ts
+@@ -0,0 +1,603 @@
++/**
++ * Real-DB coverage for the support retention sweep: what each rule deletes,
++ * what it must keep (open, snoozed, reopened, held, back-office, a ticket
++ * still in progress), and that the files it orphans are then removed by the
++ * native file-retention sweep. Storage is the only double.
++ */
++import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest'
++import { createDbTestFixture, testDb } from '@/lib/server/__tests__/db-test-fixture'
++import {
++  conversationMessages,
++  conversations,
++  conversationTagAssignments,
++  conversationTags,
++  eq,
++  files,
++  principal,
++  ticketConversations,
++  tickets,
++  ticketStatuses,
++} from '@/lib/server/db'
++import type { ConversationAttachment } from '@/lib/server/db'
++import type { ConversationId, FileId, PrincipalId, TicketId } from '@quackback/ids'
++
++vi.mock('@/lib/server/db', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/lib/server/db')>()),
++  db: (await import('@/lib/server/__tests__/db-test-fixture')).testDb,
++}))
++
++const deleted: string[] = []
++const failingKeys = new Set<string>()
++vi.mock('@/lib/server/storage/s3', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/lib/server/storage/s3')>()),
++  deleteObject: vi.fn(async (key: string) => {
++    if (failingKeys.has(key)) throw new Error(`storage unavailable for ${key}`)
++    deleted.push(key)
++  }),
++}))
++
++import {
++  readSupportRetentionPolicy,
++  supportRetentionConfigured,
++  sweepSupportRetention,
++  SupportRetentionConfigError,
++  type SupportRetentionPolicy,
++} from '../conversation.support-retention'
++import { runSupportRetention, supportRetentionEnabled } from '../support-retention-queue'
++import { sweepFileRetention } from '@/lib/server/domains/files/files.retention'
++
++const fixture = await createDbTestFixture({
++  probe: async (db) => {
++    await db.select({ id: files.id }).from(files).limit(0)
++    await db.select({ id: tickets.id }).from(tickets).limit(0)
++  },
++})
++
++const DAY = 86_400_000
++const NOW = new Date('2027-03-01T04:10:00Z')
++const ago = (days: number) => new Date(NOW.getTime() - days * DAY)
++const POLICY: SupportRetentionPolicy = { closedDays: 90, idleDays: 365, holdTag: 'retention-hold' }
++
++let seq = 0
++async function visitor() {
++  const [p] = await testDb
++    .insert(principal)
++    .values({ role: 'user', type: 'anonymous', createdAt: ago(800) })
++    .returning()
++  return p!.id as PrincipalId
++}
++
++async function conversation(values: Partial<typeof conversations.$inferInsert> = {}) {
++  const [c] = await testDb
++    .insert(conversations)
++    .values({
++      visitorPrincipalId: await visitor(),
++      channel: 'messenger',
++      status: 'closed',
++      resolvedAt: ago(120),
++      lastMessageAt: ago(120),
++      createdAt: ago(130),
++      updatedAt: ago(120),
++      ...values,
++    })
++    .returning()
++  return c!
++}
++
++async function status(category: 'open' | 'pending' | 'closed') {
++  seq += 1
++  const [s] = await testDb
++    .insert(ticketStatuses)
++    .values({ name: `s${seq}`, slug: `support-retention-${category}-${seq}`, category })
++    .returning()
++  return s!.id
++}
++
++async function ticket(
++  category: 'open' | 'pending' | 'closed',
++  values: Partial<typeof tickets.$inferInsert> = {}
++) {
++  const [t] = await testDb
++    .insert(tickets)
++    .values({
++      title: 'report',
++      statusId: await status(category),
++      type: 'customer',
++      resolvedAt: category === 'closed' ? ago(120) : null,
++      createdAt: ago(130),
++      updatedAt: ago(120),
++      ...values,
++    })
++    .returning()
++  return t!
++}
++
++async function link(ticketId: TicketId, conversationId: ConversationId, ticketType = 'customer') {
++  await testDb
++    .insert(ticketConversations)
++    .values({ ticketId, conversationId, ticketType: ticketType as 'customer' })
++}
++
++async function message(
++  parent: { conversationId?: ConversationId; ticketId?: TicketId },
++  values: Partial<typeof conversationMessages.$inferInsert> = {}
++) {
++  const [m] = await testDb
++    .insert(conversationMessages)
++    .values({
++      ...parent,
++      principalId: null,
++      senderType: 'system',
++      content: 'screenshot attached',
++      createdAt: ago(125),
++      ...values,
++    })
++    .returning()
++  return m!
++}
++
++async function attachedFile(messageId: string) {
++  seq += 1
++  const [f] = await testDb
++    .insert(files)
++    .values({
++      storageKey: `files/2026/11/support-${seq}.png`,
++      name: `shot-${seq}.png`,
++      contentType: 'image/png',
++      family: 'image',
++      size: 10,
++      sha256: 'b'.repeat(64),
++      source: 'visitor',
++      messageId: messageId as typeof files.$inferInsert.messageId,
++      attachedAt: ago(125),
++      createdAt: ago(125),
++    })
++    .returning()
++  return f!
++}
++
++const attachmentFor = (id: FileId): ConversationAttachment => ({
++  url: '/api/storage/files/x.png',
++  name: 'x.png',
++  contentType: 'image/png',
++  size: 10,
++  fileId: id,
++  family: 'image',
++})
++
++async function hold(conversationId: ConversationId, deletedAt: Date | null = null) {
++  // The hold is matched by name; each test runs in its own rolled-back transaction.
++  const [tag] = await testDb
++    .insert(conversationTags)
++    .values({ name: POLICY.holdTag, deletedAt })
++    .returning()
++  await testDb
++    .insert(conversationTagAssignments)
++    .values({ conversationId, conversationTagId: tag!.id })
++}
++
++const exists = async (table: typeof conversations | typeof tickets | typeof files, id: string) =>
++  (
++    await testDb
++      .select({ id: table.id })
++      .from(table)
++      .where(eq(table.id, id as never))
++  ).length === 1
++const messageExists = async (id: string) =>
++  (
++    await testDb
++      .select({ id: conversationMessages.id })
++      .from(conversationMessages)
++      .where(eq(conversationMessages.id, id as never))
++  ).length === 1
++
++const sweep = (policy: SupportRetentionPolicy = POLICY) =>
++  sweepSupportRetention(policy, { now: NOW })
++
++describe('support retention policy (no database)', () => {
++  it('is inert while the window is unset', () => {
++    expect(supportRetentionConfigured({})).toBe(false)
++    expect(readSupportRetentionPolicy({})).toBeNull()
++    expect(readSupportRetentionPolicy({ SUPPORT_RETENTION_CLOSED_DAYS: '  ' })).toBeNull()
++  })
++
++  it('reads the window, the idle window and the hold tag', () => {
++    expect(
++      readSupportRetentionPolicy({
++        SUPPORT_RETENTION_CLOSED_DAYS: '90',
++        SUPPORT_RETENTION_IDLE_DAYS: '365',
++        SUPPORT_RETENTION_HOLD_TAG: 'legal-hold',
++      })
++    ).toEqual({ closedDays: 90, idleDays: 365, holdTag: 'legal-hold' })
++    expect(readSupportRetentionPolicy({ SUPPORT_RETENTION_CLOSED_DAYS: '90' })).toEqual({
++      closedDays: 90,
++      idleDays: null,
++      holdTag: 'retention-hold',
++    })
++  })
++
++  it.each([
++    [{ SUPPORT_RETENTION_CLOSED_DAYS: '90d' }],
++    [{ SUPPORT_RETENTION_CLOSED_DAYS: '29' }],
++    [{ SUPPORT_RETENTION_CLOSED_DAYS: '3651' }],
++    [{ SUPPORT_RETENTION_CLOSED_DAYS: '-90' }],
++    [{ SUPPORT_RETENTION_CLOSED_DAYS: '90', SUPPORT_RETENTION_IDLE_DAYS: '60' }],
++    [{ SUPPORT_RETENTION_CLOSED_DAYS: '90', SUPPORT_RETENTION_IDLE_DAYS: 'year' }],
++    // An idle window or a hold tag set without the closed window is incomplete, never inert.
++    [{ SUPPORT_RETENTION_IDLE_DAYS: '365' }],
++    [{ SUPPORT_RETENTION_HOLD_TAG: 'legal-hold' }],
++  ])('refuses a malformed window loudly: %j', (env) => {
++    expect(supportRetentionConfigured(env)).toBe(true)
++    expect(() => readSupportRetentionPolicy(env)).toThrow(SupportRetentionConfigError)
++  })
++
++  it('arms the cron once the window is set, even when it is malformed, and fails that job terminally', async () => {
++    const previous = process.env.SUPPORT_RETENTION_CLOSED_DAYS
++    try {
++      delete process.env.SUPPORT_RETENTION_CLOSED_DAYS
++      expect(await supportRetentionEnabled()).toBe(false)
++      process.env.SUPPORT_RETENTION_CLOSED_DAYS = 'ninety'
++      expect(await supportRetentionEnabled()).toBe(true)
++      await expect(runSupportRetention()).rejects.toMatchObject({ name: 'TerminalJobError' })
++    } finally {
++      if (previous === undefined) delete process.env.SUPPORT_RETENTION_CLOSED_DAYS
++      else process.env.SUPPORT_RETENTION_CLOSED_DAYS = previous
++    }
++  })
++})
++
++describe.skipIf(!fixture.available)('support retention sweep (real DB, rolled back)', () => {
++  beforeEach(async () => {
++    await fixture.begin()
++    deleted.length = 0
++    failingKeys.clear()
++  })
++  afterEach(fixture.rollback)
++  afterAll(fixture.close)
++
++  it('deletes a conversation closed past the window, with its paired ticket and every message', async () => {
++    const c = await conversation()
++    const t = await ticket('closed')
++    await link(t.id, c.id)
++    const inConversation = await message({ conversationId: c.id })
++    const inTicket = await message({ ticketId: t.id })
++
++    const result = await sweep()
++
++    expect(result).toMatchObject({ conversations: 1, tickets: 1, truncated: false })
++    expect(await exists(conversations, c.id)).toBe(false)
++    expect(await exists(tickets, t.id)).toBe(false)
++    expect(await messageExists(inConversation.id)).toBe(false)
++    expect(await messageExists(inTicket.id)).toBe(false)
++  })
++
++  it('keeps open, snoozed and recently closed conversations', async () => {
++    const open = await conversation({ status: 'open', resolvedAt: null })
++    const snoozed = await conversation({ status: 'snoozed', resolvedAt: null })
++    const recent = await conversation({ resolvedAt: ago(30), lastMessageAt: ago(30) })
++    // Closed long ago but answered recently (closed again after a late reply).
++    const lateReply = await conversation({ resolvedAt: ago(200), lastMessageAt: ago(10) })
++
++    const result = await sweep()
++
++    expect(result.conversations).toBe(0)
++    for (const c of [open, snoozed, recent, lateReply])
++      expect(await exists(conversations, c.id)).toBe(true)
++  })
++
++  it('a conversation reopened before the run is kept even with an old resolved_at', async () => {
++    const reopened = await conversation({
++      status: 'open',
++      resolvedAt: ago(200),
++      lastMessageAt: ago(200),
++    })
++    expect((await sweep({ ...POLICY, idleDays: null })).conversations).toBe(0)
++    expect(await exists(conversations, reopened.id)).toBe(true)
++  })
++
++  it('a held conversation is kept with its tickets and deleted messages, whatever its age; a deleted hold tag still holds', async () => {
++    const held = await conversation({
++      resolvedAt: ago(900),
++      lastMessageAt: ago(900),
++      updatedAt: ago(900),
++    })
++    const t = await ticket('closed', {
++      resolvedAt: ago(900),
++      updatedAt: ago(900),
++      deletedAt: ago(800),
++    })
++    await link(t.id, held.id)
++    const gone = await message({ conversationId: held.id }, { deletedAt: ago(800) })
++    await hold(held.id, new Date())
++
++    const result = await sweep()
++
++    expect(result).toMatchObject({ conversations: 0, tickets: 0, messages: 0 })
++    expect(await exists(conversations, held.id)).toBe(true)
++    expect(await exists(tickets, t.id)).toBe(true)
++    expect(await messageExists(gone.id)).toBe(true)
++  })
++
++  it('a paired ticket still in progress keeps the whole conversation', async () => {
++    const c = await conversation()
++    const t = await ticket('open')
++    await link(t.id, c.id)
++
++    expect((await sweep()).conversations).toBe(0)
++    expect(await exists(conversations, c.id)).toBe(true)
++    expect(await exists(tickets, t.id)).toBe(true)
++  })
++
++  it('a ticket closed only recently keeps the conversation too', async () => {
++    const c = await conversation()
++    const t = await ticket('closed', { resolvedAt: ago(10), updatedAt: ago(10) })
++    await link(t.id, c.id)
++
++    expect((await sweep()).conversations).toBe(0)
++    expect(await exists(conversations, c.id)).toBe(true)
++  })
++
++  it('a back-office ticket linked to the conversation is never deleted; only its link goes', async () => {
++    const c = await conversation()
++    const backOffice = await ticket('open', { type: 'back_office' })
++    await link(backOffice.id, c.id, 'back_office')
++    const note = await message({ ticketId: backOffice.id })
++
++    expect((await sweep()).conversations).toBe(1)
++    expect(await exists(tickets, backOffice.id)).toBe(true)
++    expect(await messageExists(note.id)).toBe(true)
++  })
++
++  it('idle rule: any status past the idle window, unless a snooze timer is still ahead', async () => {
++    const idle = await conversation({
++      status: 'open',
++      resolvedAt: null,
++      lastMessageAt: ago(400),
++      updatedAt: ago(400),
++    })
++    const waking = await conversation({
++      status: 'snoozed',
++      resolvedAt: null,
++      lastMessageAt: ago(400),
++      updatedAt: ago(400),
++      snoozedUntil: new Date(NOW.getTime() + DAY),
++    })
++    const touched = await conversation({
++      status: 'open',
++      resolvedAt: null,
++      lastMessageAt: ago(400),
++      updatedAt: ago(5),
++    })
++
++    expect((await sweep()).conversations).toBe(1)
++    expect(await exists(conversations, idle.id)).toBe(false)
++    expect(await exists(conversations, waking.id)).toBe(true)
++    expect(await exists(conversations, touched.id)).toBe(true)
++    // Without an idle window the open thread stays.
++    const again = await conversation({
++      status: 'open',
++      resolvedAt: null,
++      lastMessageAt: ago(400),
++      updatedAt: ago(400),
++    })
++    expect((await sweep({ ...POLICY, idleDays: null })).conversations).toBe(0)
++    expect(await exists(conversations, again.id)).toBe(true)
++  })
++
++  it('manually filed spam is deleted on the same window', async () => {
++    const spam = await conversation({ endReason: 'spam', spamReason: 'manual' })
++    expect((await sweep()).conversations).toBe(1)
++    expect(await exists(conversations, spam.id)).toBe(false)
++  })
++
++  it('unlinked customer tickets follow the window; soft-deleted tickets go after it even when linked to a live conversation', async () => {
++    const standalone = await ticket('closed')
++    const standaloneRecent = await ticket('closed', { resolvedAt: ago(10), updatedAt: ago(10) })
++    const standaloneOpen = await ticket('open')
++    const live = await conversation({ status: 'open', resolvedAt: null, lastMessageAt: ago(1) })
++    const softDeleted = await ticket('open', { deletedAt: ago(100) })
++    await link(softDeleted.id, live.id)
++    const softRecent = await ticket('open', { deletedAt: ago(10) })
++    const tracker = await ticket('closed', { type: 'tracker' })
++
++    const result = await sweep({ ...POLICY, idleDays: null })
++
++    expect(result.tickets).toBe(2)
++    expect(await exists(tickets, standalone.id)).toBe(false)
++    expect(await exists(tickets, softDeleted.id)).toBe(false)
++    for (const kept of [standaloneRecent, standaloneOpen, softRecent, tracker]) {
++      expect(await exists(tickets, kept.id)).toBe(true)
++    }
++    expect(await exists(conversations, live.id)).toBe(true)
++  })
++
++  it('soft-deleted messages go after the window; their files are then removed by file-retention', async () => {
++    const live = await conversation({ status: 'open', resolvedAt: null, lastMessageAt: ago(1) })
++    const old = await message({ conversationId: live.id }, { deletedAt: ago(100) })
++    const recent = await message({ conversationId: live.id }, { deletedAt: ago(10) })
++    const kept = await message({ conversationId: live.id })
++    const file = await attachedFile(old.id)
++    await testDb
++      .update(conversationMessages)
++      .set({ attachments: [attachmentFor(file.id)] })
++      .where(eq(conversationMessages.id, old.id))
++
++    expect((await sweep()).messages).toBe(1)
++    expect(await messageExists(old.id)).toBe(false)
++    expect(await messageExists(recent.id)).toBe(true)
++    expect(await messageExists(kept.id)).toBe(true)
++
++    const files_ = await sweepFileRetention({ now: NOW })
++    expect(files_.removed).toBe(1)
++    expect(deleted).toContain(file.storageKey)
++  })
++
++  it('an orphaned file another message still carries keeps its bytes', async () => {
++    const c = await conversation()
++    const m = await message({ conversationId: c.id })
++    const file = await attachedFile(m.id)
++    const backOffice = await ticket('open', { type: 'back_office' })
++    await message({ ticketId: backOffice.id }, { attachments: [attachmentFor(file.id)] })
++
++    await sweep()
++    await sweepFileRetention({ now: NOW })
++
++    expect(deleted).not.toContain(file.storageKey)
++    expect(await exists(files, file.id)).toBe(true)
++  })
++
++  it('removes file tombstones past the window, deleting the object again first; a storage failure keeps the row', async () => {
++    seq += 1
++    const insertTombstone = async (deletedAt: Date, key: string) =>
++      (
++        await testDb
++          .insert(files)
++          .values({
++            storageKey: key,
++            name: 'old.png',
++            contentType: 'image/png',
++            family: 'image',
++            size: 1,
++            sha256: 'c'.repeat(64),
++            source: 'visitor',
++            createdAt: ago(300),
++            deletedAt,
++          })
++          .returning()
++      )[0]!
++    const old = await insertTombstone(ago(100), `files/2026/10/tomb-${seq}.png`)
++    const recent = await insertTombstone(ago(10), `files/2026/10/tomb-${seq}-r.png`)
++    const failing = await insertTombstone(ago(100), `files/2026/10/tomb-${seq}-f.png`)
++    const foreign = await insertTombstone(ago(100), `avatars/tomb-${seq}.png`)
++    failingKeys.add(failing.storageKey)
++
++    const result = await sweep()
++
++    expect(result.fileTombstones).toBe(1)
++    expect(deleted).toContain(old.storageKey)
++    expect(await exists(files, old.id)).toBe(false)
++    expect(await exists(files, recent.id)).toBe(true)
++    expect(await exists(files, failing.id)).toBe(true)
++    expect(await exists(files, foreign.id)).toBe(true)
++    expect(deleted).not.toContain(foreign.storageKey)
++  })
++
++  it('pages past conversations an open ticket blocks, so later ones in the same run still go', async () => {
++    const blockedTickets: string[] = []
++    for (let i = 0; i < 3; i += 1) {
++      const c = await conversation()
++      const t = await ticket('open')
++      await link(t.id, c.id)
++      blockedTickets.push(t.id)
++    }
++    const doomed = [await conversation(), await conversation()]
++
++    const result = await sweepSupportRetention(POLICY, { now: NOW, batchSize: 2 })
++
++    expect(result.conversations).toBe(2)
++    for (const c of doomed) expect(await exists(conversations, c.id)).toBe(false)
++  })
++
++  it('is idempotent: a second run deletes nothing', async () => {
++    await conversation()
++    await sweep()
++    expect(await sweep()).toMatchObject({
++      conversations: 0,
++      tickets: 0,
++      messages: 0,
++      fileTombstones: 0,
++    })
++  })
++
++  it('a note, a system event or an edit after the close restarts the clock', async () => {
++    const noted = await conversation()
++    await message(
++      { conversationId: noted.id },
++      { isInternal: true, senderType: 'agent', createdAt: ago(1) }
++    )
++    const evented = await conversation()
++    await message({ conversationId: evented.id }, { createdAt: ago(2) })
++    const edited = await conversation({ updatedAt: ago(3) })
++    const old = await conversation()
++
++    const result = await sweep({ ...POLICY, idleDays: null })
++
++    expect(result.conversations).toBe(1)
++    expect(await exists(conversations, old.id)).toBe(false)
++    for (const kept of [noted, evented, edited])
++      expect(await exists(conversations, kept.id)).toBe(true)
++  })
++
++  it('the hold tag is matched without letter case', async () => {
++    const held = await conversation()
++    const [tag] = await testDb
++      .insert(conversationTags)
++      .values({ name: 'Retention-HOLD' })
++      .returning()
++    await testDb
++      .insert(conversationTagAssignments)
++      .values({ conversationId: held.id, conversationTagId: tag!.id })
++
++    expect((await sweep()).conversations).toBe(0)
++    expect(await exists(conversations, held.id)).toBe(true)
++    expect((await sweep({ ...POLICY, holdTag: 'RETENTION-hold' })).conversations).toBe(0)
++  })
++
++  it('idle rule follows the owner rule: an open ticket untouched past the idle window goes with its thread', async () => {
++    const c = await conversation({
++      status: 'open',
++      resolvedAt: null,
++      lastMessageAt: ago(400),
++      updatedAt: ago(400),
++    })
++    const t = await ticket('open', { updatedAt: ago(400), resolvedAt: null })
++    await link(t.id, c.id)
++
++    expect(await sweep()).toMatchObject({ conversations: 1, tickets: 1 })
++    expect(await exists(tickets, t.id)).toBe(false)
++  })
++
++  it('deletes inline images no other message names; keeps a shared one; a storage failure keeps the thread', async () => {
++    const c = await conversation()
++    await message(
++      { conversationId: c.id },
++      {
++        content:
++          'see ![x](/api/storage/chat-images/2026/11/inline-a.png?read=abc) and https://feedback.example/api/storage/widget-images/w-1.png',
++      }
++    )
++    const shared = await conversation()
++    await message(
++      { conversationId: shared.id },
++      { content: 'pasted /api/storage/chat-images/2026/11/shared.png' }
++    )
++    const live = await conversation({ status: 'open', resolvedAt: null, lastMessageAt: ago(1) })
++    await message(
++      { conversationId: live.id },
++      { content: 'again /api/storage/chat-images/2026/11/shared.png' }
++    )
++    const failing = await conversation()
++    await message(
++      { conversationId: failing.id },
++      { content: '/api/storage/chat-images/2026/11/fails.png' }
++    )
++    failingKeys.add('chat-images/2026/11/fails.png')
++
++    const result = await sweep({ ...POLICY, idleDays: null })
++
++    expect(deleted).toEqual(
++      expect.arrayContaining(['chat-images/2026/11/inline-a.png', 'widget-images/w-1.png'])
++    )
++    expect(deleted).not.toContain('chat-images/2026/11/shared.png')
++    expect(result.inlineImages).toBe(2)
++    expect(await exists(conversations, c.id)).toBe(false)
++    expect(await exists(conversations, shared.id)).toBe(false)
++    expect(await exists(conversations, failing.id)).toBe(true)
++  })
++
++  it('stops when the time budget is spent and says so', async () => {
++    await conversation()
++    const result = await sweepSupportRetention(POLICY, { now: NOW, budgetMs: -1 })
++    expect(result).toMatchObject({ conversations: 0, truncated: true })
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/conversation/__tests__/support-erasure.test.ts b/apps/web/src/lib/server/domains/conversation/__tests__/support-erasure.test.ts
+new file mode 100644
+index 0000000..0dc8e89
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/__tests__/support-erasure.test.ts
+@@ -0,0 +1,581 @@
++/**
++ * Real-DB coverage for one person's support erasure: plan reads only, apply
++ * erases exactly the planned set and refuses a stale token, a storage failure
++ * changes no row, and another person's data, shared files and the team stay.
++ * Each case below was a confirmed review finding (2026-10-20) before the fix.
++ */
++import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest'
++import { createDbTestFixture, testDb } from '@/lib/server/__tests__/db-test-fixture'
++import {
++  boards,
++  channelIdentities,
++  conversationMessages,
++  conversations,
++  emailLog,
++  eq,
++  files,
++  inAppNotifications,
++  postComments,
++  posts,
++  principal,
++  ticketConversations,
++  tickets,
++  ticketStatuses,
++  user,
++} from '@/lib/server/db'
++import { createId, type ConversationId, type PrincipalId } from '@quackback/ids'
++
++vi.mock('@/lib/server/db', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/lib/server/db')>()),
++  db: (await import('@/lib/server/__tests__/db-test-fixture')).testDb,
++}))
++
++const deleted: string[] = []
++const failingKeys = new Set<string>()
++vi.mock('@/lib/server/storage/s3', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/lib/server/storage/s3')>()),
++  deleteObject: vi.fn(async (key: string) => {
++    if (failingKeys.has(key)) throw new Error(`storage unavailable for ${key}`)
++    deleted.push(key)
++  }),
++}))
++vi.mock('@/lib/server/cache', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/lib/server/cache')>()),
++  cacheDel: vi.fn(async () => {}),
++}))
++
++import { applySupportErasure, planSupportErasure, SupportErasureRefused } from '../support-erasure'
++import { DELETED_USER_PRINCIPAL_ID } from '@/lib/server/domains/principals/principal-reattribute'
++import { removePortalUser } from '@/lib/server/domains/users/user.service'
++
++const fixture = await createDbTestFixture({
++  probe: async (db) => {
++    await db.select({ id: files.id }).from(files).limit(0)
++    await db.select({ id: channelIdentities.principalId }).from(channelIdentities).limit(0)
++  },
++})
++
++let seq = 0
++const next = () => (seq += 1)
++
++async function person(opts: { externalId?: string; email?: string; role?: string } = {}) {
++  const n = next()
++  const userId = createId('user')
++  const principalId = createId('principal')
++  await testDb.insert(user).values({
++    id: userId,
++    name: `Person ${n}`,
++    email: opts.email ?? `person-${n}@example.test`,
++    externalId: opts.externalId ?? null,
++    imageKey: `avatars/person-${n}.webp`,
++  })
++  await testDb.insert(principal).values({
++    id: principalId,
++    userId,
++    role: opts.role ?? 'user',
++    type: 'user',
++    displayName: `Person ${n}`,
++    createdAt: new Date(),
++  })
++  return { userId, principalId }
++}
++
++async function anonymous(contactEmail: string | null = null) {
++  const principalId = createId('principal')
++  await testDb.insert(principal).values({
++    id: principalId,
++    role: 'user',
++    type: 'anonymous',
++    contactEmail,
++    createdAt: new Date(),
++  })
++  return principalId
++}
++
++async function file(uploadedById: PrincipalId | null, messageId: string | null) {
++  const n = next()
++  const [f] = await testDb
++    .insert(files)
++    .values({
++      storageKey: `files/2026/10/erase-${n}.png`,
++      name: `erase-${n}.png`,
++      contentType: 'image/png',
++      family: 'image',
++      size: 1,
++      sha256: 'd'.repeat(64),
++      source: 'visitor',
++      uploadedById,
++      messageId: messageId as typeof files.$inferInsert.messageId,
++      attachedAt: new Date(),
++      meta: { thumbKey: `files/2026/10/erase-${n}-thumb.webp` },
++    })
++    .returning()
++  return f!
++}
++
++const attach = (f: { id: string; name: string }) => [
++  {
++    url: '/api/storage/x',
++    name: f.name,
++    contentType: 'image/png',
++    size: 1,
++    fileId: f.id,
++    family: 'image',
++  },
++]
++
++async function say(
++  conversationId: ConversationId,
++  principalId: PrincipalId | null,
++  values: Partial<typeof conversationMessages.$inferInsert> = {}
++) {
++  const [m] = await testDb
++    .insert(conversationMessages)
++    .values({
++      conversationId,
++      principalId,
++      senderType: principalId ? 'visitor' : 'system',
++      content: 'text',
++      ...values,
++    })
++    .returning()
++  return m!
++}
++
++/** A thread with one visitor message carrying an uploaded file. */
++async function thread(
++  visitor: PrincipalId,
++  extra: Partial<typeof conversations.$inferInsert> = {}
++) {
++  const [c] = await testDb
++    .insert(conversations)
++    .values({ visitorPrincipalId: visitor, channel: 'messenger', ...extra })
++    .returning()
++  const m = await say(c!.id, visitor, { content: 'my screenshot' })
++  const f = await file(visitor, m.id)
++  await testDb
++    .update(conversationMessages)
++    .set({ attachments: attach(f) as never })
++    .where(eq(conversationMessages.id, m.id))
++  return { conversation: c!, message: m, file: f }
++}
++
++async function ticketFor(
++  requester: PrincipalId | null,
++  type: 'customer' | 'back_office' = 'customer'
++) {
++  const n = next()
++  const [s] = await testDb
++    .insert(ticketStatuses)
++    .values({ name: `e${n}`, slug: `erase-status-${n}`, category: 'open' })
++    .returning()
++  const [t] = await testDb
++    .insert(tickets)
++    .values({ title: 'report', statusId: s!.id, type, requesterPrincipalId: requester })
++    .returning()
++  return t!
++}
++
++async function feedbackPost(author: PrincipalId, canonicalPostId: string | null = null) {
++  const boardId = createId('board')
++  await testDb.insert(boards).values({ id: boardId, slug: `erase-board-${next()}`, name: 'Bugs' })
++  const postId = createId('post')
++  await testDb.insert(posts).values({
++    id: postId,
++    boardId,
++    title: 'Bug',
++    content: 'details',
++    principalId: author,
++    canonicalPostId: canonicalPostId as typeof posts.$inferInsert.canonicalPostId,
++  })
++  return postId
++}
++
++type Table =
++  | typeof conversations
++  | typeof tickets
++  | typeof files
++  | typeof principal
++  | typeof user
++  | typeof posts
++const count = async (table: Table, id: string) =>
++  (
++    await testDb
++      .select({ id: table.id })
++      .from(table)
++      .where(eq(table.id, id as never))
++  ).length
++const messageCount = async (id: string) =>
++  (
++    await testDb
++      .select({ id: conversationMessages.id })
++      .from(conversationMessages)
++      .where(eq(conversationMessages.id, id as never))
++  ).length
++
++describe.skipIf(!fixture.available)('support erasure (real DB, rolled back)', () => {
++  beforeEach(async () => {
++    await fixture.begin()
++    deleted.length = 0
++    failingKeys.clear()
++  })
++  afterEach(fixture.rollback)
++  afterAll(fixture.close)
++
++  it('plans without changing anything, then erases exactly the planned set', async () => {
++    const subject = await person({ externalId: 'sub-erase-1', email: 'Erase.Me@Example.test' })
++    const mine = await thread(subject.principalId)
++    const paired = await ticketFor(subject.principalId)
++    await testDb.insert(ticketConversations).values({
++      ticketId: paired.id,
++      conversationId: mine.conversation.id,
++      ticketType: 'customer',
++    })
++    const other = await person({ externalId: 'sub-keep' })
++    const theirs = await thread(other.principalId)
++    const agent = await person({ role: 'member' })
++    await say(theirs.conversation.id, agent.principalId, {
++      senderType: 'agent',
++      content: 'agent reply',
++    })
++
++    const plan = await planSupportErasure({ externalId: 'sub-erase-1' })
++    expect(plan).toMatchObject({
++      refused: null,
++      accounts: 1,
++      users: 1,
++      conversations: 1,
++      tickets: 1,
++      messages: 1,
++      files: 1,
++      objects: 3,
++    })
++    expect(deleted).toEqual([])
++
++    await applySupportErasure({ externalId: 'sub-erase-1' }, plan.token)
++
++    const expected = [mine.file.storageKey, mine.file.storageKey.replace('.png', '-thumb.webp')]
++    expect(deleted.filter((k) => k.startsWith('files/')).sort()).toEqual(expected.sort())
++    expect(deleted.filter((k) => k.startsWith('avatars/'))).toHaveLength(1)
++    expect(deleted).toHaveLength(3)
++    expect(await count(conversations, mine.conversation.id)).toBe(0)
++    expect(await count(tickets, paired.id)).toBe(0)
++    expect(await count(files, mine.file.id)).toBe(0)
++    expect(await count(principal, subject.principalId)).toBe(0)
++    expect(await count(user, subject.userId)).toBe(0)
++    expect(await count(conversations, theirs.conversation.id)).toBe(1)
++    expect(await count(files, theirs.file.id)).toBe(1)
++    expect(await count(principal, agent.principalId)).toBe(1)
++  })
++
++  it('never resolves a person by a visitor email someone else typed', async () => {
++    const alice = await person({ email: 'alice@example.test' })
++    const bob = await person({ externalId: 'sub-bob', email: 'bob@example.test' })
++    const typed = await thread(bob.principalId, { visitorEmail: 'alice@example.test' })
++    const unrelated = await thread(bob.principalId)
++
++    const plan = await planSupportErasure({ email: 'alice@example.test' })
++    expect(plan).toMatchObject({ refused: null, accounts: 1, users: 1, conversations: 0 })
++    await applySupportErasure({ email: 'alice@example.test' }, plan.token)
++
++    expect(await count(user, alice.userId)).toBe(0)
++    expect(await count(user, bob.userId)).toBe(1)
++    expect(await count(conversations, typed.conversation.id)).toBe(1)
++    expect(await count(conversations, unrelated.conversation.id)).toBe(1)
++  })
++
++  it("keeps a file another person's thread also carries (an agent's shared upload)", async () => {
++    const subject = await person({ externalId: 'sub-shared' })
++    const other = await person()
++    const agent = await person({ role: 'member' })
++    const theirs = await thread(other.principalId)
++    const guideMessage = await say(theirs.conversation.id, agent.principalId, {
++      senderType: 'agent',
++    })
++    const guide = await file(agent.principalId, guideMessage.id)
++    await testDb
++      .update(conversationMessages)
++      .set({ attachments: attach(guide) as never })
++      .where(eq(conversationMessages.id, guideMessage.id))
++    const mine = await thread(subject.principalId)
++    await say(mine.conversation.id, agent.principalId, {
++      senderType: 'agent',
++      attachments: attach(guide) as never,
++    })
++
++    const plan = await planSupportErasure({ externalId: 'sub-shared' })
++    await applySupportErasure({ externalId: 'sub-shared' }, plan.token)
++
++    expect(await count(files, guide.id)).toBe(1)
++    expect(deleted).not.toContain(guide.storageKey)
++    expect(deleted).toContain(mine.file.storageKey)
++  })
++
++  it('finds what native removal left: the user row by email, and its threads on request', async () => {
++    const erin = await person({ externalId: 'sub-erin', email: 'erin@example.test' })
++    const old = await thread(erin.principalId, { visitorEmail: 'erin@example.test' })
++    await removePortalUser(erin.principalId)
++    const [husk] = await testDb.select().from(user).where(eq(user.id, erin.userId))
++    expect(husk?.email).toBe('erin@example.test')
++
++    const plain = await planSupportErasure({ email: 'erin@example.test' })
++    expect(plain).toMatchObject({ refused: null, users: 1, removedThreads: 1, conversations: 0 })
++    const withThreads = await planSupportErasure({
++      email: 'erin@example.test',
++      includeRemovedThreads: true,
++    })
++    expect(withThreads).toMatchObject({
++      refused: null,
++      users: 1,
++      removedThreads: 1,
++      conversations: 1,
++    })
++    await applySupportErasure(
++      { email: 'erin@example.test', includeRemovedThreads: true },
++      withThreads.token
++    )
++
++    expect(await count(user, erin.userId)).toBe(0)
++    expect(await count(conversations, old.conversation.id)).toBe(0)
++    expect(await count(principal, DELETED_USER_PRINCIPAL_ID)).toBe(1)
++  })
++
++  it("finds a contact-email participant, deletes their reply in another person's thread and clears its preview", async () => {
++    const owner = await person()
++    const shared = await thread(owner.principalId)
++    const cc = await anonymous('cc.person@example.test')
++    const reply = await say(shared.conversation.id, cc, { content: 'my reply as CC' })
++    await testDb
++      .update(conversations)
++      .set({ lastMessagePreview: 'my reply as CC' })
++      .where(eq(conversations.id, shared.conversation.id))
++
++    const plan = await planSupportErasure({ email: 'cc.person@example.test' })
++    expect(plan).toMatchObject({ refused: null, contacts: 1, messages: 1, conversations: 0 })
++    await applySupportErasure({ email: 'cc.person@example.test' }, plan.token)
++
++    expect(await messageCount(reply.id)).toBe(0)
++    expect(await count(principal, cc)).toBe(0)
++    const [after] = await testDb
++      .select()
++      .from(conversations)
++      .where(eq(conversations.id, shared.conversation.id))
++    expect(after?.lastMessagePreview).toBeNull()
++    expect(await messageCount(shared.message.id)).toBe(1)
++  })
++
++  it('deletes mail-log rows by address (also "Name <address>") and by thread', async () => {
++    const subject = await person({ externalId: 'sub-mail', email: 'dana@example.test' })
++    const mine = await thread(subject.principalId)
++    const base = { direction: 'inbound', emailType: 'reply', status: 'received' }
++    await testDb.insert(emailLog).values([
++      { ...base, address: 'Dana Example <dana@example.test>', subject: 'Help' },
++      { ...base, address: 'DANA@example.test', subject: 'Help again' },
++      {
++        ...base,
++        direction: 'outbound',
++        address: 'agent@example.test',
++        subject: 'Re',
++        conversationId: mine.conversation.id,
++      },
++      { ...base, address: 'someone@example.test', subject: 'Unrelated' },
++    ])
++
++    const plan = await planSupportErasure({ externalId: 'sub-mail' })
++    expect(plan.emailLog).toBe(3)
++    await applySupportErasure({ externalId: 'sub-mail' }, plan.token)
++
++    const left = await testDb.select({ address: emailLog.address }).from(emailLog)
++    expect(left.map((r) => r.address)).toEqual(['someone@example.test'])
++  })
++
++  it('deletes inline images only it names, its back-office tickets and teammates’ notifications', async () => {
++    const subject = await person({ externalId: 'sub-inline' })
++    const mine = await thread(subject.principalId)
++    await say(mine.conversation.id, subject.principalId, {
++      content:
++        'pasted /api/storage/chat-images/2026/10/mine.png and /api/storage/chat-images/2026/10/shared.png',
++    })
++    const other = await person()
++    const theirs = await thread(other.principalId)
++    await say(theirs.conversation.id, other.principalId, {
++      content: '/api/storage/chat-images/2026/10/shared.png',
++    })
++    const requested = await ticketFor(subject.principalId, 'back_office')
++    const teamOnly = await ticketFor(null, 'back_office')
++    await testDb.insert(ticketConversations).values({
++      ticketId: teamOnly.id,
++      conversationId: mine.conversation.id,
++      ticketType: 'back_office',
++    })
++    const agent = await person({ role: 'member' })
++    await testDb.insert(inAppNotifications).values({
++      principalId: agent.principalId,
++      type: 'conversation_reply',
++      title: 'Person replied',
++      body: 'preview of the reply',
++      metadata: { conversationId: mine.conversation.id },
++    })
++
++    const plan = await planSupportErasure({ externalId: 'sub-inline' })
++    await applySupportErasure({ externalId: 'sub-inline' }, plan.token)
++
++    expect(deleted).toContain('chat-images/2026/10/mine.png')
++    expect(deleted).not.toContain('chat-images/2026/10/shared.png')
++    expect(await count(tickets, requested.id)).toBe(0)
++    expect(await count(tickets, teamOnly.id)).toBe(1)
++    expect(
++      await testDb
++        .select()
++        .from(inAppNotifications)
++        .where(eq(inAppNotifications.principalId, agent.principalId))
++    ).toHaveLength(0)
++  })
++
++  it('never erases a signed-in person who typed the address as their contact email', async () => {
++    const victim = await person({ externalId: 'sub-victim', email: 'victim@example.test' })
++    await thread(victim.principalId)
++    const typist = await person({ externalId: 'sub-typist', email: 'typist@example.test' })
++    await testDb
++      .update(principal)
++      .set({ contactEmail: 'victim@example.test' })
++      .where(eq(principal.id, typist.principalId))
++    const typistThread = await thread(typist.principalId)
++
++    const plan = await planSupportErasure({
++      externalId: 'sub-victim',
++      email: 'victim@example.test',
++    })
++    expect(plan).toMatchObject({
++      refused: null,
++      accounts: 1,
++      contacts: 0,
++      conversations: 1,
++      otherAccountsSkipped: 1,
++    })
++    await applySupportErasure(
++      { externalId: 'sub-victim', email: 'victim@example.test' },
++      plan.token
++    )
++
++    expect(await count(principal, typist.principalId)).toBe(1)
++    expect(await count(conversations, typistThread.conversation.id)).toBe(1)
++    expect(deleted).not.toContain(typistThread.file.storageKey)
++  })
++
++  it('refuses an email that belongs to another account than the external id', async () => {
++    await person({ externalId: 'sub-a' })
++    const b = await person({ email: 'b@example.test' })
++    const plan = await planSupportErasure({ externalId: 'sub-a', email: 'b@example.test' })
++    expect(plan.refused).toMatch(/different account/)
++    await expect(
++      applySupportErasure({ externalId: 'sub-a', email: 'b@example.test' }, plan.token)
++    ).rejects.toBeInstanceOf(SupportErasureRefused)
++    expect(await count(user, b.userId)).toBe(1)
++    // The same account by both selectors is fine.
++    await person({ externalId: 'sub-c', email: 'c@example.test' })
++    expect(
++      (await planSupportErasure({ externalId: 'sub-c', email: 'c@example.test' })).refused
++    ).toBeNull()
++  })
++
++  it('refuses a stale token: a message that arrived after the plan is never erased unseen', async () => {
++    const subject = await person({ externalId: 'sub-stale' })
++    const mine = await thread(subject.principalId)
++    const plan = await planSupportErasure({ externalId: 'sub-stale' })
++    await say(mine.conversation.id, subject.principalId, { content: 'one more thing' })
++
++    await expect(
++      applySupportErasure({ externalId: 'sub-stale' }, plan.token)
++    ).rejects.toBeInstanceOf(SupportErasureRefused)
++    expect(deleted).toEqual([])
++    expect(await count(conversations, mine.conversation.id)).toBe(1)
++  })
++
++  it('a storage failure changes no row; a re-plan and apply completes', async () => {
++    const subject = await person({ externalId: 'sub-storage' })
++    const mine = await thread(subject.principalId)
++    failingKeys.add(mine.file.storageKey)
++    const plan = await planSupportErasure({ externalId: 'sub-storage' })
++
++    await expect(applySupportErasure({ externalId: 'sub-storage' }, plan.token)).rejects.toThrow(
++      /storage unavailable/
++    )
++    expect(await count(conversations, mine.conversation.id)).toBe(1)
++    expect(await count(files, mine.file.id)).toBe(1)
++    expect(await count(user, subject.userId)).toBe(1)
++
++    failingKeys.clear()
++    const again = await planSupportErasure({ externalId: 'sub-storage' })
++    expect(again.token).toBe(plan.token)
++    await applySupportErasure({ externalId: 'sub-storage' }, again.token)
++    expect(await count(conversations, mine.conversation.id)).toBe(0)
++  })
++
++  it('refuses a team principal, an unknown person and a malformed selector', async () => {
++    await person({ externalId: 'sub-agent', role: 'admin' })
++    const plan = await planSupportErasure({ externalId: 'sub-agent' })
++    expect(plan.refused).toMatch(/team principal/)
++    await expect(
++      applySupportErasure({ externalId: 'sub-agent' }, plan.token)
++    ).rejects.toBeInstanceOf(SupportErasureRefused)
++    expect((await planSupportErasure({ externalId: 'nobody' })).refused).toBe('no matching person')
++    await expect(planSupportErasure({})).rejects.toThrow(/external id or an email/)
++    await expect(planSupportErasure({ email: '   ' })).rejects.toThrow(/external id or an email/)
++    await expect(planSupportErasure({ email: 'not an email' })).rejects.toThrow(/malformed/)
++  })
++
++  it('re-attributes posts and comments by default; deletes posts on request without hiding merged duplicates', async () => {
++    const subject = await person({ externalId: 'sub-posts' })
++    const postId = await feedbackPost(subject.principalId)
++    const otherAuthor = await person()
++    const otherPost = await feedbackPost(otherAuthor.principalId)
++    const [comment] = await testDb
++      .insert(postComments)
++      .values({ postId: otherPost, principalId: subject.principalId, content: 'me too' })
++      .returning()
++
++    const plan = await planSupportErasure({ externalId: 'sub-posts' })
++    expect(plan.posts).toBe(0)
++    await applySupportErasure({ externalId: 'sub-posts' }, plan.token)
++    const [kept] = await testDb
++      .select({ principalId: posts.principalId })
++      .from(posts)
++      .where(eq(posts.id, postId))
++    expect(kept!.principalId).toBe(DELETED_USER_PRINCIPAL_ID)
++    const [movedComment] = await testDb
++      .select({ principalId: postComments.principalId })
++      .from(postComments)
++      .where(eq(postComments.id, comment!.id))
++    expect(movedComment!.principalId).toBe(DELETED_USER_PRINCIPAL_ID)
++
++    const second = await person({ externalId: 'sub-posts-delete' })
++    const canonical = await feedbackPost(second.principalId)
++    const duplicate = await feedbackPost(otherAuthor.principalId, canonical)
++    const withPosts = await planSupportErasure({
++      externalId: 'sub-posts-delete',
++      deletePosts: true,
++    })
++    expect(withPosts.posts).toBe(1)
++    await applySupportErasure(
++      { externalId: 'sub-posts-delete', deletePosts: true },
++      withPosts.token
++    )
++    expect(await count(posts, canonical)).toBe(0)
++    const [dup] = await testDb
++      .select({ c: posts.canonicalPostId })
++      .from(posts)
++      .where(eq(posts.id, duplicate))
++    expect(dup!.c).toBeNull()
++  })
++
++  it('is complete: by email, nothing of the person is left to plan afterwards', async () => {
++    const subject = await person({ externalId: 'sub-twice', email: 'twice@example.test' })
++    await thread(subject.principalId)
++    const plan = await planSupportErasure({ email: 'twice@example.test' })
++    await applySupportErasure({ email: 'twice@example.test' }, plan.token)
++    expect((await planSupportErasure({ email: 'twice@example.test' })).refused).toBe(
++      'no matching person'
++    )
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/conversation/conversation.support-retention.ts b/apps/web/src/lib/server/domains/conversation/conversation.support-retention.ts
+new file mode 100644
+index 0000000..c5ac41b
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/conversation.support-retention.ts
+@@ -0,0 +1,493 @@
++/**
++ * Support retention: permanently deletes support conversations, customer
++ * tickets and soft-deleted messages once a workspace-chosen window has passed,
++ * so a published retention period is something the software keeps rather than
++ * a promise someone has to remember.
++ *
++ * OFF UNLESS CONFIGURED. Nothing runs while every `SUPPORT_RETENTION_*`
++ * variable is unset. Once any is set the job is armed, and a malformed or
++ * incomplete configuration fails it loudly instead of turning the sweep off: a
++ * silent no-op here is a broken privacy promise no dashboard would show.
++ *
++ * What goes, each by its own rule:
++ *
++ *  - CLOSED CONVERSATIONS, `closedDays` after they were closed AND after every
++ *    sign of activity: the last visitor-facing message, any message at all
++ *    (internal notes and system events included), and the row's own
++ *    `updated_at` (tags, assignment, attributes). A reopen leaves the thread
++ *    `open` or `snoozed`; a note or edit on a closed thread restarts its clock.
++ *    Spam included: an agent's manual filing is still a person's data
++ *    (machine-filed spam already goes at 30 days through spam-retention).
++ *  - IDLE CONVERSATIONS (optional, `SUPPORT_RETENTION_IDLE_DAYS`), any status,
++ *    when nothing about them moved for that long. A snooze timer still ahead
++ *    keeps a thread. This is the workspace's own rule that a thread untouched
++ *    for that long is no longer needed, open or not.
++ *  - CUSTOMER TICKETS go with their conversation, in the same transaction, but
++ *    only when every customer ticket linked to it is finished: closed past the
++ *    window, untouched past the idle window, or soft-deleted. An open ticket
++ *    inside the window keeps the whole conversation. Unlinked customer tickets
++ *    follow the same rules on their own. Back-office and tracker tickets are
++ *    the team's records and are never touched.
++ *  - SOFT-DELETED TICKETS AND MESSAGES, `closedDays` after the delete. A
++ *    deleted message keeps its text and attachments until then.
++ *  - FILE TOMBSTONES (name, size, hash of a file whose bytes are already gone),
++ *    `closedDays` after the bytes went.
++ *
++ * A HOLD keeps a conversation: one tagged with the hold tag
++ * (`SUPPORT_RETENTION_HOLD_TAG`, default `retention-hold`, compared without
++ * letter case like every tag name; a soft-deleted tag still holds) is skipped,
++ * with its tickets and deleted messages. Renaming or hard-deleting the tag
++ * releases every hold, so a run with no such tag logs a warning.
++ *
++ * BYTES. Attached files follow without new storage code: `files.message_id`
++ * is ON DELETE SET NULL, so a deleted message orphans its file and the next
++ * `file-retention` run (scheduled after this one) deletes the objects unless a
++ * message that stays still names the file. Inline images (`chat-images/`,
++ * `widget-images/` refs in a message body or a legacy attachment) have no file
++ * row, so this sweep deletes those objects itself, before the rows, and only
++ * when no message that stays names them; a storage failure keeps the thread
++ * for the next run.
++ *
++ * LOCKING. Each batch locks its conversations and their customer tickets with
++ * `FOR UPDATE SKIP LOCKED` (never waiting, so it cannot deadlock with a ticket
++ * status sync), then reads the tickets' status in a fresh statement, so a
++ * reopen committed while the batch ran is seen. A row someone else holds is
++ * left for the next run.
++ */
++import { sql } from 'drizzle-orm'
++import { db, type Transaction } from '@/lib/server/db'
++import { getExecuteRows } from '@/lib/server/utils/execute-rows'
++import { logger } from '@/lib/server/logger'
++import { deleteObject } from '@/lib/server/storage/s3'
++import { FILES_PREFIX } from '@/lib/server/domains/files/files.service'
++import {
++  deleteInlineImages,
++  deleteNotificationsFor,
++  uuidArray,
++  type MessageMedia,
++} from './support-data'
++
++const log = logger.child({ component: 'support-retention' })
++
++const DAY_MS = 86_400_000
++export const SUPPORT_RETENTION_MIN_DAYS = 30
++export const SUPPORT_RETENTION_MAX_DAYS = 3650
++export const DEFAULT_SUPPORT_RETENTION_HOLD_TAG = 'retention-hold'
++const VARIABLES = [
++  'SUPPORT_RETENTION_CLOSED_DAYS',
++  'SUPPORT_RETENTION_IDLE_DAYS',
++  'SUPPORT_RETENTION_HOLD_TAG',
++] as const
++
++export interface SupportRetentionPolicy {
++  closedDays: number
++  idleDays: number | null
++  holdTag: string
++}
++
++export class SupportRetentionConfigError extends Error {
++  constructor(message: string) {
++    super(message)
++    this.name = 'SupportRetentionConfigError'
++  }
++}
++
++const isSet = (value: string | undefined) => (value ?? '').trim() !== ''
++
++/** True once an operator has set any retention variable; a malformed value still counts. */
++export function supportRetentionConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
++  return VARIABLES.some((name) => isSet(env[name]))
++}
++
++function parseDays(name: string, raw: string): number {
++  const value = raw.trim()
++  if (!/^\d+$/.test(value)) {
++    throw new SupportRetentionConfigError(`${name} must be a whole number of days`)
++  }
++  const days = Number(value)
++  if (days < SUPPORT_RETENTION_MIN_DAYS || days > SUPPORT_RETENTION_MAX_DAYS) {
++    throw new SupportRetentionConfigError(
++      `${name} must be between ${SUPPORT_RETENTION_MIN_DAYS} and ${SUPPORT_RETENTION_MAX_DAYS} days`
++    )
++  }
++  return days
++}
++
++/** The configured policy, null when nothing is set; throws on anything set but invalid. */
++export function readSupportRetentionPolicy(
++  env: NodeJS.ProcessEnv = process.env
++): SupportRetentionPolicy | null {
++  if (!supportRetentionConfigured(env)) return null
++  if (!isSet(env.SUPPORT_RETENTION_CLOSED_DAYS)) {
++    throw new SupportRetentionConfigError(
++      'SUPPORT_RETENTION_CLOSED_DAYS is required when any support retention variable is set'
++    )
++  }
++  const closedDays = parseDays('SUPPORT_RETENTION_CLOSED_DAYS', env.SUPPORT_RETENTION_CLOSED_DAYS!)
++  const idleDays = isSet(env.SUPPORT_RETENTION_IDLE_DAYS)
++    ? parseDays('SUPPORT_RETENTION_IDLE_DAYS', env.SUPPORT_RETENTION_IDLE_DAYS!)
++    : null
++  if (idleDays !== null && idleDays < closedDays) {
++    throw new SupportRetentionConfigError(
++      'SUPPORT_RETENTION_IDLE_DAYS cannot be shorter than SUPPORT_RETENTION_CLOSED_DAYS'
++    )
++  }
++  const holdTag =
++    (env.SUPPORT_RETENTION_HOLD_TAG ?? '').trim() || DEFAULT_SUPPORT_RETENTION_HOLD_TAG
++  return { closedDays, idleDays, holdTag }
++}
++
++export interface SupportRetentionResult {
++  conversations: number
++  tickets: number
++  messages: number
++  fileTombstones: number
++  /** Inline image objects deleted with the rows that named them. */
++  inlineImages: number
++  /** True when the time budget ran out before every rule was drained. */
++  truncated: boolean
++}
++
++interface Cutoffs {
++  closed: string
++  /** Null when no idle window is configured. */
++  idle: string | null
++  now: string
++  holdTag: string
++}
++
++const holdFor = (conversationId: ReturnType<typeof sql>, holdTag: string) => sql`
++  EXISTS (
++    SELECT 1 FROM conversation_tag_assignments a
++    JOIN conversation_tags t ON t.id = a.conversation_tag_id
++    WHERE a.conversation_id = ${conversationId} AND lower(t.name) = lower(${holdTag})
++  )`
++
++/**
++ * A customer ticket counts as finished: soft-deleted past the window, closed
++ * past the window, or untouched past the idle window. `t` and `s` are the
++ * ticket and its status.
++ */
++const ticketFinished = (c: Cutoffs) => sql`(
++  (t.deleted_at IS NOT NULL AND t.deleted_at < ${c.closed}::timestamptz)
++  OR (s.category = 'closed' AND coalesce(t.resolved_at, t.updated_at) < ${c.closed}::timestamptz
++      AND t.updated_at < ${c.closed}::timestamptz)
++  OR (${c.idle}::timestamptz IS NOT NULL AND t.updated_at < ${c.idle}::timestamptz)
++)`
++
++/** No message of any kind in the conversation since `cutoff`. */
++const quietSince = (cutoff: string) => sql`NOT EXISTS (
++  SELECT 1 FROM conversation_messages m
++  WHERE m.conversation_id = c.id AND m.created_at >= ${cutoff}::timestamptz
++)`
++
++/** One batch of conversations, with the customer tickets that go with them. */
++async function deleteConversationBatch(
++  tx: Transaction,
++  c: Cutoffs,
++  after: string | null,
++  batchSize: number
++): Promise<{ scanned: string[]; conversations: number; tickets: number; inlineImages: number }> {
++  const candidates = getExecuteRows<{ id: string }>(
++    await tx.execute(sql`
++      SELECT c.id FROM conversations c
++      WHERE (
++          (c.status = 'closed'
++            AND coalesce(c.resolved_at, c.last_message_at) < ${c.closed}::timestamptz
++            AND c.last_message_at < ${c.closed}::timestamptz
++            AND coalesce(c.updated_at, c.created_at) < ${c.closed}::timestamptz
++            AND ${quietSince(c.closed)})
++          OR (${c.idle}::timestamptz IS NOT NULL
++            AND c.last_message_at < ${c.idle}::timestamptz
++            AND coalesce(c.updated_at, c.created_at) < ${c.idle}::timestamptz
++            AND ${quietSince(c.idle ?? c.now)}
++            AND NOT (c.status = 'snoozed' AND c.snoozed_until IS NOT NULL
++                     AND c.snoozed_until > ${c.now}::timestamptz))
++        )
++        AND NOT ${holdFor(sql`c.id`, c.holdTag)}
++        AND (${after}::uuid IS NULL OR c.id > ${after}::uuid)
++      ORDER BY c.id
++      LIMIT ${batchSize}
++      FOR UPDATE OF c SKIP LOCKED
++    `)
++  ).map((r) => r.id)
++  const none = { scanned: candidates, conversations: 0, tickets: 0, inlineImages: 0 }
++  if (candidates.length === 0) return none
++
++  // Every customer ticket linked to a candidate, and which of them this batch could lock.
++  const linked = getExecuteRows<{ conversation_id: string; ticket_id: string }>(
++    await tx.execute(sql`
++      SELECT tc.conversation_id, tc.ticket_id FROM ticket_conversations tc
++      JOIN tickets t ON t.id = tc.ticket_id
++      WHERE tc.conversation_id = ANY(${uuidArray(candidates)}) AND t.type = 'customer'
++    `)
++  )
++  const lockedTickets = new Set(
++    getExecuteRows<{ id: string }>(
++      await tx.execute(sql`
++        SELECT t.id FROM tickets t
++        WHERE t.id = ANY(${uuidArray(linked.map((l) => l.ticket_id))})
++        FOR UPDATE OF t SKIP LOCKED
++      `)
++    ).map((r) => r.id)
++  )
++  // A fresh statement: a status change committed while this batch ran is seen here.
++  const finishedTickets = new Set(
++    getExecuteRows<{ id: string }>(
++      await tx.execute(sql`
++        SELECT t.id FROM tickets t
++        JOIN ticket_statuses s ON s.id = t.status_id
++        WHERE t.id = ANY(${uuidArray([...lockedTickets])}) AND ${ticketFinished(c)}
++      `)
++    ).map((r) => r.id)
++  )
++  const blocked = new Set(
++    linked.filter((l) => !finishedTickets.has(l.ticket_id)).map((l) => l.conversation_id)
++  )
++  let doomed = candidates.filter((id) => !blocked.has(id))
++  if (doomed.length === 0) return none
++  const ticketOf = new Map(linked.map((l) => [l.ticket_id, l.conversation_id]))
++  const doomedTickets = linked
++    .filter((l) => doomed.includes(l.conversation_id))
++    .map((l) => l.ticket_id)
++
++  const media = getExecuteRows<MessageMedia>(
++    await tx.execute(sql`
++      SELECT m.id, coalesce(m.conversation_id, m.ticket_id) AS owner, m.content,
++             m.content_json::text AS content_json, m.attachments::text AS attachments
++      FROM conversation_messages m
++      WHERE m.conversation_id = ANY(${uuidArray(doomed)}) OR m.ticket_id = ANY(${uuidArray(doomedTickets)})
++    `)
++  )
++  const images = await deleteInlineImages(tx, media)
++  const failed = new Set([...images.failedOwners].map((owner) => ticketOf.get(owner) ?? owner))
++  doomed = doomed.filter((id) => !failed.has(id))
++  if (doomed.length === 0) return { ...none, inlineImages: images.deleted }
++
++  // A ticket goes only when every conversation it is linked to goes with it.
++  const ticketIds = linked.filter((l) => doomed.includes(l.conversation_id)).map((l) => l.ticket_id)
++  const tickets = getExecuteRows<{ id: string }>(
++    await tx.execute(sql`
++      DELETE FROM tickets t
++      WHERE t.id = ANY(${uuidArray(ticketIds)})
++        AND NOT EXISTS (
++          SELECT 1 FROM ticket_conversations tc
++          WHERE tc.ticket_id = t.id AND NOT (tc.conversation_id = ANY(${uuidArray(doomed)}))
++        )
++      RETURNING t.id
++    `)
++  ).length
++  const conversations = getExecuteRows<{ id: string }>(
++    await tx.execute(
++      sql`DELETE FROM conversations WHERE id = ANY(${uuidArray(doomed)}) RETURNING id`
++    )
++  ).length
++  await deleteNotificationsFor(tx, doomed, ticketIds)
++  return { scanned: candidates, conversations, tickets, inlineImages: images.deleted }
++}
++
++/** Customer tickets that no conversation links to, or that were soft-deleted. */
++async function deleteTicketBatch(
++  tx: Transaction,
++  c: Cutoffs,
++  after: string | null,
++  batchSize: number
++): Promise<{ scanned: string[]; deleted: number; inlineImages: number }> {
++  const candidates = getExecuteRows<{ id: string }>(
++    await tx.execute(sql`
++      SELECT t.id FROM tickets t
++      JOIN ticket_statuses s ON s.id = t.status_id
++      WHERE t.type = 'customer'
++        AND (
++          (t.deleted_at IS NOT NULL AND t.deleted_at < ${c.closed}::timestamptz)
++          OR (NOT EXISTS (SELECT 1 FROM ticket_conversations tc WHERE tc.ticket_id = t.id)
++              AND ${ticketFinished(c)})
++        )
++        AND NOT EXISTS (
++          SELECT 1 FROM ticket_conversations tc
++          WHERE tc.ticket_id = t.id AND ${holdFor(sql`tc.conversation_id`, c.holdTag)}
++        )
++        AND (${after}::uuid IS NULL OR t.id > ${after}::uuid)
++      ORDER BY t.id
++      LIMIT ${batchSize}
++      FOR UPDATE OF t SKIP LOCKED
++    `)
++  ).map((r) => r.id)
++  if (candidates.length === 0) return { scanned: [], deleted: 0, inlineImages: 0 }
++  const media = getExecuteRows<MessageMedia>(
++    await tx.execute(sql`
++      SELECT m.id, m.ticket_id AS owner, m.content, m.content_json::text AS content_json,
++             m.attachments::text AS attachments
++      FROM conversation_messages m WHERE m.ticket_id = ANY(${uuidArray(candidates)})
++    `)
++  )
++  const images = await deleteInlineImages(tx, media)
++  const doomed = candidates.filter((id) => !images.failedOwners.has(id))
++  const deleted = getExecuteRows<{ id: string }>(
++    await tx.execute(sql`DELETE FROM tickets WHERE id = ANY(${uuidArray(doomed)}) RETURNING id`)
++  ).length
++  await deleteNotificationsFor(tx, [], doomed)
++  return { scanned: candidates, deleted, inlineImages: images.deleted }
++}
++
++/** Messages soft-deleted longer ago than the window, outside held conversations. */
++async function deleteMessageBatch(
++  tx: Transaction,
++  c: Cutoffs,
++  after: string | null,
++  batchSize: number
++): Promise<{ scanned: string[]; deleted: number; inlineImages: number }> {
++  const media = getExecuteRows<MessageMedia>(
++    await tx.execute(sql`
++      SELECT m.id, m.id AS owner, m.content, m.content_json::text AS content_json,
++             m.attachments::text AS attachments
++      FROM conversation_messages m
++      WHERE m.deleted_at IS NOT NULL AND m.deleted_at < ${c.closed}::timestamptz
++        AND (m.conversation_id IS NULL OR NOT ${holdFor(sql`m.conversation_id`, c.holdTag)})
++        AND (m.ticket_id IS NULL OR NOT EXISTS (
++          SELECT 1 FROM ticket_conversations tc
++          WHERE tc.ticket_id = m.ticket_id AND ${holdFor(sql`tc.conversation_id`, c.holdTag)}
++        ))
++        AND (${after}::uuid IS NULL OR m.id > ${after}::uuid)
++      ORDER BY m.id
++      LIMIT ${batchSize}
++      FOR UPDATE OF m SKIP LOCKED
++    `)
++  )
++  if (media.length === 0) return { scanned: [], deleted: 0, inlineImages: 0 }
++  const images = await deleteInlineImages(tx, media)
++  const doomed = media.map((m) => m.id).filter((id) => !images.failedOwners.has(id))
++  const deleted = getExecuteRows<{ id: string }>(
++    await tx.execute(
++      sql`DELETE FROM conversation_messages WHERE id = ANY(${uuidArray(doomed)}) RETURNING id`
++    )
++  ).length
++  return { scanned: media.map((m) => m.id), deleted, inlineImages: images.deleted }
++}
++
++/**
++ * Tombstones of files whose objects were removed longer ago than the window.
++ * The object is deleted again first (a no-op when it is already gone): a
++ * file-retention run that died between its claim and its storage delete leaves
++ * a tombstone whose bytes remain, and dropping that row would lose the only
++ * record of them. A storage failure keeps the row for the next run.
++ */
++async function deleteTombstoneBatch(c: Cutoffs, after: string | null, batchSize: number) {
++  const rows = getExecuteRows<{ id: string; storage_key: string }>(
++    await db.execute(sql`
++      SELECT f.id, f.storage_key FROM files f
++      WHERE f.deleted_at IS NOT NULL AND f.deleted_at < ${c.closed}::timestamptz
++        AND f.message_id IS NULL
++        AND f.storage_key LIKE ${`${FILES_PREFIX}/%`}
++        AND (${after}::uuid IS NULL OR f.id > ${after}::uuid)
++      ORDER BY f.id
++      LIMIT ${batchSize}
++    `)
++  )
++  const removable: string[] = []
++  for (const row of rows) {
++    try {
++      await deleteObject(row.storage_key)
++      removable.push(row.id)
++    } catch (err) {
++      log.warn({ err, fileId: row.id }, 'tombstone object delete failed; the next run retries it')
++    }
++  }
++  const deleted = getExecuteRows<{ id: string }>(
++    await db.execute(sql`
++      DELETE FROM files
++      WHERE id = ANY(${uuidArray(removable)}) AND deleted_at IS NOT NULL AND message_id IS NULL
++      RETURNING id
++    `)
++  ).length
++  return { scanned: rows.map((r) => r.id), deleted }
++}
++
++type Phase = 'conversations' | 'tickets' | 'messages' | 'fileTombstones'
++const PHASES: Phase[] = ['conversations', 'tickets', 'messages', 'fileTombstones']
++
++/**
++ * Apply `policy` once: every rule in batches of `batchSize`. Each rule gets its
++ * share of what is left of `budgetMs`, so one large backlog cannot starve the
++ * others; whatever is left over runs on the next daily run.
++ */
++export async function sweepSupportRetention(
++  policy: SupportRetentionPolicy,
++  opts?: { now?: Date; batchSize?: number; budgetMs?: number }
++): Promise<SupportRetentionResult> {
++  const now = opts?.now ?? new Date()
++  const batchSize = opts?.batchSize ?? 200
++  const end = Date.now() + (opts?.budgetMs ?? 45_000)
++  const c: Cutoffs = {
++    closed: new Date(now.getTime() - policy.closedDays * DAY_MS).toISOString(),
++    idle:
++      policy.idleDays === null
++        ? null
++        : new Date(now.getTime() - policy.idleDays * DAY_MS).toISOString(),
++    now: now.toISOString(),
++    holdTag: policy.holdTag,
++  }
++  const result: SupportRetentionResult = {
++    conversations: 0,
++    tickets: 0,
++    messages: 0,
++    fileTombstones: 0,
++    inlineImages: 0,
++    truncated: false,
++  }
++
++  const tag = getExecuteRows<{ found: number }>(
++    await db.execute(
++      sql`SELECT 1 AS found FROM conversation_tags WHERE lower(name) = lower(${policy.holdTag}) LIMIT 1`
++    )
++  )
++  if (tag.length === 0) {
++    log.warn(
++      { hold_tag: policy.holdTag },
++      'support retention hold tag does not exist; no conversation is on hold'
++    )
++  }
++
++  for (const [index, phase] of PHASES.entries()) {
++    const deadline = Date.now() + Math.max(0, end - Date.now()) / (PHASES.length - index)
++    let after: string | null = null
++    for (;;) {
++      if (Date.now() >= deadline) {
++        result.truncated = true
++        break
++      }
++      let scanned: string[]
++      if (phase === 'conversations') {
++        const batch = await db.transaction((tx) => deleteConversationBatch(tx, c, after, batchSize))
++        result.conversations += batch.conversations
++        result.tickets += batch.tickets
++        result.inlineImages += batch.inlineImages
++        scanned = batch.scanned
++      } else if (phase === 'tickets') {
++        const batch = await db.transaction((tx) => deleteTicketBatch(tx, c, after, batchSize))
++        result.tickets += batch.deleted
++        result.inlineImages += batch.inlineImages
++        scanned = batch.scanned
++      } else if (phase === 'messages') {
++        const batch = await db.transaction((tx) => deleteMessageBatch(tx, c, after, batchSize))
++        result.messages += batch.deleted
++        result.inlineImages += batch.inlineImages
++        scanned = batch.scanned
++      } else {
++        const batch = await deleteTombstoneBatch(c, after, batchSize)
++        result.fileTombstones += batch.deleted
++        scanned = batch.scanned
++      }
++      if (scanned.length < batchSize) break
++      after = scanned[scanned.length - 1]!
++    }
++  }
++
++  const fields = { ...result, closed_days: policy.closedDays, idle_days: policy.idleDays }
++  if (result.truncated) {
++    log.warn(fields, 'support retention sweep ran out of time; the next run continues')
++  } else {
++    log.info(fields, 'support retention sweep complete')
++  }
++  return result
++}
+diff --git a/apps/web/src/lib/server/domains/conversation/support-data.ts b/apps/web/src/lib/server/domains/conversation/support-data.ts
+new file mode 100644
+index 0000000..c55f670
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/support-data.ts
+@@ -0,0 +1,211 @@
++/**
++ * Shared pieces of support retention and support erasure (iPLAYCAFE overlay):
++ * id-array literals, inline message images (`chat-images/`, `widget-images/`
++ * objects that have no `files` row) and teammates' in-app notifications about
++ * a thread, which name it only in `metadata`.
++ */
++import { sql } from 'drizzle-orm'
++import { fromUuid } from '@quackback/ids'
++import type { Transaction } from '@/lib/server/db'
++import { getExecuteRows } from '@/lib/server/utils/execute-rows'
++import { logger } from '@/lib/server/logger'
++import { deleteObject } from '@/lib/server/storage/s3'
++import { storedAssetKeyFromSrc } from '@/lib/server/storage/asset-url'
++
++const log = logger.child({ component: 'support-data' })
++
++/** A uuid[] literal; empty matches nothing. */
++export const uuidArray = (values: string[]) =>
++  values.length === 0
++    ? sql`ARRAY[]::uuid[]`
++    : sql`ARRAY[${sql.join(
++        values.map((v) => sql`${v}`),
++        sql`, `
++      )}]::uuid[]`
++
++/** Prefixes of message images stored without a `files` row. */
++const INLINE_IMAGE_PREFIXES = ['chat-images/', 'widget-images/']
++const STORAGE_REF = /[^\s"'()<>\\]*\/api\/storage\/[^\s"'()<>\\]+/g
++
++/** Inline image keys a message body, rich body or legacy attachment list names. */
++export function inlineImageKeys(texts: Array<string | null | undefined>): string[] {
++  const keys = new Set<string>()
++  for (const text of texts) {
++    for (const ref of text?.match(STORAGE_REF) ?? []) {
++      const key = storedAssetKeyFromSrc(ref)
++      if (key && INLINE_IMAGE_PREFIXES.some((prefix) => key.startsWith(prefix))) keys.add(key)
++    }
++  }
++  return [...keys]
++}
++
++const likePattern = (key: string) => `%${key.replace(/[\\%_]/g, (c) => `\\${c}`)}%`
++
++/** The keys, among `keys`, that a message outside `excludedMessageIds` still names. */
++export async function inlineKeysStillReferenced(
++  reader: Pick<Transaction, 'execute'>,
++  keys: string[],
++  excludedMessageIds: string[]
++): Promise<Set<string>> {
++  const kept = new Set<string>()
++  for (const key of keys) {
++    const rows = getExecuteRows<{ found: number }>(
++      await reader.execute(sql`
++        SELECT 1 AS found FROM conversation_messages m
++        WHERE NOT (m.id = ANY(${uuidArray(excludedMessageIds)}))
++          AND (m.content LIKE ${likePattern(key)}
++            OR m.content_json::text LIKE ${likePattern(key)}
++            OR m.attachments::text LIKE ${likePattern(key)})
++        LIMIT 1
++      `)
++    )
++    if (rows.length > 0) kept.add(key)
++  }
++  return kept
++}
++
++export interface MessageMedia {
++  id: string
++  owner: string
++  content: string | null
++  content_json: string | null
++  attachments: string | null
++}
++
++/**
++ * Delete the inline images of the given messages that nothing else names.
++ * Returns the owners (conversation or ticket ids) whose images could not all be
++ * deleted, so their rows stay for the next run, and the count deleted.
++ */
++export async function deleteInlineImages(
++  tx: Transaction,
++  messages: MessageMedia[]
++): Promise<{ failedOwners: Set<string>; deleted: number }> {
++  const byOwner = new Map<string, string[]>()
++  for (const m of messages) {
++    const keys = inlineImageKeys([m.content, m.content_json, m.attachments])
++    if (keys.length > 0) byOwner.set(m.owner, [...(byOwner.get(m.owner) ?? []), ...keys])
++  }
++  const failedOwners = new Set<string>()
++  let deleted = 0
++  if (byOwner.size === 0) return { failedOwners, deleted }
++  const all = [...new Set([...byOwner.values()].flat())]
++  const kept = await inlineKeysStillReferenced(
++    tx,
++    all,
++    messages.map((m) => m.id)
++  )
++  const done = new Set<string>()
++  for (const [owner, keys] of byOwner) {
++    for (const key of keys) {
++      if (kept.has(key) || done.has(key)) continue
++      try {
++        await deleteObject(key)
++        done.add(key)
++        deleted += 1
++      } catch (err) {
++        log.warn({ err }, 'inline image delete failed; the thread stays for the next run')
++        failedOwners.add(owner)
++      }
++    }
++  }
++  return { failedOwners, deleted }
++}
++
++/**
++ * Teammates' in-app notifications about the deleted threads ("X replied on …"
++ * with a preview). They name the thread only in `metadata`, with no foreign
++ * key, so nothing cascades to them.
++ */
++export async function deleteNotificationsFor(
++  tx: Pick<Transaction, 'execute'>,
++  conversationIds: string[],
++  ticketIds: string[]
++): Promise<void> {
++  const refs = [
++    ...conversationIds.map((id) => fromUuid('conversation', id)),
++    ...ticketIds.map((id) => fromUuid('ticket', id)),
++  ]
++  if (refs.length === 0) return
++  await tx.execute(sql`
++    DELETE FROM in_app_notifications
++    WHERE metadata->>'conversationId' = ANY(${textArray(refs)})
++       OR metadata->>'ticketId' = ANY(${textArray(refs)})
++  `)
++}
++
++/** A text[] literal; empty matches nothing. */
++export const textArray = (values: string[]) =>
++  values.length === 0
++    ? sql`ARRAY[]::text[]`
++    : sql`ARRAY[${sql.join(
++        values.map((v) => sql`${v}`),
++        sql`, `
++      )}]::text[]`
++
++export interface SupportErasureSelector {
++  /** The host's identity `sub`, stored as `user.external_id`. */
++  externalId?: string
++  /** An email address: account email, email-channel identity or principal contact email. */
++  email?: string
++  /** Delete the person's feedback posts instead of re-attributing them. */
++  deletePosts?: boolean
++  /** Also delete threads native removal re-attributed to the placeholder, by visitor email. */
++  includeRemovedThreads?: boolean
++}
++
++export interface SupportErasurePlan {
++  /** Principals by how they were found. */
++  accounts: number
++  emailChannel: number
++  contacts: number
++  /** `user` rows, including ones native removal left without a principal. */
++  users: number
++  conversations: number
++  /** Placeholder threads carrying the email, deleted only with includeRemovedThreads. */
++  removedThreads: number
++  tickets: number
++  messages: number
++  files: number
++  objects: number
++  posts: number
++  emailLog: number
++  /** Signed-in principals whose typed contact email matched; never erased. */
++  otherAccountsSkipped: number
++  /** Why the request cannot be applied, or null. */
++  refused: string | null
++  token: string
++}
++
++/** A reader: the database or a transaction. */
++export type Reader = Pick<Transaction, 'execute'>
++
++export const sorted = (values: Iterable<string>) => [...new Set(values)].sort()
++
++export async function rows<T>(reader: Reader, query: ReturnType<typeof sql>): Promise<T[]> {
++  return getExecuteRows<T>(await reader.execute(query))
++}
++
++export function normaliseSelector(selector: SupportErasureSelector) {
++  const externalId = selector.externalId?.trim() || null
++  const email = selector.email?.trim().toLowerCase() || null
++  if (!externalId && !email) throw new Error('an external id or an email is required')
++  if (email && !/^[^\s@<>"]+@[^\s@<>"]+$/.test(email)) throw new Error('the email is malformed')
++  return {
++    externalId,
++    email,
++    deletePosts: selector.deletePosts === true,
++    includeRemovedThreads: selector.includeRemovedThreads === true,
++  }
++}
++
++/** Mail-log rows to or from the addresses (also `Name <address>`), or about the threads. */
++export function emailLogScope(emails: string[], conversationIds: string[], ticketIds: string[]) {
++  const wrapped = emails.map((e) => `%<${e.replace(/[\\%_]/g, (c) => `\\${c}`)}>%`)
++  return sql`(
++    lower(address) = ANY(${textArray(emails)})
++    OR lower(address) LIKE ANY(${textArray(wrapped)})
++    OR conversation_id = ANY(${uuidArray(conversationIds)})
++    OR ticket_id = ANY(${uuidArray(ticketIds)})
++  )`
++}
+diff --git a/apps/web/src/lib/server/domains/conversation/support-erasure.ts b/apps/web/src/lib/server/domains/conversation/support-erasure.ts
+new file mode 100644
+index 0000000..25dedce
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/support-erasure.ts
+@@ -0,0 +1,474 @@
++/**
++ * Support erasure: removes one person's support data for good, for a data
++ * subject's erasure request (iPLAYCAFE overlay).
++ *
++ * Native "remove user" is not an erasure: it re-attributes the person's
++ * conversations to the deleted-user placeholder and keeps their `user` row and
++ * email. This deletes instead.
++ *
++ * WHO. The person is found by the host's identity `sub` (`user.external_id`)
++ * and/or an email address, matched against the account email, the email
++ * channel identity and the `contact_email` of a principal with no account (a
++ * CC'd participant, a cold-inbound sender), never against a signed-in person's
++ * typed `contact_email` (counted as `otherAccountsSkipped`) or
++ * `conversations.visitor_email`: that is unverified text anyone can type, and
++ * matching it would erase whoever typed it. When both selectors are given,
++ * an email that belongs to a different account is refused. A `user` row left
++ * behind by native removal (no principal, external id cleared) is found by
++ * its email and deleted. Threads native removal re-attributed to the
++ * placeholder are counted in the plan and deleted only with
++ * `includeRemovedThreads`, matched by their visitor email, since nothing else
++ * ties them to the person any more. A team principal is refused.
++ *
++ * WHAT. Their conversations with every child row; tickets they requested, of
++ * any type, and customer tickets linked only to their conversations; messages
++ * they wrote anywhere (other threads' last-message previews are cleared);
++ * files they uploaded, and files and inline images their threads carry that no
++ * other message names: objects first, then rows, tombstones included; their
++ * avatar objects; teammates' in-app notifications about their threads; mail
++ * log rows to or from their addresses or about their threads; their help-centre
++ * feedback, analytics page views and devices, and widget origin sessions;
++ * optionally (`deletePosts`) their feedback posts, re-pointing other people's
++ * merged duplicates so they do not vanish; otherwise posts and comments are
++ * re-attributed to the placeholder as native removal does; then their
++ * principals and `user` rows (sessions, accounts, channel identities and their
++ * own notifications cascade).
++ *
++ * KEPT, and said so in SUPPORT-RETENTION.md: audit-log rows (actors, no
++ * content; native 365-day window), the event outbox and job queue (90 days and
++ * less), back-office and tracker tickets the person did not request, and the
++ * native-1 submission/evidence ledgers (ids and digests, no content).
++ *
++ * TWO STEPS. `planSupportErasure` reads only and returns counts and a token,
++ * a hash of every id (and principal role) the apply would touch.
++ * `applySupportErasure` locks the person's rows and threads, plans again under
++ * the locks and refuses unless the token matches and nothing is refused, then
++ * deletes objects and rows in that one transaction. A storage failure aborts
++ * it with the database unchanged (objects already deleted stay deleted; a
++ * re-plan and apply finishes the rest). Single-workspace installs only.
++ */
++import { createHash } from 'node:crypto'
++import { sql } from 'drizzle-orm'
++import { fromUuid, isTypeIdFormat, toUuid } from '@quackback/ids'
++import { db } from '@/lib/server/db'
++import { getExecuteRows } from '@/lib/server/utils/execute-rows'
++import { logger } from '@/lib/server/logger'
++import { deleteObject } from '@/lib/server/storage/s3'
++import {
++  DELETED_USER_PRINCIPAL_ID,
++  reattributeAuthoredContent,
++} from '@/lib/server/domains/principals/principal-reattribute'
++import {
++  deleteNotificationsFor,
++  emailLogScope,
++  inlineImageKeys,
++  inlineKeysStillReferenced,
++  normaliseSelector,
++  rows,
++  sorted,
++  textArray,
++  uuidArray,
++  type Reader,
++  type SupportErasurePlan,
++  type SupportErasureSelector,
++} from './support-data'
++
++const log = logger.child({ component: 'support-erasure' })
++
++export type { SupportErasurePlan, SupportErasureSelector } from './support-data'
++
++interface Resolved {
++  principals: Array<{ id: string; role: string; kind: 'account' | 'emailChannel' | 'contact' }>
++  userIds: string[]
++  emails: string[]
++  conversationIds: string[]
++  removedThreadIds: string[]
++  ticketIds: string[]
++  messageIds: string[]
++  fileIds: string[]
++  objectKeys: string[]
++  postIds: string[]
++  emailLog: number
++  otherAccountsSkipped: number
++  flags: { deletePosts: boolean; includeRemovedThreads: boolean }
++  refused: string | null
++}
++
++async function resolve(reader: Reader, selector: SupportErasureSelector): Promise<Resolved> {
++  const { externalId, email, deletePosts, includeRemovedThreads } = normaliseSelector(selector)
++  const placeholder = toUuid(DELETED_USER_PRINCIPAL_ID)
++
++  const users = await rows<{ id: string; by: 'externalId' | 'email' }>(
++    reader,
++    sql`
++      SELECT id, 'externalId' AS by FROM "user"
++      WHERE ${externalId}::text IS NOT NULL AND external_id = ${externalId}::text
++      UNION ALL
++      SELECT id, 'email' AS by FROM "user"
++      WHERE ${email}::text IS NOT NULL AND lower(email) = ${email}::text
++    `
++  )
++  const byExternal = new Set(users.filter((u) => u.by === 'externalId').map((u) => u.id))
++  const userIds = sorted(users.map((u) => u.id))
++  const accountPrincipals = await rows<{ id: string; role: string; user_id: string }>(
++    reader,
++    sql`SELECT id, role, user_id FROM principal WHERE user_id = ANY(${uuidArray(userIds)})`
++  )
++  // Email-channel and contact-email principals count only when they have no account: a
++  // contact_email is also typed text (pre-chat capture, an agent's edit), so a signed-in
++  // person who typed this address is someone else, never part of this erasure.
++  const emailMatches =
++    email === null
++      ? []
++      : await rows<{
++          id: string
++          role: string
++          kind: 'emailChannel' | 'contact'
++          user_id: string | null
++        }>(
++          reader,
++          sql`
++            SELECT p.id, p.role, 'emailChannel' AS kind, p.user_id FROM principal p
++            WHERE p.id IN (SELECT ci.principal_id FROM channel_identities ci
++                           WHERE ci.channel = 'email' AND ci.external_id = ${email}::text)
++            UNION
++            SELECT p.id, p.role, 'contact' AS kind, p.user_id FROM principal p
++            WHERE lower(p.contact_email) = ${email}::text
++          `
++        )
++  const emailPrincipals = emailMatches.filter((p) => p.user_id === null)
++  const otherAccountsSkipped = new Set(
++    emailMatches.filter((p) => p.user_id !== null && !userIds.includes(p.user_id)).map((p) => p.id)
++  ).size
++  const principalMap = new Map<string, Resolved['principals'][number]>()
++  for (const p of accountPrincipals) {
++    principalMap.set(p.id, { id: p.id, role: p.role, kind: 'account' })
++  }
++  for (const p of emailPrincipals) {
++    if (!principalMap.has(p.id)) principalMap.set(p.id, { id: p.id, role: p.role, kind: p.kind })
++  }
++  const principals = [...principalMap.values()].sort((a, b) => (a.id < b.id ? -1 : 1))
++  const principalIds = principals.map((p) => p.id)
++
++  let refused: string | null = null
++  if (externalId && email && users.some((u) => u.by === 'email' && !byExternal.has(u.id))) {
++    refused = 'the email belongs to a different account than the external id'
++  }
++  if (principals.some((p) => p.role !== 'user')) {
++    refused = 'a team principal matches; erase teammates through team management'
++  }
++  if (principalIds.includes(placeholder)) refused = 'the deleted-user placeholder matches'
++
++  const removedThreadIds =
++    email === null
++      ? []
++      : sorted(
++          (
++            await rows<{ id: string }>(
++              reader,
++              sql`SELECT id FROM conversations
++                  WHERE visitor_principal_id = ${placeholder}::uuid AND lower(visitor_email) = ${email}::text`
++            )
++          ).map((r) => r.id)
++        )
++  if (principals.length === 0 && userIds.length === 0 && removedThreadIds.length === 0) {
++    refused = refused ?? 'no matching person'
++  }
++
++  const emails = sorted([
++    ...(email ? [email] : []),
++    ...(
++      await rows<{ email: string }>(
++        reader,
++        sql`
++          SELECT lower(email) AS email FROM "user"
++            WHERE id = ANY(${uuidArray(userIds)}) AND email IS NOT NULL
++          UNION SELECT lower(contact_email) FROM principal
++            WHERE id = ANY(${uuidArray(principalIds)}) AND contact_email IS NOT NULL
++          UNION SELECT external_id FROM channel_identities
++            WHERE channel = 'email' AND principal_id = ANY(${uuidArray(principalIds)})
++        `
++      )
++    ).map((r) => r.email),
++  ])
++
++  const conversationIds = sorted([
++    ...(
++      await rows<{ id: string }>(
++        reader,
++        sql`SELECT id FROM conversations WHERE visitor_principal_id = ANY(${uuidArray(principalIds)})`
++      )
++    ).map((r) => r.id),
++    ...(includeRemovedThreads ? removedThreadIds : []),
++  ])
++  const ticketIds = sorted(
++    (
++      await rows<{ id: string }>(
++        reader,
++        sql`
++          SELECT t.id FROM tickets t
++          WHERE t.requester_principal_id = ANY(${uuidArray(principalIds)})
++             OR (t.type = 'customer'
++                 AND EXISTS (SELECT 1 FROM ticket_conversations tc WHERE tc.ticket_id = t.id)
++                 AND NOT EXISTS (
++                   SELECT 1 FROM ticket_conversations tc
++                   WHERE tc.ticket_id = t.id
++                     AND NOT (tc.conversation_id = ANY(${uuidArray(conversationIds)}))
++                 ))
++        `
++      )
++    ).map((r) => r.id)
++  )
++  const messages = await rows<{
++    id: string
++    content: string | null
++    content_json: string | null
++    attachments: string | null
++  }>(
++    reader,
++    sql`
++      SELECT m.id, m.content, m.content_json::text AS content_json,
++             m.attachments::text AS attachments
++      FROM conversation_messages m
++      WHERE m.principal_id = ANY(${uuidArray(principalIds)})
++         OR m.conversation_id = ANY(${uuidArray(conversationIds)})
++         OR m.ticket_id = ANY(${uuidArray(ticketIds)})
++    `
++  )
++  const messageIds = sorted(messages.map((m) => m.id))
++
++  // Files: theirs always; one their threads carry only when no other message names it.
++  const attachmentFileIds = new Set<string>()
++  for (const m of messages) {
++    for (const match of m.attachments?.matchAll(/"fileId"\s*:\s*"([^"]+)"/g) ?? []) {
++      if (isTypeIdFormat(match[1]!)) attachmentFileIds.add(toUuid(match[1]!))
++    }
++  }
++  const files = await rows<{
++    id: string
++    storage_key: string
++    meta: { thumbKey?: unknown; renditionKey?: unknown } | null
++    uploaded_by_id: string | null
++  }>(
++    reader,
++    sql`
++      SELECT f.id, f.storage_key, f.meta, f.uploaded_by_id FROM files f
++      WHERE f.uploaded_by_id = ANY(${uuidArray(principalIds)})
++         OR f.message_id = ANY(${uuidArray(messageIds)})
++         OR f.id = ANY(${uuidArray([...attachmentFileIds])})
++    `
++  )
++  const sharedFiles = new Set(
++    (
++      await rows<{ file_id: string }>(
++        reader,
++        sql`
++          SELECT DISTINCT elem->>'fileId' AS file_id FROM conversation_messages m
++          CROSS JOIN LATERAL jsonb_array_elements(
++            CASE WHEN jsonb_typeof(m.attachments) = 'array' THEN m.attachments ELSE '[]'::jsonb END
++          ) AS elem
++          WHERE m.attachments IS NOT NULL AND NOT (m.id = ANY(${uuidArray(messageIds)}))
++            AND elem->>'fileId' = ANY(${textArray(files.map((f) => fromUuid('file', f.id)))})
++        `
++      )
++    ).map((r) => toUuid(r.file_id))
++  )
++  const ownFiles = files.filter(
++    (f) =>
++      (f.uploaded_by_id !== null && principalIds.includes(f.uploaded_by_id)) ||
++      !sharedFiles.has(f.id)
++  )
++  const inline = inlineImageKeys(
++    messages.flatMap((m) => [m.content, m.content_json, m.attachments])
++  )
++  const sharedInline = await inlineKeysStillReferenced(reader, inline, messageIds)
++  const avatars = await rows<{ key: string }>(
++    reader,
++    sql`
++      SELECT avatar_key AS key FROM principal
++        WHERE id = ANY(${uuidArray(principalIds)}) AND avatar_key IS NOT NULL
++      UNION
++      SELECT image_key AS key FROM "user"
++        WHERE id = ANY(${uuidArray(userIds)}) AND image_key IS NOT NULL
++    `
++  )
++  const objectKeys = sorted([
++    ...ownFiles.flatMap((f) =>
++      [f.storage_key, f.meta?.thumbKey, f.meta?.renditionKey].filter(
++        (k): k is string => typeof k === 'string' && k.startsWith('files/')
++      )
++    ),
++    ...inline.filter((k) => !sharedInline.has(k)),
++    ...avatars.map((a) => a.key),
++  ])
++  const postIds = deletePosts
++    ? sorted(
++        (
++          await rows<{ id: string }>(
++            reader,
++            sql`SELECT id FROM posts WHERE principal_id = ANY(${uuidArray(principalIds)})`
++          )
++        ).map((r) => r.id)
++      )
++    : []
++  const emailLog =
++    (
++      await rows<{ count: number }>(
++        reader,
++        sql`SELECT count(*)::int AS count FROM email_log
++            WHERE ${emailLogScope(emails, conversationIds, ticketIds)}`
++      )
++    )[0]?.count ?? 0
++
++  return {
++    principals,
++    userIds,
++    emails,
++    conversationIds,
++    removedThreadIds,
++    ticketIds,
++    messageIds,
++    fileIds: sorted(ownFiles.map((f) => f.id)),
++    objectKeys,
++    postIds,
++    emailLog,
++    otherAccountsSkipped,
++    flags: { deletePosts, includeRemovedThreads },
++    refused,
++  }
++}
++
++function tokenFor(r: Resolved): string {
++  const { emailLog: _count, otherAccountsSkipped: _other, refused: _refused, ...touched } = r
++  return createHash('sha256').update(JSON.stringify(touched)).digest('hex')
++}
++
++function planOf(r: Resolved): SupportErasurePlan {
++  const kinds = (kind: string) => r.principals.filter((p) => p.kind === kind).length
++  return {
++    accounts: kinds('account'),
++    emailChannel: kinds('emailChannel'),
++    contacts: kinds('contact'),
++    users: r.userIds.length,
++    conversations: r.conversationIds.length,
++    removedThreads: r.removedThreadIds.length,
++    tickets: r.ticketIds.length,
++    messages: r.messageIds.length,
++    files: r.fileIds.length,
++    objects: r.objectKeys.length,
++    posts: r.postIds.length,
++    emailLog: r.emailLog,
++    otherAccountsSkipped: r.otherAccountsSkipped,
++    refused: r.refused,
++    token: tokenFor(r),
++  }
++}
++
++/** Read-only: what an apply would erase, and the token it must be given. */
++export async function planSupportErasure(
++  selector: SupportErasureSelector
++): Promise<SupportErasurePlan> {
++  return planOf(await resolve(db, selector))
++}
++
++export class SupportErasureRefused extends Error {
++  constructor(message: string) {
++    super(message)
++    this.name = 'SupportErasureRefused'
++  }
++}
++
++/** Erase what `planSupportErasure` reported, only if nothing changed since. */
++export async function applySupportErasure(
++  selector: SupportErasureSelector,
++  token: string
++): Promise<SupportErasurePlan> {
++  const outline = await resolve(db, selector)
++  if (outline.refused) throw new SupportErasureRefused(outline.refused)
++  if (tokenFor(outline) !== token) {
++    throw new SupportErasureRefused('the data changed since the plan; plan again and review it')
++  }
++  const outlinePrincipals = outline.principals.map((p) => p.id)
++
++  const result = await db.transaction(async (tx) => {
++    // Lock the person and their threads: a new message, ticket or principal
++    // needs one of these rows, so nothing can join the set until commit.
++    await tx.execute(
++      sql`SELECT id FROM "user" WHERE id = ANY(${uuidArray(outline.userIds)}) FOR UPDATE`
++    )
++    await tx.execute(
++      sql`SELECT id FROM principal WHERE id = ANY(${uuidArray(outlinePrincipals)}) FOR UPDATE`
++    )
++    await tx.execute(
++      sql`SELECT id FROM conversations WHERE id = ANY(${uuidArray(outline.conversationIds)}) FOR UPDATE`
++    )
++    await tx.execute(
++      sql`SELECT id FROM tickets WHERE id = ANY(${uuidArray(outline.ticketIds)}) FOR UPDATE`
++    )
++    const r = await resolve(tx, selector)
++    if (r.refused) throw new SupportErasureRefused(r.refused)
++    if (tokenFor(r) !== token) {
++      throw new SupportErasureRefused(
++        'the data changed during the erasure; plan again and review it'
++      )
++    }
++    const ids = r.principals.map((p) => p.id)
++
++    // Objects first: a failure throws and rolls the rows back.
++    for (const key of r.objectKeys) await deleteObject(key)
++
++    const touchedThreads = getExecuteRows<{ id: string }>(
++      await tx.execute(sql`
++        SELECT DISTINCT conversation_id AS id FROM conversation_messages
++        WHERE principal_id = ANY(${uuidArray(ids)}) AND conversation_id IS NOT NULL
++          AND NOT (conversation_id = ANY(${uuidArray(r.conversationIds)}))
++      `)
++    ).map((row) => row.id)
++    await tx.execute(
++      sql`DELETE FROM email_log WHERE ${emailLogScope(r.emails, r.conversationIds, r.ticketIds)}`
++    )
++    await deleteNotificationsFor(tx, r.conversationIds, r.ticketIds)
++    await tx.execute(sql`DELETE FROM files WHERE id = ANY(${uuidArray(r.fileIds)})`)
++    await tx.execute(sql`DELETE FROM tickets WHERE id = ANY(${uuidArray(r.ticketIds)})`)
++    await tx.execute(sql`DELETE FROM conversations WHERE id = ANY(${uuidArray(r.conversationIds)})`)
++    await tx.execute(
++      sql`DELETE FROM conversation_messages WHERE id = ANY(${uuidArray(r.messageIds)})`
++    )
++    await tx.execute(
++      sql`UPDATE conversations SET last_message_preview = NULL WHERE id = ANY(${uuidArray(touchedThreads)})`
++    )
++    if (r.postIds.length > 0) {
++      await tx.execute(
++        sql`UPDATE posts SET canonical_post_id = NULL WHERE canonical_post_id = ANY(${uuidArray(r.postIds)})`
++      )
++      await tx.execute(sql`DELETE FROM posts WHERE id = ANY(${uuidArray(r.postIds)})`)
++    }
++    await tx.execute(
++      sql`DELETE FROM kb_article_feedback WHERE principal_id = ANY(${uuidArray(ids)})`
++    )
++    await tx.execute(sql`DELETE FROM page_views WHERE principal_id = ANY(${uuidArray(ids)})`)
++    await tx.execute(sql`DELETE FROM visitor_devices WHERE principal_id = ANY(${uuidArray(ids)})`)
++    await tx.execute(sql`
++      DELETE FROM widget_origin_session
++      WHERE user_id = ANY(${textArray([...r.userIds, ...r.userIds.map((id) => fromUuid('user', id))])})
++    `)
++    for (const principalId of ids) {
++      await reattributeAuthoredContent(tx, fromUuid('principal', principalId))
++    }
++    await tx.execute(sql`DELETE FROM "user" WHERE id = ANY(${uuidArray(r.userIds)})`)
++    await tx.execute(sql`DELETE FROM principal WHERE id = ANY(${uuidArray(ids)})`)
++    return planOf(r)
++  })
++
++  try {
++    const { cacheDel, CACHE_KEYS } = await import('@/lib/server/cache')
++    for (const userId of outline.userIds) {
++      await cacheDel(CACHE_KEYS.PRINCIPAL_BY_USER(fromUuid('user', userId)))
++    }
++  } catch (err) {
++    log.warn({ err }, 'principal cache invalidation after erasure failed')
++  }
++  const { token: _token, ...counts } = result
++  log.info(counts, 'support erasure applied')
++  return result
++}
+diff --git a/apps/web/src/lib/server/domains/conversation/support-retention-queue.ts b/apps/web/src/lib/server/domains/conversation/support-retention-queue.ts
+new file mode 100644
+index 0000000..c9aa94b
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/support-retention-queue.ts
+@@ -0,0 +1,31 @@
++/**
++ * Support retention — a daily job that applies the workspace's support
++ * retention window (see conversation.support-retention.ts, which states every
++ * rule). Inert until `SUPPORT_RETENTION_CLOSED_DAYS` is set; a set but invalid
++ * value fails the job terminally so it shows as a failure, never as a quiet
++ * no-op.
++ */
++import { TerminalJobError } from '@/lib/server/jobs/definitions'
++import {
++  readSupportRetentionPolicy,
++  SupportRetentionConfigError,
++  supportRetentionConfigured,
++  sweepSupportRetention,
++} from './conversation.support-retention'
++
++/** The cron gate: armed once the window is set at all. */
++export async function supportRetentionEnabled(): Promise<boolean> {
++  return supportRetentionConfigured()
++}
++
++export async function runSupportRetention(): Promise<void> {
++  let policy
++  try {
++    policy = readSupportRetentionPolicy()
++  } catch (err) {
++    if (err instanceof SupportRetentionConfigError) throw new TerminalJobError(err.message)
++    throw err
++  }
++  if (!policy) return
++  await sweepSupportRetention(policy)
++}
+diff --git a/apps/web/src/lib/server/jobs/JOBS.md b/apps/web/src/lib/server/jobs/JOBS.md
+index 5baa717..fed866a 100644
+--- a/apps/web/src/lib/server/jobs/JOBS.md
++++ b/apps/web/src/lib/server/jobs/JOBS.md
+@@ -376,6 +376,7 @@ went stale the moment a queue moved.
+ | `event-summaries`               | —              | 2           | 3        | 60s   |
+ | `segment-evaluation`            | dynamic        | 2           | 3        | 60s   |
+ | `file-preview`                  | —              | 2           | 2        | 120s  |
++| `support-retention`             | `10 4 * * *`   | 1           | 3        | 120s  |
+ | `file-retention`                | `40 4 * * *`   | 1           | 3        | 60s   |
+ | `help-center-translate`         | —              | 1           | 3        | 120s  |
+ | `help-center-translate-resume`  | `25 * * * *`   | 1           | 1        | 60s   |
+diff --git a/apps/web/src/lib/server/jobs/definitions.ts b/apps/web/src/lib/server/jobs/definitions.ts
+index a7c3aa2..583e76b 100644
+--- a/apps/web/src/lib/server/jobs/definitions.ts
++++ b/apps/web/src/lib/server/jobs/definitions.ts
+@@ -405,6 +405,24 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
+     failedRetentionMs: 7 * DAY_MS,
+     handler: () => import('@/lib/server/messages/file-preview-job').then((m) => m.runFilePreview),
+   },
++  {
++    // Deletes support conversations, customer tickets and soft-deleted
++    // messages past the workspace's own retention window (iPLAYCAFE overlay).
++    // Inert until SUPPORT_RETENTION_CLOSED_DAYS is set. Runs before
++    // file-retention so the files it orphans lose their bytes the same day.
++    name: 'support-retention',
++    cron: '10 4 * * *',
++    maxAttempts: 3,
++    leaseMs: 120_000,
++    cronEnabled: () =>
++      import('@/lib/server/domains/conversation/support-retention-queue').then((m) =>
++        m.supportRetentionEnabled()
++      ),
++    handler: () =>
++      import('@/lib/server/domains/conversation/support-retention-queue').then(
++        (m) => m.runSupportRetention
++      ),
++  },
+   {
+     // Removes uploads never sent and files whose message was deleted for good.
+     // Offset from the other daily sweeps: it is bounded by object-store deletes

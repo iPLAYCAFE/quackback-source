@@ -1,0 +1,4 @@
+# Patches must stay byte-exact for git apply and SHA256SUMS.
+*.patch -text
+SHA256SUMS -text
+series -text

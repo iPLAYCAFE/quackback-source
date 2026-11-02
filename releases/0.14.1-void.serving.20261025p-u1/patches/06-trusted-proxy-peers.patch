@@ -1,0 +1,157 @@
+diff --git a/apps/web/src/lib/server/auth/__tests__/client-ip.test.ts b/apps/web/src/lib/server/auth/__tests__/client-ip.test.ts
+index b396f4b3d..14a2f09d4 100644
+--- a/apps/web/src/lib/server/auth/__tests__/client-ip.test.ts
++++ b/apps/web/src/lib/server/auth/__tests__/client-ip.test.ts
+@@ -1,3 +1,4 @@
++// @vitest-environment node
+ /**
+  * The client address Better Auth sees must be the one the rest of the app
+  * trusts: the socket peer on a direct install, the trusted hop behind proxies,
+@@ -46,6 +47,7 @@ import {
+   withTrustedClientIpRequest,
+ } from '../client-ip'
+ import { signCustomerHost, signEdgeClientIp } from '@/lib/server/workspaces/saas-edge-host'
++import { getClientIp } from '@/lib/server/domains/api/rate-limit'
+ 
+ beforeEach(() => {
+   proxyConfig.hops = 0
+@@ -53,6 +55,59 @@ beforeEach(() => {
+   mockGetRequestIP.mockReset()
+ })
+ 
++describe('configured peer admission preserves native client resolution', () => {
++  beforeEach(() => vi.stubEnv('TRUSTED_PROXY_CIDRS', '192.0.2.0/24'))
++  afterEach(() => vi.unstubAllEnvs())
++  const headers = () => new Headers({'x-real-ip':'198.51.100.4',
++    'cf-connecting-ip':'198.51.100.5', 'x-forwarded-for':'198.51.100.6, 10.0.0.3'})
++  it.each(['x-real-ip', 'cf-connecting-ip'])('uses native operator header %s after peer admission', header => {
++    mockGetRequestIP.mockReturnValue('192.0.2.7')
++    proxyConfig.header = header
++    expect(getClientIp(headers())).toBe(header === 'x-real-ip' ? '198.51.100.4' : '198.51.100.5')
++  })
++  it('preserves the native two-hop topology', () => {
++    mockGetRequestIP.mockReturnValue('192.0.2.7')
++    proxyConfig.hops = 2
++    expect(getClientIp(headers())).toBe('198.51.100.6')
++  })
++  it('ignores forwarding headers when native hops is zero and no header is configured', () => {
++    mockGetRequestIP.mockReturnValue('192.0.2.7')
++    expect(getClientIp(headers())).toBe('192.0.2.7')
++  })
++  it('uses native hop fallback when its configured header is missing', () => {
++    mockGetRequestIP.mockReturnValue('192.0.2.7')
++    proxyConfig.header = 'x-operator-client-ip'
++    proxyConfig.hops = 2
++    expect(getClientIp(headers())).toBe('198.51.100.6')
++  })
++  it('ignores all operator/forwarding/private headers from an untrusted peer', () => {
++    mockGetRequestIP.mockReturnValue('203.0.113.7')
++    proxyConfig.header = 'x-real-ip'
++    proxyConfig.hops = 2
++    const input = headers()
++    input.set(CLIENT_IP_HEADER, '198.51.100.77')
++    expect(getClientIp(input)).toBe('203.0.113.7')
++    expect(withTrustedClientIp(input).get(CLIENT_IP_HEADER)).toBe('203.0.113.7')
++  })
++  it('fails closed without a socket peer', () => {
++    proxyConfig.header = 'cf-connecting-ip'
++    expect(getClientIp(headers())).toBe('unknown')
++  })
++  it('preserves a separately authenticated native signed-edge address', () => {
++    vi.stubEnv('QUACKBACK_SAAS_EDGE_SECRET', 'synthetic-edge-test-only')
++    vi.stubEnv('QUACKBACK_SAAS_RAILWAY_ORIGIN', 'origin.up.example')
++    mockGetRequestIP.mockReturnValue('203.0.113.7')
++    const now = Math.floor(Date.now()/1000)
++    const customer = 'feedback.customer.test'
++    const input = new Headers({host:'origin.up.example',
++      'x-quackback-customer-host':customer,
++      'x-quackback-customer-host-sig':signCustomerHost('synthetic-edge-test-only',customer),
++      'x-quackback-edge-client-ip':'198.51.100.23',
++      'x-quackback-edge-client-ip-sig':`${now}.${signEdgeClientIp('synthetic-edge-test-only',customer,'198.51.100.23',now)}`})
++    expect(getClientIp(input)).toBe('198.51.100.23')
++  })
++})
++
+ describe('withTrustedClientIp', () => {
+   it('uses the socket peer and ignores a spoofed X-Forwarded-For when no proxy is trusted', () => {
+     mockGetRequestIP.mockReturnValue('203.0.113.7')
+diff --git a/apps/web/src/lib/server/auth/__tests__/proxy-peers.test.ts b/apps/web/src/lib/server/auth/__tests__/proxy-peers.test.ts
+new file mode 100644
+index 000000000..6c2b009f3
+--- /dev/null
++++ b/apps/web/src/lib/server/auth/__tests__/proxy-peers.test.ts
+@@ -0,0 +1,24 @@
++import { describe, it, expect } from 'vitest'
++import { configuredProxyPeer } from '../proxy-peers'
++
++describe('exposed-origin trusted proxy seam', () => {
++  it('keeps native semantics when no CIDR policy is configured', () => {
++    expect(configuredProxyPeer('203.0.113.4', '')).toBeNull()
++  })
++  it.each(['203.0.113.4', '2001:db8:bad::1'])('ignores spoofed forwarding headers from untrusted peer %s', peer => {
++    expect(configuredProxyPeer(peer, '192.0.2.0/24')).toBe(peer)
++  })
++  it.each(['192.0.2.7','::ffff:192.0.2.7'])('delegates admitted peer %s to native config', peer => {
++    expect(configuredProxyPeer(peer, '192.0.2.0/24')).toBeNull()
++  })
++  it.each(['192.0.2.0/invalid', '192.0.2.0/99', 'garbage', '192.0.2.0/24/4', '192.0.2.0/24,',
++    '192.0.2.0/', '192.0.2.0/ ', '192.0.2.0/+0', '2001:db8::/', '2001:db8::/ '])('fails closed on malformed policy %s', policy => {
++    expect(configuredProxyPeer('192.0.2.7', policy)).toBe('192.0.2.7')
++  })
++  it.each([undefined, 'garbage'])('fails closed without a real peer %s', peer => {
++    expect(configuredProxyPeer(peer, '192.0.2.0/24')).toBe('unknown')
++  })
++  it('supports admitted IPv6 peers and keeps independent direct IPv6 clients', () => {
++    expect(configuredProxyPeer('2001:db8::1', '2001:db8::/32')).toBeNull()
++  })
++})
+diff --git a/apps/web/src/lib/server/auth/proxy-peers.ts b/apps/web/src/lib/server/auth/proxy-peers.ts
+new file mode 100644
+index 000000000..9dbfa515c
+--- /dev/null
++++ b/apps/web/src/lib/server/auth/proxy-peers.ts
+@@ -0,0 +1,21 @@
++import { BlockList, isIP } from 'node:net'
++
++/** Authenticate the TCP peer; native code still resolves admitted headers/hops. */
++export function configuredProxyPeer(peer: string | undefined,
++  cidrs = process.env.TRUSTED_PROXY_CIDRS): string | null {
++  if (!cidrs?.trim()) return null
++  if (!peer || !isIP(peer)) return 'unknown'
++  const list = new BlockList()
++  for (const value of cidrs.split(',')) {
++    const parts = value.trim().split('/')
++    const ip = parts[0]
++    const family = isIP(ip)
++    const max = family === 6 ? 128 : 32
++    if (parts.length === 2 && !/^[0-9]+$/.test(parts[1])) return peer
++    const prefix = parts.length === 1 ? max : Number(parts[1])
++    if (!family || parts.length > 2 || !Number.isInteger(prefix) || prefix < 0 || prefix > max) return peer
++    list.addSubnet(ip, prefix, family === 6 ? 'ipv6' : 'ipv4')
++  }
++  // null delegates to the unchanged native operator header/hop resolver.
++  return list.check(peer, isIP(peer) === 6 ? 'ipv6' : 'ipv4') ? null : peer
++}
+diff --git a/apps/web/src/lib/server/domains/api/rate-limit.ts b/apps/web/src/lib/server/domains/api/rate-limit.ts
+index 22c78492a..814823748 100644
+--- a/apps/web/src/lib/server/domains/api/rate-limit.ts
++++ b/apps/web/src/lib/server/domains/api/rate-limit.ts
+@@ -12,6 +12,7 @@ import { API_MONTH_BUCKET_KEY, secondsUntilNextUtcMonth } from './monthly-usage'
+ import { isIP } from 'node:net'
+ import { config } from '@/lib/server/config'
+ import { getRequestIP } from '@tanstack/react-start/server'
++import { configuredProxyPeer } from '@/lib/server/auth/proxy-peers'
+ import { logger } from '@/lib/server/logger'
+ import {
+   EDGE_CLIENT_IP_HEADER,
+@@ -217,6 +218,10 @@ export function getClientIp(source: Request | Headers): string {
+     if (edge && 'ip' in edge) return edge.ip
+     if (edge) warnEdgeClientIpRejected(edge.rejected)
+   }
++  let peer: string | undefined
++  try { peer = getRequestIP() } catch { /* no runtime peer: fail closed */ }
++  const configured = configuredProxyPeer(peer)
++  if (configured !== null) return configured
+   // Startup validates config before serving traffic. Unit-level consumers may
+   // intentionally load this helper without a complete runtime environment;
+   // fail closed to direct-peer semantics in that case.

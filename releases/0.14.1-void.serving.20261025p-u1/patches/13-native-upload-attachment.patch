@@ -1,0 +1,1147 @@
+diff --git a/apps/web/src/components/widget/__tests__/native-host-bridge-upload.test.tsx b/apps/web/src/components/widget/__tests__/native-host-bridge-upload.test.tsx
+new file mode 100644
+index 00000000..d3cdadfe
+--- /dev/null
++++ b/apps/web/src/components/widget/__tests__/native-host-bridge-upload.test.tsx
+@@ -0,0 +1,127 @@
++// @vitest-environment happy-dom
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const ports = vi.hoisted(() => ({ upload: vi.fn(), action: vi.fn() }))
++vi.mock('@tanstack/react-start', () => ({
++  createServerFn: () => {
++    const fn = Object.assign(async () => undefined, { validator: () => fn, handler: () => fn })
++    return fn
++  },
++}))
++vi.mock('@/lib/server/functions/widget/native-host', async (original) => ({
++  ...(await original<typeof import('@/lib/server/functions/widget/native-host')>()),
++  nativeHostActionFn: ports.action,
++}))
++vi.mock('@/lib/client/native-host-attachment', () => ({ uploadNativeAttachment: ports.upload }))
++vi.mock('../widget-native-capture', () => ({ configureNativeCapture: vi.fn() }))
++import { useNativeHostBridge } from '../use-native-host-bridge'
++
++const hostOrigin = 'https://app.example.test'
++const contract = 'iplaycafe.feedback/native-1'
++let replies: Array<Record<string, unknown>> = []
++function command(type: string, payload: Record<string, unknown>) {
++  return { contract, operationId: crypto.randomUUID(), type, payload }
++}
++async function send(value: ReturnType<typeof command>) {
++  await act(async () => {
++    window.dispatchEvent(
++      new MessageEvent('message', {
++        source: window.parent,
++        origin: hostOrigin,
++        data: { type: 'quackback:native', data: value },
++      })
++    )
++    for (let i = 0; i < 10; i++) await Promise.resolve()
++  })
++}
++function resultFor(value: ReturnType<typeof command>) {
++  return replies.find((reply) => reply.operationId === value.operationId)
++}
++beforeEach(() => {
++  replies = []
++  ports.upload.mockReset()
++  ports.action.mockReset()
++  vi.spyOn(window.parent, 'postMessage').mockImplementation(((message: {
++    payload: Record<string, unknown>
++  }) => {
++    replies.push(message.payload)
++  }) as typeof window.postMessage)
++  vi.stubGlobal(
++    'fetch',
++    vi.fn(async (_url: string, init: { body: string }) => {
++      const body = JSON.parse(init.body) as { ipc: Record<string, unknown> }
++      return Response.json({
++        sessionToken: 'native-session',
++        user: { id: 'user_native', name: 'N', email: 'n@example.test', avatarUrl: null },
++        nativeAck: { ...body.ipc, audience: window.location.origin, jti: crypto.randomUUID() },
++      })
++    })
++  )
++})
++afterEach(() => {
++  cleanup()
++  vi.restoreAllMocks()
++  vi.unstubAllGlobals()
++})
++
++describe('native iframe upload-attachment routing', () => {
++  it('refuses before identify, then hands the same structured-clone Blob to the widget uploader', async () => {
++    renderHook(() =>
++      useNativeHostBridge(
++        () => {},
++        () => null
++      )
++    )
++    const blob = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
++    const early = command('upload-attachment', { file: blob, name: 'report.png' })
++    await send(early)
++    expect(resultFor(early)).toMatchObject({
++      success: false,
++      error: 'IDENTITY_REQUIRED',
++      type: 'upload-attachment',
++    })
++    expect(ports.upload).not.toHaveBeenCalled()
++
++    const identify = command('identify', { ssoToken: 'synthetic-sso' })
++    await send(identify)
++    expect(resultFor(identify)).toMatchObject({ success: true })
++
++    const uploaded = {
++      fileId: 'file_x',
++      url: '/api/storage/files/x.png',
++      name: 'report.png',
++      size: 3,
++      mimeType: 'image/png',
++    }
++    ports.upload.mockResolvedValueOnce(uploaded)
++    const upload = command('upload-attachment', { file: blob, name: 'report.png' })
++    await send(upload)
++    expect(ports.upload).toHaveBeenCalledTimes(1)
++    expect(ports.upload.mock.calls[0][0].file).toBe(blob)
++    expect(ports.upload.mock.calls[0][0].name).toBe('report.png')
++    expect(ports.action).not.toHaveBeenCalled()
++    expect(resultFor(upload)).toMatchObject({
++      success: true,
++      result: uploaded,
++      hostOrigin,
++      contract,
++    })
++  })
++  it('returns the closed refusal code from the uploader', async () => {
++    renderHook(() =>
++      useNativeHostBridge(
++        () => {},
++        () => null
++      )
++    )
++    await send(command('identify', { ssoToken: 'synthetic-sso' }))
++    ports.upload.mockRejectedValueOnce(new Error('ATTACHMENT_RATE_LIMITED'))
++    const upload = command('upload-attachment', {
++      file: new Blob([new Uint8Array([1])]),
++      name: 'a.png',
++    })
++    await send(upload)
++    expect(resultFor(upload)).toMatchObject({ success: false, error: 'ATTACHMENT_RATE_LIMITED' })
++  })
++})
+diff --git a/apps/web/src/components/widget/use-native-host-bridge.ts b/apps/web/src/components/widget/use-native-host-bridge.ts
+index ee7326f2..c9302e96 100644
+--- a/apps/web/src/components/widget/use-native-host-bridge.ts
++++ b/apps/web/src/components/widget/use-native-host-bridge.ts
+@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from 'react'
+ import { createNativeHostController } from '@/lib/client/native-host-controller'
+ import { nativeHostActionFn, nativeHostActionSchema } from '@/lib/server/functions/widget/native-host'
+ import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
++import { uploadNativeAttachment } from '@/lib/client/native-host-attachment'
+ import type { NativeHostContext } from '@/lib/shared/widget/native-host'
+ import { configureNativeCapture } from './widget-native-capture'
+ 
+@@ -22,6 +23,9 @@ export function useNativeHostBridge(
+   useEffect(() => {
+     const action = async (type: string, payload: Record<string, unknown>, context: NativeHostContext, token?: string | null) => {
+       if (type === 'logout' && !token) return {loggedOut: true}
++      // Client-side only: the bytes use the widget's own file upload, never the
++      // server-function facade. The controller already applied the identity gate.
++      if (type === 'upload-attachment') return uploadNativeAttachment(payload)
+       const headers = token ? {Authorization: `Bearer ${token}`} : getWidgetAuthHeaders()
+       return nativeHostActionFn({data: {context, action: nativeHostActionSchema.parse({type, payload})}, headers})
+     }
+diff --git a/apps/web/src/lib/client/__tests__/native-host-attachment.test.ts b/apps/web/src/lib/client/__tests__/native-host-attachment.test.ts
+new file mode 100644
+index 00000000..81af786e
+--- /dev/null
++++ b/apps/web/src/lib/client/__tests__/native-host-attachment.test.ts
+@@ -0,0 +1,202 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { uploadNativeAttachment, isNativeAttachmentName } from '../native-host-attachment'
++import { clearWidgetToken, setWidgetToken } from '@/lib/client/widget-auth'
++import { MAX_ATTACHMENT_BYTES, MAX_VIDEO_ATTACHMENT_BYTES } from '@/lib/shared/files/file-types'
++
++interface Sent {
++  method: string
++  url: string
++  headers: Record<string, string>
++  body: unknown
++}
++const sent: Sent[] = []
++let respond: (xhr: FakeXhr) => void = () => {}
++
++/** The real shared composer helper runs; only the network object is fake. */
++class FakeXhr {
++  status = 0
++  responseText = ''
++  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null }
++  onload: (() => void) | null = null
++  onerror: (() => void) | null = null
++  onabort: (() => void) | null = null
++  private request: Sent = { method: '', url: '', headers: {}, body: null }
++  open(method: string, url: string) {
++    this.request.method = method
++    this.request.url = url
++  }
++  setRequestHeader(key: string, value: string) {
++    this.request.headers[key.toLowerCase()] = value
++  }
++  abort() {
++    this.onabort?.()
++  }
++  send(body: unknown) {
++    this.request.body = body
++    sent.push(this.request)
++    queueMicrotask(() => respond(this))
++  }
++}
++function reply(status: number, body: unknown) {
++  respond = (xhr) => {
++    xhr.status = status
++    xhr.responseText = JSON.stringify(body)
++    xhr.onload?.()
++  }
++}
++const stored = {
++  fileId: 'file_01kexample',
++  url: '/api/storage/files/x.png',
++  name: 'report.png',
++  contentType: 'image/png',
++  size: 4,
++  family: 'image',
++}
++const bytes = () => new Uint8Array([0x89, 0x50, 0x4e, 0x47])
++
++beforeEach(() => {
++  sent.length = 0
++  vi.stubGlobal('XMLHttpRequest', FakeXhr)
++  setWidgetToken('synthetic-native-session')
++  reply(201, stored)
++})
++afterEach(() => {
++  vi.unstubAllGlobals()
++  clearWidgetToken()
++})
++
++describe('native upload-attachment', () => {
++  it('posts the exact Blob bytes through the widget file endpoint with the widget session', async () => {
++    const blob = new Blob([bytes()], { type: 'image/png' })
++    await expect(uploadNativeAttachment({ file: blob, name: 'report.png' })).resolves.toEqual({
++      fileId: stored.fileId,
++      url: stored.url,
++      name: 'report.png',
++      size: 4,
++      mimeType: 'image/png',
++    })
++    expect(sent).toHaveLength(1)
++    expect(sent[0].method).toBe('POST')
++    expect(sent[0].url).toBe('/api/widget/files?name=report.png')
++    expect(sent[0].headers.authorization).toBe('Bearer synthetic-native-session')
++    expect(sent[0].headers['content-type']).toBe('image/png')
++    const body = sent[0].body as File
++    expect(body).toBeInstanceOf(Blob)
++    expect(body.name).toBe('report.png')
++    expect(new Uint8Array(await body.arrayBuffer())).toEqual(bytes())
++  })
++  it('encodes the display name in the query and returns the stored name and type', async () => {
++    reply(201, { ...stored, name: 'รายงาน 1.webm', contentType: 'video/webm' })
++    const result = await uploadNativeAttachment({
++      file: new Blob([bytes()], { type: 'video/webm' }),
++      name: 'รายงาน 1.webm',
++    })
++    expect(sent[0].url).toBe(`/api/widget/files?name=${encodeURIComponent('รายงาน 1.webm')}`)
++    expect(result).toMatchObject({ name: 'รายงาน 1.webm', mimeType: 'video/webm' })
++  })
++  it.each([
++    ['a string', 'aGVsbG8='],
++    ['an ArrayBuffer', new ArrayBuffer(4)],
++    ['a typed array', bytes()],
++    ['a JSON-serialised Blob', JSON.parse(JSON.stringify(new Blob([bytes()])))],
++    ['null', null],
++  ])('refuses %s instead of a structured-clone Blob without any request', async (_label, file) => {
++    await expect(uploadNativeAttachment({ file, name: 'report.png' })).rejects.toThrow(
++      'ATTACHMENT_INVALID'
++    )
++    expect(sent).toHaveLength(0)
++  })
++  it('refuses an empty Blob and widened or missing payload keys', async () => {
++    const blob = new Blob([bytes()], { type: 'image/png' })
++    for (const payload of [
++      { file: new Blob([]), name: 'report.png' },
++      { file: blob },
++      { name: 'report.png' },
++      { file: blob, name: 'report.png', ticketId: 'ticket_x' },
++    ]) {
++      await expect(uploadNativeAttachment(payload)).rejects.toThrow('ATTACHMENT_INVALID')
++    }
++    expect(sent).toHaveLength(0)
++  })
++  it('refuses a Blob above the existing family cap before the network', async () => {
++    const image = new Blob([bytes()], { type: 'image/png' })
++    Object.defineProperty(image, 'size', { value: MAX_ATTACHMENT_BYTES + 1 })
++    await expect(uploadNativeAttachment({ file: image, name: 'report.png' })).rejects.toThrow(
++      'ATTACHMENT_TOO_LARGE'
++    )
++    const video = new Blob([bytes()], { type: 'video/webm' })
++    Object.defineProperty(video, 'size', { value: MAX_VIDEO_ATTACHMENT_BYTES + 1 })
++    await expect(uploadNativeAttachment({ file: video, name: 'screen.webm' })).rejects.toThrow(
++      'ATTACHMENT_TOO_LARGE'
++    )
++    expect(sent).toHaveLength(0)
++  })
++  it('admits a video up to the video cap', async () => {
++    const video = new Blob([bytes()], { type: 'video/webm' })
++    Object.defineProperty(video, 'size', { value: MAX_ATTACHMENT_BYTES + 1 })
++    reply(201, { ...stored, contentType: 'video/webm', name: 'screen.webm' })
++    await expect(
++      uploadNativeAttachment({ file: video, name: 'screen.webm' })
++    ).resolves.toMatchObject({ mimeType: 'video/webm' })
++  })
++  it('refuses names that are empty, too long, path-like, padded or contain control characters', async () => {
++    const control = 'a' + String.fromCharCode(0) + '.png'
++    const newline = 'a' + String.fromCharCode(10) + '.png'
++    const del = 'a' + String.fromCharCode(127) + '.png'
++    for (const name of [
++      '',
++      'x'.repeat(256),
++      'dir/report.png',
++      'dir\\report.png',
++      '../report.png',
++      '..',
++      '.',
++      ' report.png',
++      'report.png ',
++      control,
++      newline,
++      del,
++      42,
++      undefined,
++    ]) {
++      expect(isNativeAttachmentName(name)).toBe(false)
++      await expect(uploadNativeAttachment({ file: new Blob([bytes()]), name })).rejects.toThrow(
++        'ATTACHMENT_INVALID'
++      )
++    }
++    expect(isNativeAttachmentName('x'.repeat(251) + '.png')).toBe(true)
++    expect(sent).toHaveLength(0)
++  })
++  it.each([
++    [413, { error: 'Over 25 MB', reason: 'too_large' }, 'ATTACHMENT_TOO_LARGE'],
++    [415, { error: 'Refused', reason: 'blocked' }, 'ATTACHMENT_TYPE_REFUSED'],
++    [400, { error: 'Empty', reason: 'empty' }, 'ATTACHMENT_INVALID'],
++    [
++      429,
++      { error: { code: 'RATE_LIMITED', message: 'Too many uploads, slow down' } },
++      'ATTACHMENT_RATE_LIMITED',
++    ],
++    [
++      401,
++      { error: { code: 'AUTH_REQUIRED', message: 'Valid widget session required' } },
++      'ATTACHMENT_UPLOAD_FAILED',
++    ],
++    [503, { error: 'File storage is not configured' }, 'ATTACHMENT_UPLOAD_FAILED'],
++    [500, { error: 'Upload failed' }, 'ATTACHMENT_UPLOAD_FAILED'],
++    [201, { url: '/api/storage/files/x.png' }, 'ATTACHMENT_UPLOAD_FAILED'],
++  ])('maps HTTP %i to a closed code', async (status, body, code) => {
++    reply(status, body)
++    await expect(
++      uploadNativeAttachment({
++        file: new Blob([bytes()], { type: 'image/png' }),
++        name: 'report.png',
++      })
++    ).rejects.toThrow(new RegExp(`^${code}$`))
++  })
++  it('maps a transport failure to ATTACHMENT_UPLOAD_FAILED', async () => {
++    respond = (xhr) => xhr.onerror?.()
++    await expect(
++      uploadNativeAttachment({ file: new Blob([bytes()]), name: 'report.png' })
++    ).rejects.toThrow('ATTACHMENT_UPLOAD_FAILED')
++  })
++})
+diff --git a/apps/web/src/lib/client/__tests__/native-host-controller-upload.test.ts b/apps/web/src/lib/client/__tests__/native-host-controller-upload.test.ts
+new file mode 100644
+index 00000000..c826cec4
+--- /dev/null
++++ b/apps/web/src/lib/client/__tests__/native-host-controller-upload.test.ts
+@@ -0,0 +1,125 @@
++import { describe, it, expect, vi } from 'vitest'
++import { createNativeHostController } from '../native-host-controller'
++import { nativeHostCommandSchema, type NativeHostContext } from '@/lib/shared/widget/native-host'
++const origin = 'https://app.example.test'
++const audience = 'https://feedback.example.test'
++function command(type: string, payload: Record<string, unknown> = {}) {
++  return {
++    contract: 'iplaycafe.feedback/native-1',
++    operationId: crypto.randomUUID(),
++    type,
++    payload,
++  }
++}
++function ports() {
++  return {
++    audience,
++    clearIdentity: vi.fn(() => 'previous'),
++    applyIdentity: vi.fn(),
++    identify: vi.fn(
++      async (
++        _payload: Record<string, unknown>,
++        context: NativeHostContext
++      ): Promise<Record<string, unknown>> => ({
++        sessionToken: 'native-session',
++        user: { id: 'u' },
++        nativeAck: { ...context, audience, jti: crypto.randomUUID() },
++      })
++    ),
++    action: vi.fn(async (type: string, ..._rest: unknown[]): Promise<unknown> =>
++      type === 'logout' ? { loggedOut: true } : { fileId: 'file_x' }
++    ),
++    respond: vi.fn(),
++    configureCapture: vi.fn(),
++  }
++}
++const blob = () => new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
++const replyFor = (p: ReturnType<typeof ports>, op: { operationId: string }) =>
++  p.respond.mock.calls
++    .map(([, , value]) => value)
++    .filter((value) => value.operationId === op.operationId)
++
++describe('native upload-attachment command', () => {
++  it('is part of the closed native-1 command set and keeps the Blob by reference', () => {
++    const file = blob()
++    const parsed = nativeHostCommandSchema.parse(
++      command('upload-attachment', { file, name: 'a.png' })
++    )
++    expect(parsed.payload.file).toBe(file)
++    expect(
++      nativeHostCommandSchema.safeParse(command('attach', { file, name: 'a.png' })).success
++    ).toBe(false)
++  })
++  it('answers IDENTITY_REQUIRED before identify and from another parent origin, without uploading', async () => {
++    const p = ports()
++    const bridge = createNativeHostController(p)
++    const early = command('upload-attachment', { file: blob(), name: 'a.png' })
++    await bridge.receive(early, origin)
++    expect(replyFor(p, early)).toEqual([
++      expect.objectContaining({ success: false, error: 'IDENTITY_REQUIRED' }),
++    ])
++    await bridge.receive(command('identify'), origin)
++    const foreign = command('upload-attachment', { file: blob(), name: 'a.png' })
++    await bridge.receive(foreign, 'https://evil.example.test')
++    expect(replyFor(p, foreign)).toEqual([
++      expect.objectContaining({ success: false, error: 'IDENTITY_REQUIRED' }),
++    ])
++    expect(p.action).not.toHaveBeenCalled()
++  })
++  it('passes the identical Blob to the iframe port after identify and returns its result', async () => {
++    const p = ports()
++    const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    const file = blob()
++    const op = command('upload-attachment', { file, name: 'a.png' })
++    await bridge.receive(op, origin)
++    expect(p.action).toHaveBeenCalledWith(
++      'upload-attachment',
++      { file, name: 'a.png' },
++      expect.objectContaining({
++        operationId: op.operationId,
++        hostOrigin: origin,
++      })
++    )
++    expect((p.action.mock.calls[0] as unknown[])[1]).toMatchObject({ file })
++    expect(((p.action.mock.calls[0] as unknown[])[1] as { file: Blob }).file).toBe(file)
++    expect(replyFor(p, op)).toEqual([
++      expect.objectContaining({ success: true, result: { fileId: 'file_x' } }),
++    ])
++  })
++  it('keeps closed refusal codes and hides any other failure text', async () => {
++    const p = ports()
++    const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.action.mockRejectedValueOnce(new Error('ATTACHMENT_TYPE_REFUSED'))
++    const refused = command('upload-attachment', { file: blob(), name: 'a.exe' })
++    await bridge.receive(refused, origin)
++    expect(replyFor(p, refused)).toEqual([
++      expect.objectContaining({ success: false, error: 'ATTACHMENT_TYPE_REFUSED' }),
++    ])
++    p.action.mockRejectedValueOnce(new Error('storage said: key files/abc'))
++    const opaque = command('upload-attachment', { file: blob(), name: 'a.png' })
++    await bridge.receive(opaque, origin)
++    expect(replyFor(p, opaque)).toEqual([
++      expect.objectContaining({ success: false, error: 'NATIVE_OPERATION_FAILED' }),
++    ])
++  })
++  it('fences an in-flight upload result when the identity switches', async () => {
++    const p = ports()
++    const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    let resolve!: (value: unknown) => void
++    p.action.mockImplementationOnce(
++      () =>
++        new Promise((r) => {
++          resolve = r
++        })
++    )
++    const op = command('upload-attachment', { file: blob(), name: 'a.png' })
++    const pending = bridge.receive(op, origin)
++    await bridge.receive(command('identify'), origin)
++    resolve({ fileId: 'file_old_identity' })
++    await pending
++    expect(replyFor(p, op)).toHaveLength(0)
++  })
++})
+diff --git a/apps/web/src/lib/client/native-host-attachment.ts b/apps/web/src/lib/client/native-host-attachment.ts
+new file mode 100644
+index 00000000..d59de22f
+--- /dev/null
++++ b/apps/web/src/lib/client/native-host-attachment.ts
+@@ -0,0 +1,99 @@
++/**
++ * Native host `upload-attachment`: host-provided bytes become an ordinary
++ * Quackback file through the same widget upload endpoint and helper the
++ * messenger composer uses. The host never receives a storage credential; it
++ * gets a file id that only this identified requester can attach to a Ticket.
++ *
++ * The controller has already enforced the native identity gate and fences the
++ * reply by identity generation. This module validates the structured-clone
++ * Blob and name, uploads, and maps every refusal to a closed error code.
++ */
++import { uploadFile, UploadError } from '@/lib/client/files/upload-file'
++import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
++import { familyFor, maxBytesForFamily } from '@/lib/shared/files/file-types'
++import type { UploadedFile } from '@/lib/shared/conversation/types'
++
++export const NATIVE_ATTACHMENT_NAME_MAX = 255
++
++export interface NativeAttachmentResult {
++  fileId: string
++  url: string
++  name: string
++  size: number
++  mimeType: string
++}
++
++export type NativeAttachmentUpload = (file: File) => Promise<UploadedFile>
++
++const defaultUpload: NativeAttachmentUpload = (file) =>
++  uploadFile(file, { endpoint: '/api/widget/files', headers: getWidgetAuthHeaders() })
++
++/** A display name only: no path, no control character, no dot-only name. */
++export function isNativeAttachmentName(value: unknown): value is string {
++  if (typeof value !== 'string') return false
++  const length = [...value].length
++  if (length < 1 || length > NATIVE_ATTACHMENT_NAME_MAX) return false
++  if (value.trim() !== value || /^\.+$/.test(value)) return false
++  for (const character of value) {
++    const code = character.codePointAt(0) ?? 0
++    if (code < 0x20 || code === 0x7f || character === '/' || character === '\\') return false
++  }
++  return true
++}
++
++function refusal(code: string): Error {
++  return new Error(code)
++}
++
++/** Server and transport refusals, by the reason the shared helper reports. */
++function mapUploadError(error: unknown): Error {
++  const reason = error instanceof UploadError ? error.reason : undefined
++  if (reason === 'too_large') return refusal('ATTACHMENT_TOO_LARGE')
++  if (reason === 'blocked') return refusal('ATTACHMENT_TYPE_REFUSED')
++  if (reason === 'empty') return refusal('ATTACHMENT_INVALID')
++  if (reason === 'rate_limited') return refusal('ATTACHMENT_RATE_LIMITED')
++  return refusal('ATTACHMENT_UPLOAD_FAILED')
++}
++
++export async function uploadNativeAttachment(
++  payload: Record<string, unknown>,
++  upload: NativeAttachmentUpload = defaultUpload
++): Promise<NativeAttachmentResult> {
++  const keys = Object.keys(payload)
++  if (keys.length !== 2 || !('file' in payload) || !('name' in payload)) {
++    throw refusal('ATTACHMENT_INVALID')
++  }
++  const { file, name } = payload
++  // A structured-clone Blob only. JSON, data URLs, strings and buffers are refused.
++  if (!(file instanceof Blob) || !isNativeAttachmentName(name)) throw refusal('ATTACHMENT_INVALID')
++  if (file.size <= 0) throw refusal('ATTACHMENT_INVALID')
++  if (file.size > maxBytesForFamily(familyFor(name, file.type)))
++    throw refusal('ATTACHMENT_TOO_LARGE')
++
++  let uploaded: UploadedFile
++  try {
++    uploaded = await upload(new File([file], name, { type: file.type }))
++  } catch (error) {
++    throw mapUploadError(error)
++  }
++  if (
++    !uploaded ||
++    typeof uploaded.fileId !== 'string' ||
++    !uploaded.fileId ||
++    typeof uploaded.url !== 'string' ||
++    !uploaded.url ||
++    typeof uploaded.size !== 'number'
++  ) {
++    throw refusal('ATTACHMENT_UPLOAD_FAILED')
++  }
++  return {
++    fileId: uploaded.fileId,
++    url: uploaded.url,
++    name: typeof uploaded.name === 'string' && uploaded.name ? uploaded.name : name,
++    size: uploaded.size,
++    mimeType:
++      typeof uploaded.contentType === 'string' && uploaded.contentType
++        ? uploaded.contentType
++        : 'application/octet-stream',
++  }
++}
+diff --git a/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-attachments.test.ts b/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-attachments.test.ts
+new file mode 100644
+index 00000000..8845acbb
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-attachments.test.ts
+@@ -0,0 +1,227 @@
++/**
++ * Real-DB witness for native upload-attachment + create-ticket: a file the
++ * identified requester stored through the widget pipeline is linked to the
++ * native Ticket's opening message, a same-submission retry never relinks or
++ * duplicates it, and another principal's upload is refused before any Ticket,
++ * pair or native submission mapping exists. Runs in the rollback fixture.
++ */
++import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest'
++import {
++  createId,
++  type PrincipalId,
++  type TicketId,
++  type TicketStatusId,
++  type UserId,
++} from '@quackback/ids'
++
++vi.mock('@/lib/server/db', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/lib/server/db')>()),
++  db: (await import('@/lib/server/__tests__/db-test-fixture')).testDb,
++}))
++vi.mock('@/lib/server/config', () => ({
++  config: { s3PublicUrl: undefined, baseUrl: 'http://localhost:3000' },
++  getBaseUrl: () => 'http://localhost:3000',
++}))
++vi.mock('@/lib/server/storage/s3', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/lib/server/storage/s3')>()),
++  uploadObject: vi.fn(async (key: string) => `/api/storage/${key}?read=sig`),
++  getPublicUrlOrNull: (key: string | null | undefined) =>
++    key ? `/api/storage/${key}?read=fresh` : null,
++}))
++vi.mock('@/lib/server/storage/trusted-url', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/lib/server/storage/trusted-url')>()),
++  isTrustedAttachmentUrl: (url: string) =>
++    typeof url === 'string' && url.startsWith('/api/storage/'),
++}))
++vi.mock('@/lib/server/jobs/job-queue', () => ({
++  enqueueJob: vi.fn(async () => ({ inserted: true, jobId: 'job_x' })),
++}))
++vi.mock('@/lib/server/realtime/conversation-channels', () => ({
++  publishTicketEvent: vi.fn(),
++  publishConversationEvent: vi.fn(),
++  publishConversationMessage: vi.fn(),
++  publishAgentConversationEvent: vi.fn(),
++  publishConversationUpdate: vi.fn(),
++  publishTyping: vi.fn(),
++}))
++vi.mock('../ticket.webhooks', () => ({
++  emitTicketCreated: vi.fn().mockResolvedValue(undefined),
++  emitTicketStatusChanged: vi.fn().mockResolvedValue(undefined),
++  emitTicketAssigned: vi.fn().mockResolvedValue(undefined),
++  emitTicketReplied: vi.fn().mockResolvedValue(undefined),
++  emitTicketNoteAdded: vi.fn().mockResolvedValue(undefined),
++  emitTicketExternalStatusChanged: vi.fn().mockResolvedValue(undefined),
++}))
++vi.mock('../../conversation/conversation.webhooks', () => ({
++  emitConversationCreated: vi.fn().mockResolvedValue(undefined),
++  emitMessageCreated: vi.fn().mockResolvedValue(undefined),
++  emitMessageNoteCreated: vi.fn().mockResolvedValue(undefined),
++  emitMessageDeleted: vi.fn().mockResolvedValue(undefined),
++  emitConversationStatusChanged: vi.fn().mockResolvedValue(undefined),
++  emitConversationAssigned: vi.fn().mockResolvedValue(undefined),
++  emitConversationPriorityChanged: vi.fn().mockResolvedValue(undefined),
++  emitConversationCsatSubmitted: vi.fn().mockResolvedValue(undefined),
++  emitConversationCsatCommentAdded: vi.fn().mockResolvedValue(undefined),
++}))
++vi.mock('../../conversation/conversation.notify', () => ({
++  notifyVisitorMessage: vi.fn().mockResolvedValue(undefined),
++  notifyAgentReply: vi.fn().mockResolvedValue(undefined),
++  notifyConversationStarted: vi.fn().mockResolvedValue(undefined),
++}))
++vi.mock('@/lib/server/domains/assistant/assistant.orchestrator', () => ({
++  runAssistantTurnForConversation: vi.fn().mockResolvedValue(undefined),
++}))
++
++import { createDbTestFixture, testDb } from '@/lib/server/__tests__/db-test-fixture'
++import {
++  conversationMessages,
++  files,
++  principal,
++  settings,
++  ticketConversations,
++  tickets,
++  ticketStatuses,
++  user,
++  and,
++  eq,
++  sql,
++} from '@/lib/server/db'
++import { ANONYMOUS_ACTOR, type Actor } from '@/lib/server/policy/types'
++import { createTicketCore } from '../ticket.service'
++import { storeFile } from '@/lib/server/domains/files/files.service'
++import { nativeSubmissionDigest } from '@/lib/server/widget/native-submission'
++
++const fixture = await createDbTestFixture({
++  probe: async (db) => {
++    await db.select({ id: ticketConversations.ticketId }).from(ticketConversations).limit(0)
++    await db.select({ id: files.id }).from(files).limit(0)
++    await db.execute(sql`select principal_id from ipc_native_submission limit 0`)
++  },
++})
++const suffix = () => `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
++const pdf = () => new TextEncoder().encode('%PDF-1.7\n' + 'x'.repeat(200))
++
++async function seedPrincipal(): Promise<PrincipalId> {
++  const userId = createId('user') as UserId
++  const principalId = createId('principal') as PrincipalId
++  await testDb.insert(user).values({ id: userId, name: `U-${suffix()}` })
++  await testDb
++    .insert(principal)
++    .values({ id: principalId, userId, role: 'user', type: 'user', createdAt: new Date() })
++  return principalId
++}
++function requesterActor(principalId: PrincipalId): Actor {
++  return { ...ANONYMOUS_ACTOR, principalId, principalType: 'user' }
++}
++async function seedDefaultStatus() {
++  await testDb
++    .insert(settings)
++    .values({ name: 'Test WS', slug: `test_${suffix()}`, createdAt: new Date() })
++  await testDb
++    .update(ticketStatuses)
++    .set({ isDefault: false })
++    .where(eq(ticketStatuses.isDefault, true))
++  await testDb.insert(ticketStatuses).values({
++    id: createId('ticket_status') as TicketStatusId,
++    name: 'T-Received',
++    slug: `t_received_${suffix()}`,
++    category: 'open',
++    publicStage: 'received',
++    position: 100,
++    isDefault: true,
++  })
++}
++async function upload(owner: PrincipalId) {
++  return storeFile({
++    bytes: pdf(),
++    name: 'report.pdf',
++    source: 'visitor',
++    uploadedById: owner,
++    unverifiedSender: false,
++  })
++}
++function nativeInput(requester: PrincipalId, fileId: string) {
++  // The wire shape the native facade admits; the core rebuilds the rest from the row.
++  const ticket = {
++    title: 'Broken save',
++    description: 'See the attached report',
++    attachments: [{ fileId, url: '/api/storage/claimed-by-host', size: 1 }],
++  }
++  return {
++    type: 'customer' as const,
++    ...ticket,
++    attachments: ticket.attachments as never,
++    requesterPrincipalId: requester,
++    withBackingConversation: true,
++    nativeSubmission: { submissionId: crypto.randomUUID(), digest: nativeSubmissionDigest(ticket) },
++  }
++}
++
++describe.skipIf(!fixture.available)('native Ticket attachments (real DB, rolled back)', () => {
++  beforeEach(fixture.begin)
++  afterEach(fixture.rollback)
++  afterAll(fixture.close)
++
++  it("links the requester's own upload to the opening message and replays without relinking", async () => {
++    await seedDefaultStatus()
++    const me = await seedPrincipal()
++    const row = await upload(me)
++    const input = nativeInput(me, row.id)
++    const created = await createTicketCore(input, requesterActor(me))
++    const [pair] = await testDb
++      .select()
++      .from(ticketConversations)
++      .where(eq(ticketConversations.ticketId, created.id as TicketId))
++    const messages = await testDb
++      .select()
++      .from(conversationMessages)
++      .where(eq(conversationMessages.conversationId, pair!.conversationId))
++    expect(messages).toHaveLength(1)
++    expect(messages[0]).toMatchObject({ principalId: me, senderType: 'visitor', ticketId: null })
++    expect(messages[0].attachments).toEqual([
++      expect.objectContaining({
++        fileId: row.id,
++        name: 'report.pdf',
++        contentType: 'application/pdf',
++        size: row.size,
++      }),
++    ])
++    const [linked] = await testDb.select().from(files).where(eq(files.id, row.id))
++    expect(linked.messageId).toBe(messages[0].id)
++    expect(linked.attachedAt).not.toBeNull()
++
++    const retried = await createTicketCore(input, requesterActor(me))
++    expect(retried.id).toBe(created.id)
++    expect(
++      await testDb
++        .select()
++        .from(conversationMessages)
++        .where(eq(conversationMessages.conversationId, pair!.conversationId))
++    ).toHaveLength(1)
++    const [after] = await testDb.select().from(files).where(eq(files.id, row.id))
++    expect(after.messageId).toBe(messages[0].id)
++    expect(after.attachedAt?.getTime()).toBe(linked.attachedAt?.getTime())
++  })
++
++  it("refuses another principal's upload before any Ticket, pair or submission mapping", async () => {
++    await seedDefaultStatus()
++    const me = await seedPrincipal()
++    const other = await seedPrincipal()
++    const foreign = await upload(other)
++    const input = nativeInput(me, foreign.id)
++    await expect(createTicketCore(input, requesterActor(me))).rejects.toThrow('Invalid attachment')
++    expect(
++      await testDb.select().from(tickets).where(eq(tickets.requesterPrincipalId, me))
++    ).toHaveLength(0)
++    const mapping = await testDb.execute(
++      sql`select 1 from ipc_native_submission where principal_id = ${me}`
++    )
++    expect(mapping).toHaveLength(0)
++    const [untouched] = await testDb
++      .select()
++      .from(files)
++      .where(and(eq(files.id, foreign.id)))
++    expect(untouched.messageId).toBeNull()
++    expect(untouched.attachedAt).toBeNull()
++  })
++})
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-facade.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-facade.test.ts
+new file mode 100644
+index 00000000..c96036fa
+--- /dev/null
++++ b/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-facade.test.ts
+@@ -0,0 +1,154 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++vi.mock('@tanstack/react-start', () => ({
++  createServerFn: () => {
++    let schema: { parse(value: unknown): unknown },
++      handler: (value: { data: unknown }) => Promise<unknown>
++    const fn = async (value: { data: unknown }) => handler({ data: schema.parse(value.data) })
++    fn.validator = (value: typeof schema) => {
++      schema = value
++      return fn
++    }
++    fn.handler = (value: typeof handler) => {
++      handler = value
++      return fn
++    }
++    return fn
++  },
++}))
++const ports = vi.hoisted(() => ({
++  auth: vi.fn(),
++  bound: vi.fn(),
++  create: vi.fn(),
++  bearer: 'synthetic-native-bearer',
++}))
++vi.mock('@/lib/server/functions/widget-auth', () => ({ requireWidgetAuth: ports.auth }))
++vi.mock('@/lib/server/widget/native-host-token', () => ({
++  requireBoundNativeHostSession: ports.bound,
++  retireNativeHostSession: vi.fn(),
++}))
++vi.mock('@tanstack/react-start/server', () => ({
++  getRequestHeaders: () => new Headers({ authorization: `Bearer ${ports.bearer}` }),
++}))
++vi.mock('@/lib/server/functions/tickets', () => ({ runCreateMyTicket: ports.create }))
++// The digest helper is pure; its module only names the SQL tag for the lock.
++vi.mock('@/lib/server/db', () => ({ sql: vi.fn() }))
++import { nativeHostActionFn, nativeHostActionSchema } from '../native-host'
++import { nativeSubmissionDigest } from '@/lib/server/widget/native-submission'
++import { MAX_CONVERSATION_ATTACHMENTS } from '@/lib/shared/conversation/types'
++const invoke = nativeHostActionFn as unknown as (args: { data: unknown }) => Promise<unknown>
++const context = {
++  contract: 'iplaycafe.feedback/native-1',
++  operationId: '00000000-0000-4000-8000-000000000003',
++  hostOrigin: 'https://app.example.test',
++}
++const ctx = {
++  principal: { type: 'user', id: 'synthetic-principal', role: 'user' },
++  user: { id: 'synthetic-user' },
++  scope: 'widget',
++}
++const submissionId = '00000000-0000-4000-8000-000000000004'
++const attachment = (n: number) => ({
++  fileId: `file_${n}`,
++  url: `/api/storage/files/${n}.png`,
++  size: 10 + n,
++})
++const create = (attachments: unknown) => ({
++  type: 'create-ticket',
++  payload: {
++    submissionId,
++    ticket: { title: 'Broken save', description: 'Screenshot attached', attachments },
++  },
++})
++beforeEach(() => {
++  vi.resetAllMocks()
++  ports.auth.mockResolvedValue(ctx)
++  ports.bound.mockResolvedValue('session')
++  ports.create.mockResolvedValue({ id: 'ticket_x' })
++})
++describe('native create-ticket attachments', () => {
++  it('passes uploaded file references to the native ticket core with an attachment-bound digest', async () => {
++    const attachments = [attachment(1), attachment(2)]
++    await expect(invoke({ data: { context, action: create(attachments) } })).resolves.toEqual({
++      id: 'ticket_x',
++    })
++    const ticket = { title: 'Broken save', description: 'Screenshot attached', attachments }
++    expect(ports.create).toHaveBeenCalledWith(ctx, ticket, {
++      submissionId,
++      digest: nativeSubmissionDigest(ticket),
++    })
++    expect(nativeSubmissionDigest(ticket)).not.toBe(
++      nativeSubmissionDigest({ ...ticket, attachments: [attachment(1)] })
++    )
++    expect(ports.bound.mock.invocationCallOrder[0]).toBeLessThan(
++      ports.create.mock.invocationCallOrder[0]
++    )
++  })
++  it('strips host-only keys such as mimeType so the digest is stable for the same files', async () => {
++    await invoke({
++      data: {
++        context,
++        action: create([{ ...attachment(1), name: 'a.png', mimeType: 'image/png' }]),
++      },
++    })
++    expect(ports.create.mock.calls[0][1].attachments).toEqual([{ ...attachment(1), name: 'a.png' }])
++  })
++  it('accepts the conversation maximum and refuses more before any authority or ticket work', async () => {
++    const full = Array.from({ length: MAX_CONVERSATION_ATTACHMENTS }, (_, n) => attachment(n))
++    expect(nativeHostActionSchema.safeParse(create(full)).success).toBe(true)
++    await expect(
++      invoke({ data: { context, action: create([...full, attachment(99)]) } })
++    ).rejects.toThrow()
++    expect(ports.auth).not.toHaveBeenCalled()
++    expect(ports.create).not.toHaveBeenCalled()
++  })
++  it.each([
++    ['a reference without fileId', { url: '/api/storage/files/1.png', size: 1 }],
++    ['an empty fileId', { fileId: '', url: '/api/storage/files/1.png', size: 1 }],
++    ['a negative size', { fileId: 'file_1', url: '/api/storage/files/1.png', size: -1 }],
++    ['a missing url', { fileId: 'file_1', size: 1 }],
++  ])('refuses %s', async (_label, value) => {
++    await expect(invoke({ data: { context, action: create([value]) } })).rejects.toThrow()
++    expect(ports.create).not.toHaveBeenCalled()
++  })
++  it('keeps text-only native reports unchanged', async () => {
++    const action = {
++      type: 'create-ticket',
++      payload: { submissionId, ticket: { title: 'Text only' } },
++    }
++    await invoke({ data: { context, action } })
++    expect(ports.create).toHaveBeenCalledWith(
++      ctx,
++      { title: 'Text only' },
++      { submissionId, digest: nativeSubmissionDigest({ title: 'Text only' }) }
++    )
++  })
++  it('maps a swept upload to ATTACHMENT_EXPIRED and passes other refusals through', async () => {
++    ports.create.mockRejectedValueOnce(
++      Object.assign(new Error('This file is no longer available. Attach it again.'), {
++        code: 'FILE_EXPIRED',
++      })
++    )
++    await expect(invoke({ data: { context, action: create([attachment(1)]) } })).rejects.toThrow(
++      /^ATTACHMENT_EXPIRED$/
++    )
++    ports.create.mockRejectedValueOnce(
++      Object.assign(new Error('Invalid attachment'), { code: 'VALIDATION_ERROR' })
++    )
++    await expect(invoke({ data: { context, action: create([attachment(1)]) } })).rejects.toThrow(
++      'Invalid attachment'
++    )
++  })
++  it('refuses an unbound session before the ticket core sees any attachment', async () => {
++    ports.bound.mockRejectedValueOnce(new Error('NATIVE_SESSION_BINDING_REQUIRED'))
++    await expect(invoke({ data: { context, action: create([attachment(1)]) } })).rejects.toThrow(
++      'NATIVE_SESSION_BINDING_REQUIRED'
++    )
++    expect(ports.create).not.toHaveBeenCalled()
++  })
++  it('never routes upload-attachment through the server facade', () => {
++    expect(
++      nativeHostActionSchema.safeParse({ type: 'upload-attachment', payload: { name: 'a.png' } })
++        .success
++    ).toBe(false)
++  })
++})
+diff --git a/apps/web/src/lib/server/functions/widget/native-host.ts b/apps/web/src/lib/server/functions/widget/native-host.ts
+index 9b37a2ab..bd331c17 100644
+--- a/apps/web/src/lib/server/functions/widget/native-host.ts
++++ b/apps/web/src/lib/server/functions/widget/native-host.ts
+@@ -1,12 +1,26 @@
+ import { createServerFn } from '@tanstack/react-start'
+ import { z } from 'zod'
+ import { createMyTicketSchema } from '@/lib/shared/schemas/tickets'
++import { MAX_CONVERSATION_ATTACHMENTS } from '@/lib/shared/conversation/types'
+ import { nativeHostContextSchema } from '@/lib/shared/widget/native-host'
+ 
+ const reportId = z.string().regex(/^brp_[0-9a-f-]{36}$/)
+ const evidenceId = z.string().regex(/^qbe_[0-9a-f-]{36}$/)
++// Native Tickets attach only pipeline files (upload-attachment results). The
++// ticket service rebuilds type/size/URL from the file row and admits only the
++// requester's own uploads; unknown keys (for example mimeType) are stripped.
++const nativeTicketAttachment = z.object({
++  fileId: z.string().min(1).max(64),
++  url: z.string().min(1),
++  size: z.number().int().nonnegative(),
++  name: z.string().optional(),
++  contentType: z.string().optional(),
++})
++export const nativeTicketSchema = createMyTicketSchema.extend({
++  attachments: z.array(nativeTicketAttachment).max(MAX_CONVERSATION_ATTACHMENTS).optional(),
++})
+ export const nativeHostActionSchema = z.discriminatedUnion('type', [
+-  z.object({type: z.literal('create-ticket'), payload: z.object({submissionId: z.uuid(), ticket: createMyTicketSchema})}),
++  z.object({type: z.literal('create-ticket'), payload: z.object({submissionId: z.uuid(), ticket: nativeTicketSchema})}),
+   z.object({type: z.literal('list-tickets'), payload: z.object({}).strict()}),
+   z.object({type: z.literal('read-ticket'), payload: z.object({ticketId: z.string().min(1)})}),
+   z.object({type: z.literal('reply-ticket'), payload: z.object({ticketId: z.string().min(1), content: z.string().min(1).max(4000)})}),
+@@ -57,10 +71,16 @@ export const nativeHostActionFn = createServerFn({method: 'POST'})
+     const native = await import('../tickets')
+     if (data.action.type === 'create-ticket') {
+       const {nativeSubmissionDigest} = await import('@/lib/server/widget/native-submission')
+-      return native.runCreateMyTicket(ctx, data.action.payload.ticket, {
+-        submissionId: data.action.payload.submissionId,
+-        digest: nativeSubmissionDigest(data.action.payload.ticket),
+-      })
++      try {
++        return await native.runCreateMyTicket(ctx, data.action.payload.ticket, {
++          submissionId: data.action.payload.submissionId,
++          digest: nativeSubmissionDigest(data.action.payload.ticket),
++        })
++      } catch (error) {
++        // Retention removed an unsent upload: the host must upload it again.
++        if ((error as {code?: unknown} | null)?.code === 'FILE_EXPIRED') throw new Error('ATTACHMENT_EXPIRED')
++        throw error
++      }
+     }
+     if (data.action.type === 'list-tickets') return native.runGetMyTickets(ctx)
+     const {db, tickets, ticketConversations, eq, and, isNull} = await import('@/lib/server/db')
+diff --git a/apps/web/src/lib/shared/widget/native-host.ts b/apps/web/src/lib/shared/widget/native-host.ts
+index ecaec2b4..775ddf5a 100644
+--- a/apps/web/src/lib/shared/widget/native-host.ts
++++ b/apps/web/src/lib/shared/widget/native-host.ts
+@@ -18,6 +18,6 @@ export type NativeHostContext = z.infer<typeof nativeHostContextSchema>
+ export const nativeHostCommandSchema = z.object({
+   contract: z.literal(NATIVE_HOST_CONTRACT),
+   operationId: z.uuid(),
+-  type: z.enum(['identify', 'logout', 'create-ticket', 'list-tickets', 'read-ticket', 'reply-ticket', 'capture-config', 'evidence-capability', 'bind-evidence', 'abort-evidence', 'read-evidence', 'delete-evidence']),
++  type: z.enum(['identify', 'logout', 'create-ticket', 'list-tickets', 'read-ticket', 'reply-ticket', 'capture-config', 'evidence-capability', 'bind-evidence', 'abort-evidence', 'read-evidence', 'delete-evidence', 'upload-attachment']),
+   payload: z.record(z.string(), z.unknown()),
+ }).strict()
+diff --git a/packages/widget/__tests__/native-attachment.test.ts b/packages/widget/__tests__/native-attachment.test.ts
+new file mode 100644
+index 00000000..c986eef5
+--- /dev/null
++++ b/packages/widget/__tests__/native-attachment.test.ts
+@@ -0,0 +1,84 @@
++// @vitest-environment happy-dom
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { createSDK } from '../src/core/sdk'
++const origin = 'https://feedback.example.test'
++const source = { postMessage: vi.fn() } as unknown as Window
++vi.mock('../src/core/panel', () => ({
++  createPanel: () => ({
++    iframe: document.createElement('iframe'),
++    show() {},
++    hide() {},
++    destroy() {},
++    setPlacement() {},
++    setExpanded() {},
++  }),
++}))
++beforeEach(() => {
++  document.body.innerHTML = ''
++  document.head.innerHTML = ''
++  vi.spyOn(HTMLIFrameElement.prototype, 'contentWindow', 'get').mockReturnValue(source)
++  vi.stubGlobal(
++    'matchMedia',
++    vi.fn(() => ({ matches: false, addEventListener() {}, removeEventListener() {} }))
++  )
++  vi.stubGlobal(
++    'fetch',
++    vi.fn(async () => ({ ok: true, json: async () => ({}) }))
++  )
++  vi.mocked(source.postMessage).mockClear()
++})
++afterEach(() => {
++  vi.restoreAllMocks()
++  vi.unstubAllGlobals()
++})
++function ready() {
++  window.dispatchEvent(
++    new MessageEvent('message', { origin, source, data: { type: 'quackback:ready' } })
++  )
++}
++const nativeCalls = () =>
++  vi.mocked(source.postMessage).mock.calls.filter(([data]) => data.type === 'quackback:native')
++function upload(file: Blob) {
++  return {
++    contract: 'iplaycafe.feedback/native-1',
++    operationId: crypto.randomUUID(),
++    type: 'upload-attachment',
++    payload: { file, name: 'report.png' },
++  }
++}
++describe('native upload-attachment transport', () => {
++  it('queues before readiness and posts the identical Blob for structured cloning', () => {
++    const sdk = createSDK()
++    sdk.dispatch('init', { instanceUrl: origin })
++    const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
++    const command = upload(file)
++    sdk.dispatch('native', command)
++    expect(nativeCalls()).toHaveLength(0)
++    ready()
++    expect(nativeCalls()).toHaveLength(1)
++    const [message, target] = nativeCalls()[0]
++    expect(target).toBe(origin)
++    expect(message.data).toBe(command)
++    expect(message.data.payload.file).toBe(file)
++    expect(message.data.payload.file).toBeInstanceOf(Blob)
++    sdk.dispatch('destroy')
++  })
++  it('posts a ready-time Blob command directly without serialising it', () => {
++    const sdk = createSDK()
++    sdk.dispatch('init', { instanceUrl: origin })
++    sdk.dispatch('native', {
++      contract: 'iplaycafe.feedback/native-1',
++      operationId: crypto.randomUUID(),
++      type: 'list-tickets',
++      payload: {},
++    })
++    ready()
++    expect(nativeCalls()).toHaveLength(1)
++    const file = new Blob([new Uint8Array([4, 5])], { type: 'video/webm' })
++    sdk.dispatch('native', upload(file))
++    expect(nativeCalls()).toHaveLength(2)
++    expect(nativeCalls()[1][0].data.payload.file).toBe(file)
++    expect(typeof nativeCalls()[1][0].data).toBe('object')
++    sdk.dispatch('destroy')
++  })
++})

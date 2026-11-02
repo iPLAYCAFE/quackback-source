@@ -1,0 +1,108 @@
+diff --git a/apps/web/src/routes/api/widget/identify.ts b/apps/web/src/routes/api/widget/identify.ts
+--- a/apps/web/src/routes/api/widget/identify.ts
++++ b/apps/web/src/routes/api/widget/identify.ts
+@@ -100,14 +100,16 @@
+  */
+ export async function recordWidgetSessionProvenance(
+   sessionId: string,
+-  hmacVerified: boolean
++  source: boolean | 'unverified' | 'hmac' | 'insforge_exchange'
+ ): Promise<void> {
++  const identitySource = typeof source === 'boolean' ? (source ? 'hmac' : 'unverified') : source
++  const hmacVerified = identitySource === 'hmac'
+   await db
+     .insert(widgetIdentifiedSession)
+-    .values({ sessionId, hmacVerified })
++    .values({ sessionId, hmacVerified, identitySource })
+     .onConflictDoUpdate({
+       target: widgetIdentifiedSession.sessionId,
+-      set: { hmacVerified, identifiedAt: sql`now()` },
++      set: { hmacVerified, identitySource, identifiedAt: sql`now()` },
+     })
+ }
+ 
+diff --git a/packages/db/src/schema/auth.ts b/packages/db/src/schema/auth.ts
+--- a/packages/db/src/schema/auth.ts
++++ b/packages/db/src/schema/auth.ts
+@@ -1411,5 +1411,9 @@
+ export const widgetIdentifiedSession = pgTable('widget_identified_session', {
+   sessionId: text('session_id').primaryKey(),
+   hmacVerified: boolean('hmac_verified').notNull(),
++  identitySource: text('identity_source')
++    .$type<'unverified' | 'hmac' | 'insforge_exchange'>()
++    .default('unverified')
++    .notNull(),
+   identifiedAt: timestamp('identified_at', { withTimezone: true }).defaultNow().notNull(),
+ })
+diff --git a/packages/db/drizzle/meta/_journal.json b/packages/db/drizzle/meta/_journal.json
+--- a/packages/db/drizzle/meta/_journal.json
++++ b/packages/db/drizzle/meta/_journal.json
+@@ -1920,6 +1920,7 @@
+       "tag": "0296_ipc_help_center_native_private",
+       "breakpoints": true
+     },
+-    {"idx":274,"version":"7","when":1791244800005,"tag":"0297_native_evidence_deletion","breakpoints":true}
++    {"idx":274,"version":"7","when":1791244800005,"tag":"0297_native_evidence_deletion","breakpoints":true},
++    {"idx":275,"version":"7","when":1791244800006,"tag":"0298_widget_identity_source","breakpoints":true}
+   ]
+ }
+diff --git a/packages/db/drizzle/0298_widget_identity_source.sql b/packages/db/drizzle/0298_widget_identity_source.sql
+new file mode 100644
+--- /dev/null
++++ b/packages/db/drizzle/0298_widget_identity_source.sql
+@@ -0,0 +1,22 @@
++-- Match the retained legacy provenance contract without rewriting any legacy row,
++-- default or constraint. Native databases derive their newly introduced field
++-- from the existing HMAC bit once, before the updated writer is started.
++LOCK TABLE widget_identified_session IN ACCESS EXCLUSIVE MODE;
++--> statement-breakpoint
++DO $$ BEGIN
++  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
++    WHERE table_schema = current_schema() AND table_name = 'widget_identified_session'
++      AND column_name = 'identity_source') THEN
++    ALTER TABLE widget_identified_session ADD COLUMN identity_source text;
++    UPDATE widget_identified_session SET identity_source = CASE
++      WHEN hmac_verified THEN 'hmac' ELSE 'unverified' END;
++    ALTER TABLE widget_identified_session
++      ALTER COLUMN identity_source SET DEFAULT 'unverified',
++      ALTER COLUMN identity_source SET NOT NULL;
++    ALTER TABLE widget_identified_session
++      ADD CONSTRAINT widget_identified_session_identity_source_check CHECK (
++        identity_source IN ('unverified', 'hmac', 'insforge_exchange')
++        AND (identity_source = 'hmac') = hmac_verified
++      );
++  END IF;
++END $$;
+diff --git a/apps/web/src/lib/server/widget/__tests__/native-host-session.integration.test.ts b/apps/web/src/lib/server/widget/__tests__/native-host-session.integration.test.ts
+--- a/apps/web/src/lib/server/widget/__tests__/native-host-session.integration.test.ts
++++ b/apps/web/src/lib/server/widget/__tests__/native-host-session.integration.test.ts
+@@ -22,7 +22,7 @@
+       expiresAt: new Date(Date.now()+60_000), createdAt: new Date(), updatedAt: new Date()})
+     // Native provenance insertion correctly demotes a dashboard scope. A
+     // dashboard-refusal witness must retain the actual stored dashboard scope.
+-    if (scope !== 'dashboard') await testDb.insert(widgetIdentifiedSession).values({sessionId, hmacVerified: true})
++    if (scope !== 'dashboard') await testDb.insert(widgetIdentifiedSession).values({sessionId, hmacVerified: true, identitySource: 'hmac'})
+     expect(await testDb.execute(sql`select scope from session where id=${sessionId}`))
+       .toMatchObject([{scope}])
+     expect(await consumeNativeHostToken(claims)).toBe(true)
+@@ -92,7 +92,7 @@
+     expect(ordinary.id).not.toBe(native.sessionId)
+     expect(ordinary.token).not.toBe(native.token)
+     expect(await testDb.execute(sql`select session_id from ipc_native_session_binding where session_id=${ordinary.id}`)).toHaveLength(0)
+-    await testDb.insert(widgetIdentifiedSession).values({sessionId: ordinary.id, hmacVerified: true})
++    await testDb.insert(widgetIdentifiedSession).values({sessionId: ordinary.id, hmacVerified: true, identitySource: 'hmac'})
+     expect(await findOrCreateSession(native.userId, request())).toEqual(ordinary)
+     await revokePreviousNativeHostSession(native.token, context)
+     expect(await testDb.execute(sql`select id from session where id=${ordinary.id}`)).toHaveLength(1)
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-host-tickets.integration.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-host-tickets.integration.test.ts
+--- a/apps/web/src/lib/server/functions/widget/__tests__/native-host-tickets.integration.test.ts
++++ b/apps/web/src/lib/server/functions/widget/__tests__/native-host-tickets.integration.test.ts
+@@ -75,7 +75,7 @@
+     ports.auth.mockResolvedValue(ctx)
+     const ownId = crypto.randomUUID(), otherId = crypto.randomUUID()
+     await testDb.insert(session).values([{id: ownId, token: ports.bearer, userId: ctx.user.id, scope, updatedAt: new Date(), expiresAt: new Date(Date.now()+60_000)}, {id: otherId, token: 'other-bearer', userId: other.user.id, scope, updatedAt: new Date(), expiresAt: new Date(Date.now()+60_000)}])
+-    await testDb.insert(widgetIdentifiedSession).values({sessionId: ownId, hmacVerified: true})
++    await testDb.insert(widgetIdentifiedSession).values({sessionId: ownId, hmacVerified: true, identitySource: 'hmac'})
+     const now = Math.floor(Date.now()/1000)
+     const claim = {aud: 'https://feedback.example.test', jti: crypto.randomUUID(), iat: now, exp: now+60, ipc: context}
+     expect(await consumeNativeHostToken(claim)).toBe(true)

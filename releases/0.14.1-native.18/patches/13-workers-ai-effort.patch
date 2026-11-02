@@ -1,0 +1,345 @@
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/cloudflare-reasoning-wire.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/cloudflare-reasoning-wire.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1dabd4b57f09c01ca1fff7ff708c208f3a1549b5
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/__tests__/cloudflare-reasoning-wire.test.ts
+@@ -0,0 +1,227 @@
++// @vitest-environment node
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { z } from 'zod'
++import { maxIterations, toolDefinition } from '@tanstack/ai'
++
++const settings = vi.hoisted(() => ({
++  openaiApiKey: 'synthetic-local-wire-test-only',
++  openaiBaseUrl: 'https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/workers-ai/v1',
++  aiReasoningEffort: 'low' as string | undefined,
++  aiRequireParameters: undefined as boolean | undefined,
++}))
++vi.mock('@/lib/server/config', () => ({ config: settings }))
++vi.mock('@/lib/server/logger', () => ({
++  logger: { child: () => ({ warn: vi.fn() }) },
++}))
++vi.mock('@/lib/server/domains/ai/usage-log', () => ({
++  withUsageLogging: async (_params: unknown, run: () => Promise<{ result: unknown }>) =>
++    (await run()).result,
++}))
++
++import { reasoningEffortProviderOptions } from '../config'
++import { resetStructuredFallbackMemory, structuredChat } from '../structured-chat'
++import { runSynthesis } from '../../assistant/synthesis-core'
++
++type WireBody = Record<string, unknown>
++
++function completion(stream: unknown) {
++  if (stream === true) {
++    const common = {
++      id: 'synthetic-completion',
++      object: 'chat.completion.chunk',
++      created: 1,
++      model: 'synthetic-model',
++    }
++    const chunks = [
++      {
++        ...common,
++        choices: [
++          { index: 0, delta: { role: 'assistant', content: '{"ok":true}' }, finish_reason: null },
++        ],
++      },
++      { ...common, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
++      {
++        ...common,
++        choices: [],
++        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
++      },
++    ]
++    return new Response(
++      chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n',
++      {
++        headers: { 'Content-Type': 'text/event-stream' },
++      }
++    )
++  }
++  return Response.json({
++    id: 'synthetic-completion',
++    object: 'chat.completion',
++    created: 1,
++    model: 'synthetic-model',
++    choices: [
++      { index: 0, finish_reason: 'stop', message: { role: 'assistant', content: '{"ok":true}' } },
++    ],
++    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
++  })
++}
++
++function rejectFormat(message: string) {
++  return Response.json(
++    { error: { message, param: 'response_format', type: 'invalid_request_error' } },
++    { status: 400 }
++  )
++}
++
++async function runWire(rejections: string[]) {
++  const bodies: WireBody[] = []
++  vi.stubGlobal(
++    'fetch',
++    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
++      const request = new Request(input, init)
++      expect(new URL(request.url).origin).toBe('https://gateway.ai.cloudflare.com')
++      expect(request.method).toBe('POST')
++      bodies.push(JSON.parse(await request.text()))
++      expect(bodies.length).toBeLessThanOrEqual(rejections.length + 1)
++      return bodies.length <= rejections.length
++        ? rejectFormat(rejections[bodies.length - 1])
++        : completion(bodies.at(-1)?.stream)
++    })
++  )
++  const result = await structuredChat({
++    model: 'synthetic-model',
++    systemPrompts: ['Return the requested synthetic JSON.'],
++    messages: [{ role: 'user', content: 'Synthetic fixture.' }],
++    schema: z.object({ ok: z.boolean() }),
++    maxTokens: 128,
++  })
++  expect(result).toEqual({ ok: true })
++  return bodies
++}
++
++describe('Cloudflare explicit reasoning through the installed TanStack/OpenAI SDK', () => {
++  beforeEach(() => {
++    settings.openaiBaseUrl =
++      'https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/workers-ai/v1'
++    settings.aiReasoningEffort = 'low'
++    resetStructuredFallbackMemory()
++  })
++  afterEach(() => {
++    vi.unstubAllGlobals()
++  })
++
++  it('serializes explicit low with the primary strict schema request', async () => {
++    const bodies = await runWire([])
++    expect(bodies).toHaveLength(1)
++    expect(bodies[0]).toMatchObject({ reasoning_effort: 'low', max_tokens: 128 })
++    expect(bodies[0].response_format).toMatchObject({ type: 'json_schema' })
++    expect(bodies[0]).not.toHaveProperty('reasoning')
++    expect(bodies[0]).not.toHaveProperty('provider')
++  })
++
++  it('retains low on the json_object fallback without adding requests', async () => {
++    const bodies = await runWire(['json_schema is not supported'])
++    expect(bodies).toHaveLength(2)
++    expect(bodies.map((body) => body.reasoning_effort)).toEqual(['low', 'low'])
++    expect(bodies[1].response_format).toMatchObject({ type: 'json_object' })
++  })
++
++  it('retains low on the prompt-only fallback without adding requests', async () => {
++    const bodies = await runWire([
++      'json_schema is not supported',
++      'response_format is not supported',
++    ])
++    expect(bodies).toHaveLength(3)
++    expect(bodies.map((body) => body.reasoning_effort)).toEqual(['low', 'low', 'low'])
++    expect(bodies[2]).not.toHaveProperty('response_format')
++  })
++
++  it('preserves the existing OpenRouter nested option and ignores unrelated endpoints', () => {
++    settings.openaiBaseUrl = 'https://openrouter.ai/api/v1'
++    expect(reasoningEffortProviderOptions()).toEqual({ reasoning: { effort: 'low' } })
++    settings.openaiBaseUrl = 'https://api.openai.com/v1'
++    expect(reasoningEffortProviderOptions()).toEqual({})
++    settings.openaiBaseUrl = 'https://gateway.ai.cloudflare.com.evil.invalid/v1'
++    expect(reasoningEffortProviderOptions()).toEqual({})
++  })
++
++  it('accepts direct Workers AI and fails before inference for misleading effort aliases', () => {
++    settings.openaiBaseUrl = 'https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1'
++    expect(reasoningEffortProviderOptions()).toEqual({ reasoning_effort: 'low' })
++    for (const effort of ['none', 'minimal', 'medium', 'xhigh', 'invalid']) {
++      settings.aiReasoningEffort = effort
++      expect(() => reasoningEffortProviderOptions()).toThrow(
++        'Cloudflare AI_REASONING_EFFORT must be low, high or max'
++      )
++    }
++    settings.aiReasoningEffort = undefined
++    expect(reasoningEffortProviderOptions()).toEqual({})
++  })
++
++  it.each([false, true])(
++    'serializes low on public assistant synthesis (tools=%s)',
++    async (tools) => {
++      const bodies: WireBody[] = []
++      vi.stubGlobal(
++        'fetch',
++        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
++          const request = new Request(input, init)
++          expect(new URL(request.url).origin).toBe('https://gateway.ai.cloudflare.com')
++          expect(request.method).toBe('POST')
++          const body = JSON.parse(await request.text())
++          bodies.push(body)
++          expect(bodies.length).toBeLessThanOrEqual(tools ? 2 : 1)
++          return completion(body.stream)
++        })
++      )
++      const result = await runSynthesis({
++        model: 'synthetic-model',
++        systemPrompts: ['Return the requested synthetic JSON.'],
++        messages: [{ role: 'user', content: 'Synthetic fixture.' }],
++        outputSchema: z.object({ ok: z.boolean() }),
++        deltaField: 'ok',
++        salvageMode: 'strict',
++        salvage: () => null,
++        onFailure: 'throw',
++        retries: 0,
++        transportRetries: 0,
++        maxOutputTokens: 128,
++        ...(tools
++          ? {
++              tools: {
++                specs: [
++                  toolDefinition({
++                    name: 'synthetic_read',
++                    description: 'Synthetic unused read.',
++                    inputSchema: z.object({}),
++                  }).server(async () => {
++                    throw new Error('UNEXPECTED_TOOL_EXECUTION')
++                  }),
++                ],
++                context: {},
++                names: new Set(['synthetic_read']),
++                agentLoopStrategy: maxIterations(1),
++              },
++            }
++          : {}),
++        usageLogParams: {
++          pipelineStep: 'synthetic-wire',
++          callType: 'chat_completion',
++          model: 'synthetic-model',
++        },
++        deriveAnswerKind: () => 'answered',
++      })
++      expect(result).toMatchObject({ outcome: 'success', final: { ok: true } })
++      expect(bodies).toHaveLength(tools ? 2 : 1)
++      for (const body of bodies) {
++        expect(body).toMatchObject({ reasoning_effort: 'low', max_tokens: 128 })
++        expect(body).not.toHaveProperty('reasoning')
++      }
++      expect(bodies[0].stream).toBe(true)
++      if (tools) {
++        expect(bodies[0].tools).toHaveLength(1)
++        expect(bodies[0]).not.toHaveProperty('response_format')
++        expect(bodies[1].response_format).toMatchObject({ type: 'json_schema' })
++      }
++    }
++  )
++})
+diff --git a/apps/web/src/lib/server/domains/ai/config.ts b/apps/web/src/lib/server/domains/ai/config.ts
+index 2839cfb49ab729f4ba76091afd2f8c42d7d8a53e..612e10611df97b87771e1a5209940dc69a7e6aa8 100644
+--- a/apps/web/src/lib/server/domains/ai/config.ts
++++ b/apps/web/src/lib/server/domains/ai/config.ts
+@@ -148,14 +148,44 @@ export function reasoningExcludeProviderOptions(): { reasoning?: { exclude: true
+ }
+ 
+ const REASONING_EFFORTS = new Set(['low', 'high', 'max', 'medium', 'minimal'])
++const CLOUDFLARE_REASONING_EFFORTS = new Set(['low', 'high', 'max'])
++
++function isWorkersAiEndpoint(baseUrl: string | undefined): boolean {
++  if (!baseUrl) return false
++  try {
++    const url = new URL(baseUrl)
++    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash)
++      return false
++    return (
++      (url.origin === 'https://gateway.ai.cloudflare.com' &&
++        /^\/v1\/[^/]+\/[^/]+\/workers-ai\/v1\/?$/.test(url.pathname)) ||
++      (url.origin === 'https://api.cloudflare.com' &&
++        /^\/client\/v4\/accounts\/[^/]+\/ai\/v1\/?$/.test(url.pathname))
++    )
++  } catch {
++    return false
++  }
++}
+ 
+ /**
+- * OpenRouter `reasoning.effort` for models that cannot disable thinking.
+- * Unset leaves the provider default.
++ * Explicit provider reasoning effort. Workers AI uses the top-level
++ * `reasoning_effort`; OpenRouter retains its nested `reasoning.effort`.
++ * Unset leaves the provider default. Reject Workers AI aliases which GLM
++ * silently maps to max rather than the requested lower reasoning budget.
+  */
+-export function reasoningEffortProviderOptions(): { reasoning?: { effort: string } } {
++export function reasoningEffortProviderOptions(): {
++  reasoning?: { effort: string }
++  reasoning_effort?: string
++} {
+   const effort = config.aiReasoningEffort?.trim().toLowerCase()
+-  if (!effort || !REASONING_EFFORTS.has(effort) || !config.openaiBaseUrl?.includes('openrouter.ai'))
+-    return {}
+-  return { reasoning: { effort } }
++  if (!effort) return {}
++  if (isWorkersAiEndpoint(config.openaiBaseUrl)) {
++    if (!CLOUDFLARE_REASONING_EFFORTS.has(effort)) {
++      throw new Error('Cloudflare AI_REASONING_EFFORT must be low, high or max')
++    }
++    return { reasoning_effort: effort }
++  }
++  return REASONING_EFFORTS.has(effort) && config.openaiBaseUrl?.includes('openrouter.ai')
++    ? { reasoning: { effort } }
++    : {}
+ }
+diff --git a/apps/web/src/lib/server/domains/ai/structured-chat.ts b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+index 75ce233ab5d35ea0f2c261b28dd524b76ac3835b..6f596e0c7eef157de4704fb2fb39bff925cb8633 100644
+--- a/apps/web/src/lib/server/domains/ai/structured-chat.ts
++++ b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+@@ -20,7 +20,11 @@ import { openaiCompatibleText } from '@tanstack/ai-openai/compatible'
+ import { z } from 'zod'
+ import { config } from '@/lib/server/config'
+ import { logger } from '@/lib/server/logger'
+-import { stripCodeFences, structuredOutputProviderOptions } from './config'
++import {
++  reasoningEffortProviderOptions,
++  stripCodeFences,
++  structuredOutputProviderOptions,
++} from './config'
+ 
+ const log = logger.child({ component: 'ai-structured-chat' })
+ 
+@@ -114,7 +118,11 @@ export async function structuredChat<S extends z.ZodType>(
+         ...common,
+         systemPrompts: input.systemPrompts,
+         outputSchema: input.schema,
+-        modelOptions: { max_tokens: input.maxTokens, ...structuredOutputProviderOptions() },
++        modelOptions: {
++          max_tokens: input.maxTokens,
++          ...structuredOutputProviderOptions(),
++          ...reasoningEffortProviderOptions(),
++        },
+       } as never)) as z.infer<S>
+     } catch (err) {
+       if (!isResponseFormatRejection(err)) throw err
+@@ -135,6 +143,7 @@ export async function structuredChat<S extends z.ZodType>(
+         max_tokens: input.maxTokens,
+         ...(lvl === 'json_object' ? { response_format: { type: 'json_object' } } : {}),
+         ...structuredOutputProviderOptions(),
++        ...reasoningEffortProviderOptions(),
+       },
+     } as never) as unknown as Promise<string>
+ 
+diff --git a/apps/web/src/lib/server/domains/assistant/synthesis-core.ts b/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
+index ac1eae50f19805ff3fa0fd007bb6914271d65d54..de196a806ede722b68482f7703bb0b42a8ea4828 100644
+--- a/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
++++ b/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
+@@ -274,9 +274,12 @@ async function streamOnce<TContext>(
+     // strip reasoning_details. GLM-5.3-Flash cannot disable thinking and
+     // defaults to `max` (~30s Slack turns) unless AI_REASONING_EFFORT is set.
+     ...(() => {
+-      const effort = reasoningEffortProviderOptions().reasoning
++      const { reasoning: effort, ...providerEffort } = reasoningEffortProviderOptions()
+       const exclude = opts.tools ? undefined : reasoningExcludeProviderOptions().reasoning
+-      return effort || exclude ? { reasoning: { ...effort, ...exclude } } : {}
++      return {
++        ...providerEffort,
++        ...(effort || exclude ? { reasoning: { ...effort, ...exclude } } : {}),
++      }
+     })(),
+   }
+ 

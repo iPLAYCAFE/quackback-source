@@ -1,0 +1,949 @@
+diff --git a/apps/web/src/components/admin/channels/email-transport-card.tsx b/apps/web/src/components/admin/channels/email-transport-card.tsx
+index 8ae4f6bba452b2d2a9b48f207c8fe65a5bfbd45c..60a7fe7f6d111eec81f4d3b6829642d411bc04ec 100644
+--- a/apps/web/src/components/admin/channels/email-transport-card.tsx
++++ b/apps/web/src/components/admin/channels/email-transport-card.tsx
+@@ -8,6 +8,7 @@ function TransportValue({ children }: { children: string }) {
+ }
+ 
+ const OUTBOUND_LABEL = {
++  void: 'Void',
+   ses: 'Amazon SES',
+   smtp: 'SMTP',
+   resend: 'Resend',
+diff --git a/apps/web/src/components/auth/__tests__/use-email-signin.test.ts b/apps/web/src/components/auth/__tests__/use-email-signin.test.ts
+index e2e13a75637c5ee8ad3752283484844d98d7e79f..d109e14929c929b1e788c31c450ab049a1fdf77d 100644
+--- a/apps/web/src/components/auth/__tests__/use-email-signin.test.ts
++++ b/apps/web/src/components/auth/__tests__/use-email-signin.test.ts
+@@ -7,7 +7,7 @@
+  * was invisible; on a page that stays mounted it is a screen that has signed
+  * you in and still says it is working.
+  */
+-import { describe, it, expect, vi, beforeEach } from 'vitest'
++import { describe, it, expect, vi, beforeEach,afterEach } from 'vitest'
+ import { renderHook, act, waitFor } from '@testing-library/react'
+ 
+ const hoisted = vi.hoisted(() => ({ emailOtp: vi.fn() }))
+@@ -18,6 +18,22 @@ vi.mock('@/lib/client/auth-client', () => ({
+ import { useEmailSignin } from '../use-email-signin'
+ 
+ beforeEach(() => vi.clearAllMocks())
++afterEach(()=>vi.unstubAllGlobals())
++
++it('reuses one mail occurrence across a transport retry and renews only for a new confirmed request',async()=>{
++  const ids:string[]=[]
++  let calls=0
++  vi.stubGlobal('fetch',vi.fn(async(_url:string,init:RequestInit)=>{
++    ids.push(JSON.parse(init.body as string).operationId)
++    if(calls++===0)throw Error('synthetic lost response')
++    return Response.json({ok:true})
++  }))
++  const {result}=renderHook(()=>useEmailSignin({callbackUrl:'/',onSuccess:()=>{}}))
++  await act(async()=>{await result.current.requestEmail('user@example.test')})
++  await act(async()=>{await result.current.requestEmail('user@example.test')})
++  await act(async()=>{await result.current.requestEmail('user@example.test')})
++  expect(ids[0]).toBe(ids[1]);expect(ids[2]).not.toBe(ids[1])
++})
+ 
+ describe('useEmailSignin.verify', () => {
+   it('stops loading once the code is accepted', async () => {
+diff --git a/apps/web/src/components/auth/use-email-signin.ts b/apps/web/src/components/auth/use-email-signin.ts
+index a52f105bd628fb0b47ddeda744ad77a047833848..3dca4e41e6fb24fe9d730650baa3ab0c7f24043e 100644
+--- a/apps/web/src/components/auth/use-email-signin.ts
++++ b/apps/web/src/components/auth/use-email-signin.ts
+@@ -46,6 +46,7 @@ export function useEmailSignin({
+   // Sticky per-flow override so `resend` re-sends the same kind of email
+   // (e.g. a link-conflict recovery link keeps pointing at /auth/link-sso).
+   const callbackOverrideRef = useRef<string | null>(null)
++  const pendingOccurrenceRef=useRef<{payload:string;id:string}|null>(null)
+ 
+   useEffect(() => {
+     if (resendCooldown <= 0) return
+@@ -60,17 +61,21 @@ export function useEmailSignin({
+     setError('')
+     setLoading(true)
+     if (callbackUrlOverride !== undefined) callbackOverrideRef.current = callbackUrlOverride
++    const callbackURL=callbackOverrideRef.current??callbackUrl
++    const payload=JSON.stringify({email:email.trim().toLowerCase(),callbackURL})
++    if(pendingOccurrenceRef.current?.payload!==payload||Date.now()-Number(pendingOccurrenceRef.current.id.split('.')[0])>10*60000)pendingOccurrenceRef.current={payload,id:`${Date.now()}.${crypto.randomUUID()}`}
+     try {
+       const res = await fetch('/api/auth/portal-signin', {
+         method: 'POST',
+         headers: { 'content-type': 'application/json' },
+-        body: JSON.stringify({ email, callbackURL: callbackOverrideRef.current ?? callbackUrl }),
++        body: JSON.stringify({ email, callbackURL,operationId:pendingOccurrenceRef.current.id }),
+       })
+       if (!res.ok) {
+         const body = (await res.json().catch(() => ({}))) as { error?: string }
+         throw new Error(body.error || 'Failed to send sign-in email')
+       }
+       setResendCooldown(60)
++      pendingOccurrenceRef.current=null
+       return { ok: true }
+     } catch (err) {
+       const message = err instanceof Error ? err.message : 'Failed to send sign-in email'
+@@ -112,6 +117,7 @@ export function useEmailSignin({
+     setError('')
+     setCode('')
+     callbackOverrideRef.current = null
++    pendingOccurrenceRef.current=null
+   }
+ 
+   return {
+diff --git a/apps/web/src/lib/server/auth/__tests__/mail-issuance-flow.test.ts b/apps/web/src/lib/server/auth/__tests__/mail-issuance-flow.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea929491e8a460db8f3d4ea17b737925b06b2b87
+--- /dev/null
++++ b/apps/web/src/lib/server/auth/__tests__/mail-issuance-flow.test.ts
+@@ -0,0 +1,48 @@
++import {beforeEach,afterEach,expect,it,vi} from 'vitest'
++const witness=vi.hoisted(()=>({claims:new Map<string,{id:string;payloadSha:string}>(),sends:[] as string[],mint:vi.fn(),allowed:false}))
++// This suite exercises the real request -> issuance -> template -> Void adapter.
++// The PG transaction is isolated behind its store seam; its SQL runtime proof
++// remains a separate provider qualification, not an in-memory concurrency claim.
++vi.mock('../mail-issuance-store',()=>({claimMailIssuance:async(input:{operationKey:string;payloadSha:string})=>{
++  const old=witness.claims.get(input.operationKey)
++  if(old){if(old.payloadSha!==input.payloadSha)throw Error('MAIL_ISSUANCE_CONFLICT');return {id:old.id,fresh:false}}
++  const row={id:crypto.randomUUID(),payloadSha:input.payloadSha};witness.claims.set(input.operationKey,row);return {id:row.id,fresh:true}
++}}))
++vi.mock('../index',()=>({getAuth:async()=>({api:{createVerificationOTP:witness.mint}})}))
++vi.mock('../signup-policy',()=>({isAccountCreationAllowed:async()=>witness.allowed}))
++vi.mock('../sso-managed-email',()=>({loadSsoDomains:async()=>({providers:[],registered:new Set()})}))
++vi.mock('../auth-restrictions',()=>({isHardBound:()=>false}))
++vi.mock('@/lib/server/db',()=>({db:{query:{settings:{findFirst:async()=>({name:'Example'})}}}}))
++vi.mock('@/lib/server/storage/s3',()=>({getEmailSafeUrl:()=>undefined}))
++vi.mock('@/lib/server/config',()=>({config:{baseUrl:'https://feedback.example.test'}}))
++import {requestEmailSignin} from '../email-signin'
++const keys=['EMAIL_VOID_URL','EMAIL_VOID_TOKEN','EMAIL_FROM','EMAIL_SMTP_HOST','EMAIL_SES_ACCESS_KEY_ID','EMAIL_SES_SECRET_ACCESS_KEY','EMAIL_RESEND_API_KEY','RESEND_API_KEY']
++let saved:Record<string,string|undefined>
++beforeEach(()=>{saved=Object.fromEntries(keys.map(k=>[k,process.env[k]]));keys.forEach(k=>delete process.env[k]);process.env.EMAIL_VOID_URL='https://mail.example.test/api/platform-mail';process.env.EMAIL_VOID_TOKEN='synthetic-auth';process.env.EMAIL_FROM='support@mail.example.test';witness.claims.clear();witness.sends=[];witness.allowed=false;witness.mint.mockClear();vi.stubGlobal('fetch',vi.fn(async(_url:string,init:RequestInit)=>{const body=JSON.parse(init.body as string);witness.sends.push(body.logicalId);expect(witness.claims.size).toBeGreaterThan(0);return Response.json({logicalId:body.logicalId,state:'PROVIDER_ACCEPTED'})}))})
++afterEach(()=>{keys.forEach(k=>{if(saved[k]===undefined)delete process.env[k];else process.env[k]=saved[k]});vi.unstubAllGlobals()})
++const id=()=>Date.now()+'.'+crypto.randomUUID()
++it('refusal creates no account/capability and same occurrence retries send once with persisted identity',async()=>{
++  const input={email:'stranger@example.test',callbackURL:'/',operationId:id()}
++  await expect(requestEmailSignin(input)).resolves.toBeUndefined()
++  await expect(requestEmailSignin(input)).resolves.toBeUndefined()
++  expect(witness.mint).not.toHaveBeenCalled();expect(witness.sends).toHaveLength(1);expect(witness.sends[0]).toMatch(/^qb-[a-f0-9]{64}$/)
++})
++it('distinct refusal occurrence sends separately; changed-body reuse refuses before provider',async()=>{
++  const input={email:'stranger@example.test',callbackURL:'/',operationId:id()}
++  await requestEmailSignin(input)
++  await expect(requestEmailSignin({...input,email:'changed@example.test'})).rejects.toThrow('MAIL_ISSUANCE_CONFLICT')
++  await requestEmailSignin({...input,operationId:id()})
++  expect(new Set(witness.sends).size).toBe(2)
++})
++it('expired client occurrence cannot be revived after its bounded retention',async()=>{
++  await expect(requestEmailSignin({email:'stranger@example.test',callbackURL:'/',operationId:(Date.now()-11*60000)+'.'+crypto.randomUUID()})).rejects.toThrow('MAIL_ISSUANCE_EXPIRED')
++  expect(witness.sends).toHaveLength(0)
++})
++it('an interrupted dispatch is consumed durably; no second attempt after policy changes',async()=>{
++  const input={email:'stranger@example.test',callbackURL:'/',operationId:id()}
++  vi.stubGlobal('fetch',vi.fn(async()=>{throw Error('synthetic transport interruption')}))
++  await expect(requestEmailSignin(input)).rejects.toThrow('OUTCOME_UNKNOWN')
++  witness.allowed=true
++  await expect(requestEmailSignin(input)).resolves.toBeUndefined()
++  expect(witness.mint).not.toHaveBeenCalled();expect(witness.claims.size).toBe(1)
++})
+diff --git a/apps/web/src/lib/server/auth/__tests__/mail-issuance-store.pg.test.ts b/apps/web/src/lib/server/auth/__tests__/mail-issuance-store.pg.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..13cbca913f537b6d08f98eaa32f081c0e27c26c7
+--- /dev/null
++++ b/apps/web/src/lib/server/auth/__tests__/mail-issuance-store.pg.test.ts
+@@ -0,0 +1,38 @@
++import {beforeAll,afterAll,expect,it,vi} from 'vitest'
++import {PgDialect} from 'drizzle-orm/pg-core'
++const state=vi.hoisted(()=>({pg:null as any}))
++vi.mock('@/lib/server/db',async()=>{
++  const {sql}=await import('drizzle-orm')
++  const dialect=new PgDialect()
++  return {sql,db:{transaction:(fn:any)=>state.pg.transaction((tx:any)=>fn({execute:async(statement:any)=>{const query=dialect.sqlToQuery(statement);return (await tx.query(query.sql,query.params)).rows}}))}}
++})
++import {claimMailIssuance} from '../mail-issuance-store'
++// The materialized pinned Void workspace supplies the exact existing PGlite.
++// This is PostgreSQL SQL evidence, not network/client/PlanetScale acceptance.
++const proof=process.env.MAIL_PGLITE_MODULE?it:it.skip
++beforeAll(async()=>{
++  if(!process.env.MAIL_PGLITE_MODULE)return
++  const {PGlite}=await import(/* @vite-ignore */ process.env.MAIL_PGLITE_MODULE)
++  state.pg=new PGlite()
++  await state.pg.exec('CREATE TABLE verification(id text PRIMARY KEY,identifier text NOT NULL,value text NOT NULL,expires_at timestamptz NOT NULL,created_at timestamptz NOT NULL,updated_at timestamptz NOT NULL)')
++})
++afterAll(async()=>{await state.pg?.close()})
++proof('actual PostgreSQL transaction persists one opaque non-auth issuance for concurrent retries',async()=>{
++  const input={operationKey:'a'.repeat(64),payloadSha:'b'.repeat(64)}
++  const results=await Promise.all(Array.from({length:8},()=>claimMailIssuance(input)))
++  expect(results.filter(x=>x.fresh)).toHaveLength(1);expect(new Set(results.map(x=>x.id)).size).toBe(1)
++  const rows=(await state.pg.query('SELECT * FROM verification')).rows
++  expect(rows).toHaveLength(1)
++  const value=JSON.parse(rows[0].value)
++  expect(value).toEqual({...input,version:'mail-only/v1',state:'DISPATCHED'})
++  expect(rows[0].identifier).toMatch(/^ipc-mail-issuance:v1:[a-f0-9-]{36}$/)
++  expect(rows[0].identifier).not.toContain(input.operationKey)
++  expect(value.email).toBeUndefined();expect(value.otp).toBeUndefined()
++  await expect(claimMailIssuance({...input,payloadSha:'c'.repeat(64)})).rejects.toThrow('MAIL_ISSUANCE_CONFLICT')
++})
++proof('expired mail-only records prune while ordinary auth verifications remain untouched',async()=>{
++  await state.pg.exec("INSERT INTO verification VALUES('expired-mail','ipc-mail-issuance:v1:expired','{}',now()-interval '1 day',now(),now()),('otp','email-verification-otp-user@example.test','not-json:0',now()-interval '1 day',now(),now())")
++  await claimMailIssuance({operationKey:'d'.repeat(64),payloadSha:'e'.repeat(64)})
++  expect((await state.pg.query("SELECT id FROM verification WHERE id='expired-mail'")).rows).toHaveLength(0)
++  expect((await state.pg.query("SELECT id FROM verification WHERE id='otp'")).rows).toHaveLength(1)
++})
+diff --git a/apps/web/src/lib/server/auth/email-signin.ts b/apps/web/src/lib/server/auth/email-signin.ts
+index f1f02f9df6d9c5a27cf2e18df37a3fc898e2e49b..77ce4309dac687e453a1d20b98c4177091331932 100644
+--- a/apps/web/src/lib/server/auth/email-signin.ts
++++ b/apps/web/src/lib/server/auth/email-signin.ts
+@@ -47,11 +47,13 @@ export class EmailSigninRefusedError extends Error {
+  * this is entered, so that both worlds cost an attacker the same budget. That
+  * only holds if nothing in here spends it again — see the mint below.
+  */
+-export async function requestEmailSignin(opts: {
++interface EmailSigninOptions {
+   email: string
+   /** Path the user lands on after a successful magic-link click. */
+   callbackURL: string
+-}): Promise<void> {
++  operationId?: string
++}
++export async function requestEmailSignin(opts: EmailSigninOptions): Promise<void> {
+   // "Require SSO", in front of the mint. The link minted below is redeemed at
+   // `/magic-link/verify`, whose address travels inside the token, so the
+   // hook layer that enforces this for every other email path never sees it.
+@@ -63,6 +65,14 @@ export async function requestEmailSignin(opts: {
+     throw new EmailSigninRefusedError('verified_domain_requires_sso')
+   }
+ 
++  if(process.env.EMAIL_VOID_URL){
++    const {runMailIssuance}=await import('./mail-issuance')
++    return runMailIssuance(opts,()=>deliverEmailSignin(opts))
++  }
++  return deliverEmailSignin(opts)
++}
++
++async function deliverEmailSignin(opts:EmailSigninOptions):Promise<void>{
+   const auth = await getAuth()
+ 
+   const { db } = await import('@/lib/server/db')
+diff --git a/apps/web/src/lib/server/auth/index.ts b/apps/web/src/lib/server/auth/index.ts
+index 11f681de2d5e802d9e39314ea3b3c5328aa48e40..bd5e927234c140f31caeab65c913380bd6602831 100644
+--- a/apps/web/src/lib/server/auth/index.ts
++++ b/apps/web/src/lib/server/auth/index.ts
+@@ -660,7 +660,7 @@ async function createAuth() {
+       }),
+ 
+       emailOTP({
+-        async sendVerificationOTP({ email, otp, type }) {
++        async sendVerificationOTP({ email, otp, type }, otpContext) {
+           // Sign-in codes are never sent from here: this app composes the code
+           // and a magic link into one email of its own. Reaching this branch
+           // means the routed endpoint was called directly, so the code is
+@@ -686,7 +686,12 @@ async function createAuth() {
+           // (moving to a new one) both mean the same thing to the recipient:
+           // prove you hold this address.
+           const { sendVerifyAddressCode } = await import('./verify-address-email')
+-          await sendVerifyAddressCode(email, otp)
++          const currentEmail=otpContext?.context.session?.user.email
++          if(type==='change-email'&&!currentEmail)throw new Error('Email change issuance has no authenticated account')
++          const identifier=type==='change-email'
++            ? `change-email-otp-${currentEmail!.toLowerCase()}-${email.toLowerCase()}`
++            : `email-verification-otp-${email.toLowerCase()}`
++          await sendVerifyAddressCode(email, otp, identifier)
+         },
+         otpLength: 6,
+         expiresIn: 600,
+diff --git a/apps/web/src/lib/server/auth/mail-issuance-store.ts b/apps/web/src/lib/server/auth/mail-issuance-store.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d048930e6af2cbf16c60f124fd710fffa7cfe86
+--- /dev/null
++++ b/apps/web/src/lib/server/auth/mail-issuance-store.ts
+@@ -0,0 +1,36 @@
++import {randomUUID} from 'node:crypto'
++import {db,sql} from '@/lib/server/db'
++
++const PREFIX='ipc-mail-issuance:v1:'
++const RETENTION_MS=30*24*60*60*1000
++/** Reuses auth operation storage, but never creates an auth-compatible value. */
++export async function claimMailIssuance(input:{operationKey:string;payloadSha:string}):Promise<{id:string;fresh:boolean}>{
++  try{
++    return await db.transaction(async tx=>{
++      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.operationKey}, 8827))`)
++      // Same 30-day horizon as the platform provider's idempotency receipt. An
++      // expired client occurrence is refused before storage, so cleanup cannot
++      // resurrect a previously dispatched operation.
++      await tx.execute(sql`DELETE FROM verification WHERE identifier LIKE ${PREFIX+'%'} AND expires_at < now()`)
++      const rows=await tx.execute(sql`SELECT id,value FROM verification WHERE CASE WHEN identifier LIKE ${PREFIX+'%'} THEN value::jsonb->>'operationKey' ELSE NULL END = ${input.operationKey} LIMIT 2`) as unknown as Array<{id:string;value:string}>
++      if(rows.length>1)throw new Error('MAIL_ISSUANCE_CONFLICT')
++      if(rows.length){
++        const value=JSON.parse(rows[0].value)
++        if(value.version!=='mail-only/v1'||value.payloadSha!==input.payloadSha)throw new Error('MAIL_ISSUANCE_CONFLICT')
++        return {id:rows[0].id,fresh:false}
++      }
++      const id=randomUUID(),identifier=PREFIX+randomUUID()
++      const value=JSON.stringify({version:'mail-only/v1',operationKey:input.operationKey,payloadSha:input.payloadSha,state:'DISPATCHED'})
++      // Identifier is opaque and never returned to a client or placed in mail.
++      // Better Auth's magic-link verifier can look up/delete arbitrary tokens;
++      // a client-derivable namespace identifier would expose this dedupe fact.
++      // The value deliberately has no email/name/OTP/auth claim.
++      await tx.execute(sql`INSERT INTO verification(id,identifier,value,expires_at,created_at,updated_at) VALUES(${id},${identifier},${value},${new Date(Date.now()+RETENTION_MS)},now(),now())`)
++      return {id,fresh:true}
++    })
++  }catch(error){
++    if(error instanceof Error&&error.message==='MAIL_ISSUANCE_CONFLICT')throw error
++    // DB/provider errors may contain SQL values or connection URLs.
++    throw new Error('MAIL_ISSUANCE_UNAVAILABLE')
++  }
++}
+diff --git a/apps/web/src/lib/server/auth/mail-issuance.ts b/apps/web/src/lib/server/auth/mail-issuance.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..44067ce4f95307c046367a931ec239c997599779
+--- /dev/null
++++ b/apps/web/src/lib/server/auth/mail-issuance.ts
+@@ -0,0 +1,19 @@
++import {createHash,randomUUID} from 'node:crypto'
++import {withEmailOperationId} from '@quackback/email/idempotency'
++import {claimMailIssuance} from './mail-issuance-store'
++
++export async function runMailIssuance(input:{email:string;callbackURL:string;operationId?:string},send:()=>Promise<void>):Promise<void>{
++  // First-party callers reuse the occurrence across network retry. Legacy callers
++  // get a new server occurrence, persisted before any external side effect.
++  const occurrence=input.operationId??`${Date.now()}.${randomUUID()}`
++  const match=/^(\d{13})\.([a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})$/i.exec(occurrence)
++  if(!match)throw new Error('MAIL_ISSUANCE_INVALID')
++  const age=Date.now()-Number(match[1])
++  if(age>10*60*1000||age< -120000)throw new Error('MAIL_ISSUANCE_EXPIRED')
++  const hash=(value:string)=>createHash('sha256').update(value).digest('hex')
++  const claimed=await claimMailIssuance({operationKey:hash(occurrence.toLowerCase()),payloadSha:hash(JSON.stringify({email:input.email.trim().toLowerCase(),callbackURL:input.callbackURL}))})
++  // Uncertainty is durable before dispatch. A retry never re-mints capabilities
++  // or re-evaluates signup policy, so a changed policy cannot become an oracle.
++  if(!claimed.fresh)return
++  await withEmailOperationId('portal-signin',claimed.id,send)
++}
+diff --git a/apps/web/src/lib/server/auth/verify-address-email.ts b/apps/web/src/lib/server/auth/verify-address-email.ts
+index bfa258744df6d9e9074c21f0c6d7c6fdd2f998ef..eaa959caa072f5ce994e6369da4f35b7a6267570 100644
+--- a/apps/web/src/lib/server/auth/verify-address-email.ts
++++ b/apps/web/src/lib/server/auth/verify-address-email.ts
+@@ -4,14 +4,27 @@
+  * current-address step of an email change, which mints its code without the
+  * sign-in hook chain (see `functions/contact-email.ts`).
+  */
+-export async function sendVerifyAddressCode(email: string, code: string): Promise<void> {
++export async function sendVerifyAddressCode(email: string, code: string, identifier = `email-verification-otp-${email.toLowerCase()}`): Promise<void> {
+   const { sendVerifyAddressEmail } = await import('@quackback/email')
+   const { getEmailSafeUrl } = await import('@/lib/server/storage/s3')
+   const { db } = await import('@/lib/server/db')
+   const settings = await db.query.settings.findFirst({
+     columns: { name: true, logoKey: true },
+   })
++  let operationId:string|undefined
++  if(process.env.EMAIL_VOID_URL){
++    // The short code can recur. Anchor to Better Auth's persisted issuance,
++    // including expiry, so a later issuance is a new logical notification.
++    const issued=await db.query.verification.findFirst({
++      columns:{id:true,expiresAt:true},
++      where:(row,{and,eq,gt})=>and(eq(row.identifier,identifier),gt(row.expiresAt,new Date())),
++      orderBy:(row,{desc})=>[desc(row.createdAt)],
++    })
++    if(!issued)throw new Error('Void verification mail requires persisted issuance')
++    operationId=`verify-address:${issued.id}:${issued.expiresAt.toISOString()}`
++  }
+   await sendVerifyAddressEmail({
++    ...(operationId?{operationId}:{}),
+     to: email,
+     code,
+     workspaceName: settings?.name ?? undefined,
+diff --git a/apps/web/src/lib/server/domains/channels/deliver-agent-message.ts b/apps/web/src/lib/server/domains/channels/deliver-agent-message.ts
+index d8d92ad95977b342668cea2b3e3c452d8f199c9d..fb7aba8198ffc903ed08405ee2fbf2303d18656d 100644
+--- a/apps/web/src/lib/server/domains/channels/deliver-agent-message.ts
++++ b/apps/web/src/lib/server/domains/channels/deliver-agent-message.ts
+@@ -9,6 +9,7 @@ export async function deliverAgentMessageOnChannel(
+   const { sendVisitorConversationEmail } =
+     await import('@/lib/server/domains/conversation/conversation.notify')
+   await sendVisitorConversationEmail({
++    messageId: ctx.messageId,
+     conversationId: ctx.conversationId,
+     visitorPrincipalId: ctx.visitorPrincipalId,
+     recipient: ctx.recipient,
+diff --git a/apps/web/src/lib/server/domains/conversation/__tests__/email-void-handler.test.ts b/apps/web/src/lib/server/domains/conversation/__tests__/email-void-handler.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..30f2bd63478e11bd42240922653a49c2671f8e1f
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/__tests__/email-void-handler.test.ts
+@@ -0,0 +1,36 @@
++import {expect,it,vi,beforeEach,afterEach} from 'vitest'
++import {createHmac} from 'node:crypto'
++const ingest=vi.hoisted(()=>vi.fn(async(_parsed:unknown)=>({status:'duplicate'})))
++vi.mock('../conversation.email-inbound.service',()=>({ingestParsedEmail:ingest}))
++vi.mock('../conversation.mail-slug',()=>({currentMailSlug:()=> 'reply'}))
++import {handleVoidInboundEmail} from '../email-void-handler'
++const secret='synthetic-inbound-test-secret'
++const envKeys=['EMAIL_VOID_INBOUND_SECRET','EMAIL_INBOUND_DOMAIN','EMAIL_INBOUND_SIGNING_SECRET']
++let saved:Record<string,string|undefined>
++beforeEach(()=>{saved=Object.fromEntries(envKeys.map(k=>[k,process.env[k]]));process.env.EMAIL_VOID_INBOUND_SECRET=secret;process.env.EMAIL_INBOUND_DOMAIN='reply.example.test';process.env.EMAIL_INBOUND_SIGNING_SECRET='synthetic-reply-signing';ingest.mockClear()})
++afterEach(()=>{envKeys.forEach(k=>{if(saved[k]===undefined)delete process.env[k];else process.env[k]=saved[k]})})
++const payload={version:'iplaycafe.void-mail/1',deliveryId:'void-'+'a'.repeat(64),mailSlug:'reply',envelopeTo:'reply@reply.example.test',rawSize:200,email:{from:'user@example.test',to:['reply@reply.example.test'],subject:'Help',text:'body',message_id:'original@example.test',headers:{'In-Reply-To':'<parent@example.test>','References':'<parent@example.test>','Authentication-Results':'attacker; dmarc=pass'},attachments:[{filename:'a.txt',content_type:'text/plain',content:'QUI='}]}}
++function signed(value:unknown=payload,timestamp=String(Math.floor(Date.now()/1000))){const body=JSON.stringify(value);return new Request('https://feedback.example.test/api/chat/email/inbound',{method:'POST',headers:{'content-type':'application/vnd.iplaycafe.void-mail+json','x-qb-void-timestamp':timestamp,'x-qb-void-signature':createHmac('sha256',secret).update(timestamp+'.void-normalized.').update(body).digest('hex')},body})}
++it('authenticated normalized MIME reaches stock ingest with threading/attachment bytes but no forged MTA assertion',async()=>{
++  expect((await handleVoidInboundEmail(signed())).status).toBe(200)
++  expect(ingest).toHaveBeenCalledTimes(1)
++  const value=ingest.mock.calls[0][0] as any
++  expect(value).toMatchObject({from:'user@example.test',messageId:'original@example.test',inReplyTo:'parent@example.test',references:['parent@example.test'],authenticationResults:null,transportMessageId:payload.deliveryId,attachments:[{bytes:Buffer.from('AB')}]})
++})
++it('signature tampering, expired/future signature and cross-workspace envelope fail before ingest',async()=>{
++  const tampered=signed();tampered.headers.set('x-qb-void-signature','0'.repeat(64))
++  for(const request of [tampered,signed(payload,'1'),signed(payload,String(Math.floor(Date.now()/1000)+300)),signed({...payload,mailSlug:'other'}),signed({...payload,envelopeTo:'reply@attacker.test'})])expect((await handleVoidInboundEmail(request)).status).not.toBe(200)
++  expect(ingest).not.toHaveBeenCalled()
++})
++it('encoded inbound over 10MiB and malformed attachment reject without silent truncation',async()=>{
++  for(const value of [{...payload,rawSize:10*1024*1024+1},{...payload,email:{...payload.email,attachments:[{filename:'x',content:'!not-base64'}]}}])expect((await handleVoidInboundEmail(signed(value))).status).toBe(400)
++  expect(ingest).not.toHaveBeenCalled()
++})
++const normalizedRoundtrip=process.env.MAIL_PLATFORM_NORMALIZER?it:it.skip
++normalizedRoundtrip('real native normalized attachment-only MIME reaches authenticated stock ingest',async()=>{
++  const {normalizeInbound}=await import(/* @vite-ignore */ process.env.MAIL_PLATFORM_NORMALIZER!)
++  const envelope=await normalizeInbound({to:'reply@reply.example.test',rawSize:200},{from:{address:'user@example.test'},headers:[],attachments:[{filename:'proof.txt',mimeType:'text/plain',content:new Uint8Array([65,66]).buffer}]},'reply.example.test','reply','a'.repeat(64))
++  expect(envelope.email.text).toBeUndefined();expect(envelope.email.html).toBeUndefined()
++  expect((await handleVoidInboundEmail(signed(envelope))).status).toBe(200)
++  expect(ingest.mock.calls[0][0]).toMatchObject({attachments:[{bytes:Buffer.from('AB'),filename:'proof.txt'}]})
++})
+diff --git a/apps/web/src/lib/server/domains/conversation/conversation.auto-ack.ts b/apps/web/src/lib/server/domains/conversation/conversation.auto-ack.ts
+index fdc62b4f23989bca3ad4a8b1d7044dee4b25b14f..5ffb042a34bc3ee5e245f9b285d9831b58e46e86 100644
+--- a/apps/web/src/lib/server/domains/conversation/conversation.auto-ack.ts
++++ b/apps/web/src/lib/server/domains/conversation/conversation.auto-ack.ts
+@@ -8,6 +8,7 @@ import type { ConversationId } from '@quackback/ids'
+ import type { ParsedInboundEmail } from './conversation.email-inbound'
+ import { ownEmailDomains } from './conversation.email-channel'
+ import { normalizeSenderAddress } from './conversation.email-inbound'
++import { withEmailOperationId } from '@quackback/email/idempotency'
+ 
+ const log = logger.child({ component: 'conversation-auto-ack' })
+ 
+@@ -83,7 +84,8 @@ export async function maybeSendColdInboundAck(opts: {
+     const replyTo = inboundReplyToAddress(opts.conversationId, currentMailSlug())
+     const inboundId = opts.parsed.messageId
+     const minted = mintOutboundMessageId(opts.conversationId) ?? undefined
+-    const result = await sendConversationAutoAckEmail({
++    const incomingIdentity=opts.parsed.messageId??opts.parsed.transportMessageId
++    const result = await withEmailOperationId('conversation-auto-ack',incomingIdentity?`${opts.conversationId}:${incomingIdentity}`:undefined,()=>sendConversationAutoAckEmail({
+       to,
+       workspaceName,
+       conversationSubject: opts.conversationSubject,
+@@ -92,7 +94,7 @@ export async function maybeSendColdInboundAck(opts: {
+       inReplyTo: inboundId ?? undefined,
+       references: inboundId ? [inboundId] : undefined,
+       conversationId: opts.conversationId,
+-    })
++    }))
+     const outboundId = result.messageId === undefined ? minted : (result.messageId ?? undefined)
+     if (outboundId) await recordOutboundEmail(outboundId, opts.conversationId)
+     return 'sent'
+diff --git a/apps/web/src/lib/server/domains/conversation/conversation.notify-closed.ts b/apps/web/src/lib/server/domains/conversation/conversation.notify-closed.ts
+index fbd257ab5de7a7bdbefef2ebcfc802c4ad33b76e..aa2671c89e1e40aa3807d95c01a82897f3d0dd64 100644
+--- a/apps/web/src/lib/server/domains/conversation/conversation.notify-closed.ts
++++ b/apps/web/src/lib/server/domains/conversation/conversation.notify-closed.ts
+@@ -14,6 +14,7 @@ import { visitorConversationLink } from './conversation.notify'
+ import { buildHookContext } from '@/lib/server/events/hook-context'
+ import { logger } from '@/lib/server/logger'
+ import { ensureEmailLogSink } from '@/lib/server/email/email-log.sink'
++import { withEmailOperationId } from '@quackback/email/idempotency'
+ 
+ const log = logger.child({ component: 'conversation-notify-closed' })
+ 
+@@ -36,6 +37,7 @@ export async function notifyConversationClosed(opts: {
+         visitorPrincipalId: conversations.visitorPrincipalId,
+         visitorEmail: conversations.visitorEmail,
+         endReason: conversations.endReason,
++        resolvedAt: conversations.resolvedAt,
+       })
+       .from(conversations)
+       .where(eq(conversations.id, opts.conversationId))
+@@ -92,7 +94,7 @@ export async function notifyConversationClosed(opts: {
+     }
+ 
+     const { sendConversationClosedEmail } = await import('@quackback/email')
+-    const result = await sendConversationClosedEmail({
++    const result = await withEmailOperationId('conversation-closed',conv.resolvedAt?`${conv.id}:${conv.resolvedAt.toISOString()}:${opts.variant}`:undefined,()=>sendConversationClosedEmail({
+       to: recipient,
+       workspaceName: ctx.workspaceName,
+       variant: opts.variant,
+@@ -106,7 +108,7 @@ export async function notifyConversationClosed(opts: {
+       inReplyTo: inReplyTo ?? undefined,
+       references,
+       conversationId: opts.conversationId,
+-    })
++    }))
+     const outboundMessageId =
+       result?.messageId === undefined ? messageId : (result.messageId ?? undefined)
+     if (outboundMessageId) await recordOutboundEmail(outboundMessageId, opts.conversationId)
+diff --git a/apps/web/src/lib/server/domains/conversation/conversation.notify.ts b/apps/web/src/lib/server/domains/conversation/conversation.notify.ts
+index 1b3719b67786838e89abd28277b6fc63b9cea2c0..521136043dbc48c1e25f8861cbfa73451cbb745c 100644
+--- a/apps/web/src/lib/server/domains/conversation/conversation.notify.ts
++++ b/apps/web/src/lib/server/domains/conversation/conversation.notify.ts
+@@ -38,7 +38,7 @@ import {
+ } from '@/lib/server/domains/channel-accounts/channel-account.service'
+ import { randomUUID } from 'node:crypto'
+ import { agentReplyDisplayName, assembleOutboundThreading } from '@quackback/email'
+-import { withEmailIdempotencyKey } from '@quackback/email/idempotency'
++import { withEmailIdempotencyKey, withEmailOperationId } from '@quackback/email/idempotency'
+ import type { EmailAttachment } from '@quackback/email'
+ import { getChannelDescriptor } from '@/lib/shared/channels'
+ import { requireChannelAdapter } from '@/lib/server/domains/channels'
+@@ -244,6 +244,7 @@ async function resolveVisitorConversationLink(
+  * events/handlers/notification.ts) — this function is now email-only.
+  */
+ export async function notifyVisitorMessage(opts: {
++  messageId?: ConversationMessageId
+   conversation: Conversation
+   content: string
+   /** Rich message body (TipTap doc) rendered inline in the email, when present. */
+@@ -312,7 +313,7 @@ export async function notifyVisitorMessage(opts: {
+             return to ? [{ ...t, to }] : []
+           })
+           .map((t) =>
+-            mailContact(sendConversationMessageEmail, t.to, {
++            withEmailOperationId('conversation-team',opts.messageId?`${opts.conversation.id}:${opts.messageId}:${t.principalId}`:undefined,()=>mailContact(sendConversationMessageEmail, t.to, {
+               direction: 'visitor_message',
+               senderName: opts.authorName,
+               messagePreview: body,
+@@ -327,7 +328,7 @@ export async function notifyVisitorMessage(opts: {
+               inReplyTo: teamRoot ?? undefined,
+               references: teamRoot ? [teamRoot] : undefined,
+               conversationId: opts.conversation.id,
+-            })
++            }))
+           )
+       )
+     }
+@@ -419,6 +420,7 @@ async function sendWithRetry<T>(
+  * visitor. The two callers differ only in `direction`.
+  */
+ export async function sendVisitorConversationEmail(opts: {
++  messageId?: ConversationMessageId
+   conversationId: ConversationId
+   visitorPrincipalId: PrincipalId
+   recipient: string
+@@ -466,7 +468,9 @@ export async function sendVisitorConversationEmail(opts: {
+   // the same reason the threading is minted there: a provider that accepted an
+   // attempt we saw fail then delivers the retry as the same message, not a
+   // second one.
+-  const result = await withEmailIdempotencyKey(`conversation-email:${randomUUID()}`, () =>
++  const operation=opts.messageId?`conversation-email:${opts.conversationId}:${opts.messageId}:${opts.visitorPrincipalId}`:undefined
++  const key=operation??(process.env.EMAIL_VOID_URL?undefined:`conversation-email:${randomUUID()}`)
++  const result = await withEmailIdempotencyKey(key, () =>
+     sendWithRetry(opts.conversationId, () =>
+       sendConversationMessageEmail({
+         to: opts.recipient,
+diff --git a/apps/web/src/lib/server/domains/conversation/conversation.service.ts b/apps/web/src/lib/server/domains/conversation/conversation.service.ts
+index 5441d3a21a100cda41fd163e8faf8aa3871f7537..1fe4c3e1dc2b44a51f039c754468765b96db1386 100644
+--- a/apps/web/src/lib/server/domains/conversation/conversation.service.ts
++++ b/apps/web/src/lib/server/domains/conversation/conversation.service.ts
+@@ -478,6 +478,7 @@ export async function sendVisitorMessage(
+   }
+ 
+   void notifyVisitorMessage({
++    messageId: txResult.message.id,
+     conversation: txResult.conversation,
+     // Full text, not the truncated preview — notify derives its own
+     // subject/preheader excerpt and renders the whole body inline.
+diff --git a/apps/web/src/lib/server/domains/conversation/email-void-handler.ts b/apps/web/src/lib/server/domains/conversation/email-void-handler.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d4399b25f3f38317bab7c0a2e0f168894d19efb
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/email-void-handler.ts
+@@ -0,0 +1,37 @@
++import {createHmac,timingSafeEqual} from 'node:crypto'
++import {readBodyWithLimit} from '@/lib/server/utils/read-body'
++import {inboundAcceptDomains,isEmailInboundConfigured,workspaceSlugFromInboundAddress} from './conversation.email-channel'
++import {currentMailSlug} from './conversation.mail-slug'
++import {parseInboundEmail} from './conversation.email-inbound'
++
++export const VOID_NORMALIZED_CONTENT_TYPE='application/vnd.iplaycafe.void-mail+json'
++export function isVoidInboundRequest(request:Request):boolean{return (request.headers.get('content-type')??'').split(';')[0].trim().toLowerCase()===VOID_NORMALIZED_CONTENT_TYPE}
++const reply=(status:number)=>Response.json({status:status===200?'accepted':'refused'},{status,headers:{'cache-control':'no-store'}})
++export async function handleVoidInboundEmail(request:Request):Promise<Response>{
++  const secret=process.env.EMAIL_VOID_INBOUND_SECRET
++  if(!secret||!isEmailInboundConfigured())return reply(503)
++  const timestamp=request.headers.get('x-qb-void-timestamp')??'',signature=request.headers.get('x-qb-void-signature')??''
++  if(!/^\d{10}$/.test(timestamp)||Math.abs(Date.now()/1000-Number(timestamp))>120||!/^[a-f0-9]{64}$/.test(signature))return reply(401)
++  const bytes=await readBodyWithLimit(request,10*1024*1024)
++  if(!bytes)return reply(413)
++  const expected=createHmac('sha256',secret).update(timestamp+'.void-normalized.').update(bytes).digest()
++  if(!timingSafeEqual(expected,Buffer.from(signature,'hex')))return reply(401)
++  try{
++    const value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes))
++    if(value?.version!=='iplaycafe.void-mail/1'||!/^void-[a-f0-9]{64}$/.test(value.deliveryId)||!Number.isInteger(value.rawSize)||value.rawSize<1||value.rawSize>10*1024*1024||typeof value.envelopeTo!=='string'||typeof value.mailSlug!=='string'||!value.email||typeof value.email!=='object')return reply(400)
++    const at=value.envelopeTo.lastIndexOf('@'),named=workspaceSlugFromInboundAddress(value.envelopeTo)
++    if(value.mailSlug!==currentMailSlug()||named.kind!=='slug'||named.slug!==value.mailSlug||!inboundAcceptDomains().has(value.envelopeTo.slice(at+1).toLowerCase()))return reply(404)
++    const email=value.email
++    if(typeof email.from!=='string'||(email.text!==undefined&&typeof email.text!=='string')||(email.html!==undefined&&typeof email.html!=='string')||(!(typeof email.text==='string'||typeof email.html==='string')&&!(Array.isArray(email.attachments)&&email.attachments.some((a:any)=>typeof a?.content==='string'&&a.content.length>0)))||email.attachments!==undefined&&(!Array.isArray(email.attachments)||email.attachments.length>30||email.attachments.some((a:any)=>typeof a?.content!=='string'||!(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/).test(a.content))))return reply(400)
++    const safeHeaders:Record<string,string>={}
++    // Raw MIME headers are sender-controlled. No forged Authentication-Results
++    // can upgrade the stock cold-inbound sender trust gate.
++    for(const [key,v]of Object.entries(email.headers??{}))if(typeof v==='string'&&/^(message-id|in-reply-to|references|reply-to|auto-submitted|x-auto-response-suppress|precedence|list-.+)$/i.test(key))safeHeaders[key]=v
++    const parsed=parseInboundEmail({...email,to:[value.envelopeTo],headers:safeHeaders})
++    parsed.transportMessageId=value.deliveryId
++    const {ingestParsedEmail}=await import('./conversation.email-inbound.service')
++    const result=await ingestParsedEmail(parsed)
++    // A rate-limited body has not been retained; force durable upstream retry.
++    return reply(result.status==='rate_limited'?429:200)
++  }catch{return reply(503)}
++}
+diff --git a/apps/web/src/routes/api/auth/portal-signin.ts b/apps/web/src/routes/api/auth/portal-signin.ts
+index e88f9cac9c4bc5fe9804ffe876dfa136dfb68eae..3ce621f81ff94f02bb9fdbdc06ca0212d68832ba 100644
+--- a/apps/web/src/routes/api/auth/portal-signin.ts
++++ b/apps/web/src/routes/api/auth/portal-signin.ts
+@@ -8,6 +8,7 @@ import { logger } from '@/lib/server/logger'
+ const log = logger.child({ component: 'portal-signin' })
+ 
+ interface PortalSigninBody {
++  operationId?: unknown
+   email?: unknown
+   callbackURL?: unknown
+ }
+@@ -110,7 +111,7 @@ export async function handlePortalSignin(request: Request): Promise<Response> {
+   }
+ 
+   try {
+-    await requestEmailSignin({ email, callbackURL })
++    await requestEmailSignin({ email, callbackURL,...(typeof body.operationId==='string'?{operationId:body.operationId}:{}) })
+     return Response.json({ ok: true })
+   } catch (err) {
+     // Domain-level, so it says nothing about whether the address holds an
+diff --git a/apps/web/src/routes/api/chat/email/inbound.ts b/apps/web/src/routes/api/chat/email/inbound.ts
+index c7c0cb2e4fab8aa35138800c545d956cd8a41aad..e3c62c4582c70abd73292de1bff88ff52f7425b9 100644
+--- a/apps/web/src/routes/api/chat/email/inbound.ts
++++ b/apps/web/src/routes/api/chat/email/inbound.ts
+@@ -4,6 +4,8 @@ export const Route = createFileRoute('/api/chat/email/inbound')({
+   server: {
+     handlers: {
+       POST: async ({ request }) => {
++        const {isVoidInboundRequest,handleVoidInboundEmail}=await import('@/lib/server/domains/conversation/email-void-handler')
++        if(isVoidInboundRequest(request))return handleVoidInboundEmail(request)
+         // Two transports, one address. They are told apart by what they send:
+         // the fleet's edge mail bridge POSTs raw MIME, the provider webhook
+         // POSTs JSON. Each handler authenticates its own caller with its own
+diff --git a/packages/email/src/__tests__/void-send.test.ts b/packages/email/src/__tests__/void-send.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..16af3554a07b445e9ff7f8bd0e8f19a43c76a5fe
+--- /dev/null
++++ b/packages/email/src/__tests__/void-send.test.ts
+@@ -0,0 +1,59 @@
++import {beforeEach,afterEach,expect,it,vi} from 'vitest'
++import {sendRawEmail,sendInvitationEmail,sendMagicLinkEmail,sendPasswordResetEmail, getEmailProvider, setEmailLogSink,setDefaultFromResolver,resetDefaultFromResolver} from '../index'
++import {withEmailIdempotencyKey} from '../idempotency'
++import {sendingAs,sealedTo} from './brands'
++
++const keys=['EMAIL_VOID_URL','EMAIL_VOID_TOKEN','EMAIL_SES_ACCESS_KEY_ID','EMAIL_SES_SECRET_ACCESS_KEY','EMAIL_SMTP_HOST','EMAIL_RESEND_API_KEY','RESEND_API_KEY','EMAIL_INBOUND_PROVIDER']
++let saved:Record<string,string|undefined>={}
++const transport=vi.fn()
++beforeEach(()=>{saved=Object.fromEntries(keys.map(k=>[k,process.env[k]]));keys.forEach(k=>delete process.env[k]);process.env.EMAIL_VOID_URL='https://mail.example.test/api/platform-mail';process.env.EMAIL_VOID_TOKEN='synthetic-auth';vi.stubGlobal('fetch',transport);transport.mockReset();setEmailLogSink(null)})
++afterEach(()=>{keys.forEach(k=>{if(saved[k]===undefined)delete process.env[k];else process.env[k]=saved[k]});vi.unstubAllGlobals();setEmailLogSink(null)})
++const message={from:sendingAs('Support <support@mail.example.test>'),to:'user@example.test',subject:'private-subject',html:'<p>private-body</p>',text:'private-body',replyTo:'reply+t123.Tag@reply.example.test',messageId:'unstable@sender.test',inReplyTo:'parent@example.test',references:['first@example.test','parent@example.test'],attachments:[{filename:'x.txt',contentType:'text/plain',content:new Uint8Array([65,66])}]}
++it('selects real Void provider and refuses conflicting or half configuration',()=>{
++  expect(getEmailProvider()).toBe('void')
++  process.env.EMAIL_SMTP_HOST='smtp.example.test';expect(()=>getEmailProvider()).toThrow(/More than one/)
++  delete process.env.EMAIL_SMTP_HOST;delete process.env.EMAIL_VOID_TOKEN;expect(()=>getEmailProvider()).toThrow(/EMAIL_VOID/)
++})
++it('actual sendRawEmail sends stable identity and preserves signed Reply-To, threading and attachment bytes',async()=>{
++  let wire:any
++  transport.mockImplementation(async(url:string,init:RequestInit)=>{wire=JSON.parse(init.body as string);expect(url).toBe('https://mail.example.test/api/platform-mail/send');expect(new Headers(init.headers).get('authorization')).toBe('Bearer synthetic-auth');return Response.json({logicalId:wire.logicalId,state:'PROVIDER_ACCEPTED',providerId:'native-1'})})
++  const result=await withEmailIdempotencyKey('ticket:synthetic:notification:1',()=>sendRawEmail(message))
++  expect(result).toEqual({sent:true,messageId:null})
++  expect(wire).toMatchObject({logicalId:expect.stringMatching(/^qb-[a-f0-9]{64}$/),replyTo:message.replyTo,threading:{inReplyTo:'<parent@example.test>',references:'<first@example.test> <parent@example.test>'},attachments:[{contentBase64:'QUI='}]})
++  expect(wire.headers?.['Message-ID']).toBeUndefined()
++})
++it('refuses unscoped sends before network and never logs body/address/exception on Void path',async()=>{
++  const sink=vi.fn();setEmailLogSink(sink)
++  await expect(sendRawEmail(message)).rejects.toMatchObject({retryable:false,code:'LOGICAL_ID_REQUIRED'})
++  expect(transport).not.toHaveBeenCalled();expect(sink).not.toHaveBeenCalled()
++})
++it('lost send response reads receipt; unknown is permanent and never blindly re-POSTed',async()=>{
++  transport.mockImplementation(async(url:string)=>{if(url.endsWith('/send'))throw Error('private-token https://sensitive.example.test');return Response.json({logicalId:url.split('/').at(-1),state:'OUTCOME_UNKNOWN'})})
++  await expect(withEmailIdempotencyKey('unknown-send',()=>sendRawEmail(message))).rejects.toMatchObject({retryable:false,code:'OUTCOME_UNKNOWN',message:'Void mail OUTCOME_UNKNOWN'})
++  expect(transport.mock.calls.map(c=>c[0])).toEqual([expect.stringMatching(/\/send$/),expect.stringMatching(/\/receipt\/qb-/)])
++})
++it('lost response with durable accepted receipt reconciles successfully',async()=>{
++  transport.mockImplementation(async(url:string)=>{if(url.endsWith('/send'))throw Error('connection lost');return Response.json({logicalId:url.split('/').at(-1),state:'PROVIDER_ACCEPTED',providerId:'native-1'})})
++  expect((await withEmailIdempotencyKey('accepted-send',()=>sendRawEmail(message))).sent).toBe(true)
++})
++it('foreign or malformed receipt can never report success',async()=>{
++  transport.mockResolvedValue(Response.json({logicalId:'foreign',state:'PROVIDER_ACCEPTED'}))
++  await expect(withEmailIdempotencyKey('foreign-receipt',()=>sendRawEmail(message))).rejects.toMatchObject({code:'OUTCOME_UNKNOWN',retryable:false})
++})
++it('auth and invitation capability identity is stable across retries and fresh tokens differ',async()=>{
++  const ids:string[]=[]
++  setDefaultFromResolver(()=>sendingAs('support@mail.example.test'))
++  transport.mockImplementation(async(_url:string,init:RequestInit)=>{const wire=JSON.parse(init.body as string);ids.push(wire.logicalId);return Response.json({logicalId:wire.logicalId,state:'PROVIDER_ACCEPTED'})})
++  const to=sealedTo('user@example.test')
++  try{
++    await sendMagicLinkEmail({to,signInUrl:'https://feedback.example.test/auth?token=synthetic-one',code:'123456'})
++    await sendMagicLinkEmail({to,signInUrl:'https://feedback.example.test/auth?token=synthetic-one',code:'123456'})
++    await sendMagicLinkEmail({to,signInUrl:'https://feedback.example.test/auth?token=synthetic-two',code:'123456'})
++    expect(ids[0]).toBe(ids[1]);expect(ids[2]).not.toBe(ids[0])
++    await sendInvitationEmail({to,invitedByName:'Operator',workspaceName:'Test',inviteLink:'https://feedback.example.test/invite/synthetic-one'})
++    await sendInvitationEmail({to,invitedByName:'Operator',workspaceName:'Test',inviteLink:'https://feedback.example.test/invite/synthetic-one'})
++    expect(ids[3]).toBe(ids[4])
++    await sendPasswordResetEmail({to,resetLink:'https://feedback.example.test/reset/synthetic-one'})
++    expect(ids[5]).not.toBe(ids[3]);expect(ids.every(id=>/^qb-[a-f0-9]{64}$/.test(id))).toBe(true)
++  }finally{resetDefaultFromResolver()}
++})
+diff --git a/packages/email/src/idempotency.ts b/packages/email/src/idempotency.ts
+index 65a2f76767c39a3a40a18291d22846ca631cd4b8..43c814b382ea585ab91ed28ca851ea9d2788f268 100644
+--- a/packages/email/src/idempotency.ts
++++ b/packages/email/src/idempotency.ts
+@@ -42,3 +42,9 @@ export function currentEmailIdempotencyKey(): string | undefined {
+   if (!raw) return undefined
+   return `qb-${createHash('sha256').update(raw).digest('hex')}`
+ }
++
++/** A persisted business identity (capability token, event ID), never a content hash. */
++export function withEmailOperationId<T>(kind:string,identity:string|undefined,fn:()=>T):T {
++  if(scope.getStore()||!identity)return fn()
++  return withEmailIdempotencyKey(`operation:${kind}:${createHash('sha256').update(identity).digest('hex')}`,fn)
++}
+diff --git a/packages/email/src/index.ts b/packages/email/src/index.ts
+index 5df5da61f683879a0e1374b88b2bfe47e3772fed..f7822ccd6524bb0f0f68497af7b62189bb8c6d9e 100644
+--- a/packages/email/src/index.ts
++++ b/packages/email/src/index.ts
+@@ -19,8 +19,9 @@ import { createLogger } from '@quackback/logger'
+ import { isSyntheticAnonEmail } from './anon'
+ import { applyDisplayName, sendViaSes } from './ses'
+ import { sendViaResend } from './resend'
++import { sendViaVoid } from './void'
+ import { listUnsubscribeHeaders } from './list-unsubscribe'
+-import { currentEmailIdempotencyKey } from './idempotency'
++import { currentEmailIdempotencyKey,withEmailOperationId } from './idempotency'
+ import { EmailConfigError, resendApiKey, resolveEmailProvider } from './provider'
+ import type { EmailProvider } from './provider'
+ export {
+@@ -403,6 +404,15 @@ async function dispatch(
+   const text =
+     options.text ?? (options.react ? await render(options.react, { plainText: true }) : undefined)
+ 
++  if (provider === 'void') {
++    await sendViaVoid({from,to:options.to,subject:options.subject,html,text,replyTo:options.replyTo,
++      headers:threadingHeaders,attachments:options.attachments})
++    // Acceptance is not delivery. Do not persist body, subject, recipient,
++    // URLs or exceptions in the platform tail or the generic email-log sink.
++    // Provider Message-ID semantics are unqualified: signed Reply-To owns routing.
++    return {sent:true,messageId:null}
++  }
++
+   if (provider === 'ses') {
+     // Message-ID is platform-controlled: the transport drops ours on the way
+     // out and reports back the one SES assigned. In-Reply-To and References are
+@@ -626,7 +636,7 @@ interface SendInvitationParams {
+ export async function sendInvitationEmail(params: SendInvitationParams): Promise<EmailResult> {
+   const { to, invitedByName, inviteeName, workspaceName, inviteLink, logoUrl } = params
+ 
+-  return sendEmail({
++  return withEmailOperationId("sendInvitationEmail",to+"\n"+inviteLink,()=>sendEmail({
+     to,
+     subject: `You've been invited to join ${workspaceName} on Quackback`,
+     react: InvitationEmail({
+@@ -638,7 +648,7 @@ export async function sendInvitationEmail(params: SendInvitationParams): Promise
+     }),
+     emailType: 'InvitationEmail',
+     preview: { inviteLink },
+-  })
++  }))
+ }
+ 
+ // ============================================================================
+@@ -656,13 +666,13 @@ interface SendPortalInviteParams {
+ export async function sendPortalInviteEmail(params: SendPortalInviteParams): Promise<EmailResult> {
+   const { to, workspaceName, inviteLink, logoUrl, personalMessage } = params
+ 
+-  return sendEmail({
++  return withEmailOperationId("sendPortalInviteEmail",to+"\n"+inviteLink,()=>sendEmail({
+     to,
+     subject: `You've been invited to ${workspaceName}`,
+     react: PortalInviteEmail({ workspaceName, inviteLink, logoUrl, personalMessage }),
+     emailType: 'PortalInviteEmail',
+     preview: { inviteLink },
+-  })
++  }))
+ }
+ 
+ // ============================================================================
+@@ -704,13 +714,13 @@ export async function sendMagicLinkEmail(params: SendMagicLinkParams): Promise<E
+   const { to, signInUrl, code, logoUrl } = params
+ 
+   log.debug('sending sign-in email')
+-  return sendEmail({
++  return withEmailOperationId("sendMagicLinkEmail",to+"\n"+signInUrl,()=>sendEmail({
+     to,
+     subject: 'Your Quackback sign-in link',
+     react: MagicLinkEmail({ signInUrl, code, logoUrl }),
+     emailType: 'MagicLinkEmail',
+     preview: { signInUrl, code },
+-  })
++  }))
+ }
+ 
+ // ============================================================================
+@@ -764,13 +774,13 @@ export async function sendPasswordResetEmail(
+   const { to, resetLink, logoUrl } = params
+ 
+   log.debug('sending password reset email')
+-  return sendEmail({
++  return withEmailOperationId("sendPasswordResetEmail",to+"\n"+resetLink,()=>sendEmail({
+     to,
+     subject: 'Reset your Quackback password',
+     react: PasswordResetEmail({ resetLink, logoUrl }),
+     emailType: 'PasswordResetEmail',
+     preview: { resetLink },
+-  })
++  }))
+ }
+ 
+ // ============================================================================
+@@ -797,13 +807,13 @@ export async function sendRecoveryCodeUsedEmail(
+   const { to, workspaceName, ipAddress, userAgent, occurredAt, logoUrl } = params
+ 
+   log.debug('sending recovery-code-used alert')
+-  return sendEmail({
++  return withEmailOperationId("sendRecoveryCodeUsedEmail",to+"\n"+occurredAt,()=>sendEmail({
+     to,
+     subject: 'A recovery code on your account was just used',
+     react: RecoveryCodeUsedEmail({ workspaceName, ipAddress, userAgent, occurredAt, logoUrl }),
+     emailType: 'RecoveryCodeUsedEmail',
+     preview: { occurredAt },
+-  })
++  }))
+ }
+ 
+ // ============================================================================
+@@ -840,7 +850,7 @@ export async function sendNewSignInEmail(params: SendNewSignInParams): Promise<E
+   } = params
+ 
+   log.debug('sending new-sign-in alert')
+-  return sendEmail({
++  return withEmailOperationId("sendNewSignInEmail",to+"\n"+occurredAt,()=>sendEmail({
+     to,
+     subject: 'New sign-in to your account',
+     react: NewSignInEmail({
+@@ -855,7 +865,7 @@ export async function sendNewSignInEmail(params: SendNewSignInParams): Promise<E
+     }),
+     emailType: 'NewSignInEmail',
+     preview: { occurredAt },
+-  })
++  }))
+ }
+ 
+ // ============================================================================
+@@ -1770,6 +1780,8 @@ export { EMAIL_BILLABLE, METERED_EMAIL_TYPES, isEmailBillable } from './mail-cla
+ // ============================================================================
+ 
+ export interface SendVerifyAddressEmailParams {
++  /** Persisted verification row ID + expiry; required for Void, never the 6-digit code alone. */
++  operationId?: string
+   to: string
+   code: string
+   workspaceName?: string
+@@ -1786,10 +1798,10 @@ export async function sendVerifyAddressEmail(
+ ): Promise<EmailResult> {
+   const { to, code, workspaceName, logoUrl } = params
+   log.debug('sending address verification code')
+-  return sendEmail({
++  return withEmailOperationId("sendVerifyAddressEmail",params.operationId,()=>sendEmail({
+     to,
+     subject: 'Confirm your email address',
+     react: VerifyAddressEmail({ code, workspaceName, logoUrl }),
+     emailType: 'VerifyAddressEmail',
+-  })
++  }))
+ }
+diff --git a/packages/email/src/provider.ts b/packages/email/src/provider.ts
+index 29629b20ddc63865fe03471af2e13a3caf296072..1b9774ee09a75a2fa2ae8251514654a7ff2dc0d3 100644
+--- a/packages/email/src/provider.ts
++++ b/packages/email/src/provider.ts
+@@ -15,7 +15,7 @@
+  * key left out of the count. A lone Resend key sends whatever that variable says.
+  */
+ 
+-export type EmailProvider = 'ses' | 'smtp' | 'resend' | 'console'
++export type EmailProvider = 'ses' | 'smtp' | 'resend' | 'void' | 'console'
+ 
+ type EnvLike = Record<string, string | undefined>
+ 
+@@ -52,6 +52,7 @@ export class EmailProviderConflictError extends EmailConfigError {
+ }
+ 
+ const PROVIDER_LABEL: Record<Exclude<EmailProvider, 'console'>, string> = {
++  void: 'Void',
+   ses: 'Amazon SES',
+   smtp: 'SMTP',
+   resend: 'Resend',
+@@ -96,6 +97,19 @@ function configuredProviders(
+   if (present(env, 'EMAIL_SMTP_HOST')) {
+     found.push({ provider: 'smtp', variables: ['EMAIL_SMTP_HOST'] })
+   }
++  if (present(env, 'EMAIL_VOID_URL') || present(env, 'EMAIL_VOID_TOKEN')) {
++    if (!present(env, 'EMAIL_VOID_URL') || !present(env, 'EMAIL_VOID_TOKEN')) {
++      throw new EmailConfigError('EMAIL_VOID_URL and EMAIL_VOID_TOKEN must both be configured')
++    }
++    let endpoint: URL
++    try { endpoint = new URL(env.EMAIL_VOID_URL!) } catch {
++      throw new EmailConfigError('EMAIL_VOID_URL must be an HTTPS endpoint')
++    }
++    if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
++      throw new EmailConfigError('EMAIL_VOID_URL must be an HTTPS endpoint without credentials or query')
++    }
++    found.push({provider:'void',variables:['EMAIL_VOID_URL','EMAIL_VOID_TOKEN']})
++  }
+   const resendVars = resendKeyVariables(env)
+   // A key kept for inbound beside another sender is that sender's install
+   // receiving through Resend, not a second sender.
+diff --git a/packages/email/src/void.ts b/packages/email/src/void.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a24e1760122ac73790079c26923dae93c654a518
+--- /dev/null
++++ b/packages/email/src/void.ts
+@@ -0,0 +1,49 @@
++import type { EmailAttachment } from './attachment'
++import { currentEmailIdempotencyKey } from './idempotency'
++
++/** No provider text/cause survives into the application logger or SQL sink. */
++export class VoidEmailError extends Error {
++  readonly retryable = false
++  constructor(readonly code:string){super(`Void mail ${code}`);this.name='VoidEmailError'}
++}
++interface VoidSendRequest {
++  from:string;to:string;subject:string;html?:string;text?:string;replyTo?:string
++  headers?:Record<string,string>;attachments?:EmailAttachment[]
++}
++async function receipt(response:Response,logicalId:string):Promise<{state:string}|null>{
++  if(!response.ok||!response.body)return null
++  const reader=response.body.getReader();let size=0;const chunks:Uint8Array[]=[]
++  try{for(;;){const chunk=await reader.read();if(chunk.done)break;size+=chunk.value.length;if(size>4096)return null;chunks.push(chunk.value)}
++    const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length}
++    const value=JSON.parse(new TextDecoder().decode(bytes))
++    return value?.logicalId===logicalId&&typeof value.state==='string'?{state:value.state}:null
++  }catch{return null}finally{void reader.cancel().catch(()=>{});reader.releaseLock()}
++}
++export async function sendViaVoid(request:VoidSendRequest):Promise<void>{
++  const logicalId=currentEmailIdempotencyKey()
++  // A content hash merges distinct notifications; a random key duplicates a
++  // retried notification. Only the business caller knows its stable identity.
++  if(!logicalId)throw new VoidEmailError('LOGICAL_ID_REQUIRED')
++  const base=process.env.EMAIL_VOID_URL!.replace(/\/$/,'')
++  const headers={'authorization':`Bearer ${process.env.EMAIL_VOID_TOKEN!}`,'content-type':'application/json'}
++  const regular:Record<string,string>={},threading:{inReplyTo?:string;references?:string}={}
++  for(const [key,value]of Object.entries(request.headers??{})){
++    if(key.toLowerCase()==='in-reply-to')threading.inReplyTo=value
++    else if(key.toLowerCase()==='references')threading.references=value
++    else if(key.toLowerCase()!=='message-id')regular[key]=value
++  }
++  const body=JSON.stringify({logicalId,from:request.from,to:request.to,subject:request.subject,
++    ...(request.html!==undefined?{html:request.html}:{}),...(request.text!==undefined?{text:request.text}:{}),
++    ...(request.replyTo?{replyTo:request.replyTo}:{}),...(Object.keys(regular).length?{headers:regular}:{}),
++    ...(Object.keys(threading).length?{threading}:{}),
++    ...(request.attachments?.length?{attachments:request.attachments.map(a=>({filename:a.filename,contentType:a.contentType,contentBase64:Buffer.from(a.content).toString('base64')}))}:{})})
++  if(Buffer.byteLength(body)>5*1024*1024)throw new VoidEmailError('PRIVATE_PORTAL_REQUIRED')
++  let result:{state:string}|null=null
++  try{result=await receipt(await fetch(base+'/send',{method:'POST',headers,body,signal:AbortSignal.timeout(75000),redirect:'error'}),logicalId)}catch{}
++  if(!result||result.state==='OUTCOME_UNKNOWN'){
++    // Read-only reconciliation: never another send on an ambiguous outcome.
++    try{result=await receipt(await fetch(base+'/receipt/'+logicalId,{headers,signal:AbortSignal.timeout(10000),redirect:'error'}),logicalId)}catch{}
++  }
++  if(result?.state==='PROVIDER_ACCEPTED'||result?.state==='DELIVERED')return
++  throw new VoidEmailError(result&&['REJECTED','BOUNCED','COMPLAINED'].includes(result.state)?result.state:'OUTCOME_UNKNOWN')
++}

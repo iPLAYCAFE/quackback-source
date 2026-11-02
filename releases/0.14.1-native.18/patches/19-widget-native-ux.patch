@@ -1,0 +1,506 @@
+diff --git a/apps/web/src/components/widget/__tests__/widget-overview-native-capture.test.tsx b/apps/web/src/components/widget/__tests__/widget-overview-native-capture.test.tsx
+new file mode 100644
+index 0000000..c7867cd
+--- /dev/null
++++ b/apps/web/src/components/widget/__tests__/widget-overview-native-capture.test.tsx
+@@ -0,0 +1,148 @@
++// @vitest-environment happy-dom
++/**
++ * Host-armed "Report an issue" Home action: hidden until a host origin arms it,
++ * then the FIRST Home card, styled like the other action cards (icon tile,
++ * title = host label, localized subtitle), posting only to the armed origin.
++ */
++import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
++import type { ReactNode } from 'react'
++import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { IntlProvider } from 'react-intl'
++import th from '@/locales/th.json'
++
++vi.mock('../widget-auth-provider', () => ({
++  useWidgetAuth: () => ({ user: null, isIdentified: false }),
++}))
++// The recent-message and recent-tickets cards render too, so "first" is
++// measured against every Home card, not only the admin-ordered ones.
++vi.mock('../use-messenger-summary', () => ({
++  useConversationSummary: () => ({
++    conversation: { id: 'c1' },
++    teamName: 'Team',
++    agentsOnline: false,
++  }),
++}))
++vi.mock('../widget-resume-card', () => ({
++  WidgetResumeCard: () => <button type="button">Resume conversation</button>,
++}))
++vi.mock('../widget-recent-tickets', () => ({
++  WidgetRecentTicketsCard: () => <button type="button">Recent tickets</button>,
++}))
++vi.mock('../widget-changelog-teaser', () => ({ WidgetChangelogTeaser: () => null }))
++vi.mock('@/components/ui/scroll-area', () => ({
++  ScrollArea: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
++}))
++vi.mock('framer-motion', async () => {
++  const { createElement, forwardRef } = await import('react')
++  const MOTION_PROPS = new Set(['initial', 'animate', 'exit', 'transition', 'variants'])
++  const make = (tag: string) =>
++    forwardRef<HTMLElement, Record<string, unknown>>((props, ref) => {
++      const { children, ...rest } = props
++      const dom: Record<string, unknown> = { ref }
++      for (const [key, value] of Object.entries(rest)) {
++        if (!MOTION_PROPS.has(key)) dom[key] = value
++      }
++      return createElement(tag, dom, children as ReactNode)
++    })
++  const proxy = new Proxy(
++    {},
++    { get: (_target, prop) => (typeof prop === 'string' ? make(prop) : undefined) }
++  )
++  return { m: proxy, motion: proxy, useReducedMotion: () => true }
++})
++
++import { WidgetOverview } from '../widget-overview'
++import { configureNativeCapture } from '../widget-native-capture'
++
++const HOST = 'https://paikaan.app'
++
++function renderOverview(locale = 'en', messages?: Record<string, string>) {
++  const noop = () => {}
++  return render(
++    <IntlProvider locale={locale} messages={messages}>
++      <WidgetOverview
++        tabs={{ feedback: true, messages: true, help: true, tickets: true }}
++        home={null}
++        assistant={null}
++        team={[]}
++        topArticles={[]}
++        onLeaveFeedback={noop}
++        onOpenHelp={noop}
++        onOpenHelpArticle={noop}
++        onStartConversation={noop}
++        onResumeMessenger={noop}
++        onOpenTicket={noop}
++        onSeeChangelog={noop}
++        onOpenChangelogEntry={noop}
++      />
++    </IntlProvider>
++  )
++}
++
++function homeCards(): HTMLButtonElement[] {
++  return Array.from(document.querySelectorAll('button')).filter((b) => b.textContent)
++}
++
++describe('WidgetOverview native capture action', () => {
++  beforeEach(() => {
++    act(() => configureNativeCapture('', { enabled: false }))
++  })
++  afterEach(() => {
++    cleanup()
++    vi.restoreAllMocks()
++  })
++
++  it('is absent until a host origin arms it', () => {
++    renderOverview()
++    expect(screen.queryByText('Report an issue')).toBeNull()
++    act(() => configureNativeCapture(HOST, { enabled: false, label: 'Report an issue' }))
++    expect(screen.queryByText('Report an issue')).toBeNull()
++    act(() => configureNativeCapture('', { enabled: true, label: 'Report an issue' }))
++    expect(screen.queryByText('Report an issue')).toBeNull()
++  })
++
++  it('renders first, as an action card with the host label and a subtitle', () => {
++    act(() => configureNativeCapture(HOST, { enabled: true, label: 'Report an issue' }))
++    renderOverview()
++    const cards = homeCards()
++    expect(cards.length).toBeGreaterThan(1)
++    const first = cards[0]
++    expect(first.textContent).toContain('Report an issue')
++    const texts = cards.map((b) => b.textContent)
++    expect(texts.indexOf('Resume conversation')).toBeGreaterThan(0)
++    expect(texts.indexOf('Recent tickets')).toBeGreaterThan(0)
++    expect(first.textContent).toContain('Screenshot or screen recording')
++    // Same chrome as the other Home action cards (e.g. Suggest a feature).
++    const feedback = cards.find((b) => b.textContent?.includes('Suggest a feature'))!
++    expect(first.className).toBe(feedback.className)
++    expect(first.querySelector('svg')).toBeTruthy()
++  })
++
++  it('uses the widget catalog for the subtitle (Thai)', () => {
++    act(() => configureNativeCapture(HOST, { enabled: true, label: 'แจ้งปัญหา' }))
++    renderOverview('th', th as Record<string, string>)
++    const first = homeCards()[0]
++    expect(first.textContent).toContain('แจ้งปัญหา')
++    expect(first.textContent).toContain('จับภาพหน้าจอหรืออัดวิดีโอ')
++  })
++
++  it('posts the unchanged native-capture-request to the armed origin only', () => {
++    const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
++    act(() => configureNativeCapture(HOST, { enabled: true, label: 'Report an issue' }))
++    renderOverview()
++    fireEvent.click(homeCards()[0])
++    expect(post).toHaveBeenCalledTimes(1)
++    expect(post).toHaveBeenCalledWith(
++      {
++        type: 'quackback:event',
++        name: 'native-capture-request',
++        payload: {
++          contract: 'iplaycafe.feedback/native-1',
++          audience: window.location.origin,
++          hostOrigin: HOST,
++        },
++      },
++      HOST
++    )
++  })
++})
+diff --git a/apps/web/src/components/widget/__tests__/widget-shell-header.test.tsx b/apps/web/src/components/widget/__tests__/widget-shell-header.test.tsx
+index 2df37f7..188a5bc 100644
+--- a/apps/web/src/components/widget/__tests__/widget-shell-header.test.tsx
++++ b/apps/web/src/components/widget/__tests__/widget-shell-header.test.tsx
+@@ -5,7 +5,7 @@
+  */
+ import { describe, it, expect, vi, beforeEach } from 'vitest'
+ import type { ReactNode } from 'react'
+-import { render, screen } from '@testing-library/react'
++import { fireEvent, render, screen } from '@testing-library/react'
+ import { IntlProvider } from 'react-intl'
+ 
+ const authState: {
+@@ -82,6 +82,29 @@ describe('WidgetShell header', () => {
+     expect(document.querySelectorAll('.size-7').length).toBe(0)
+   })
+ 
++  it('opens the profile card above the body on an opaque popover surface', () => {
++    authState.user = { name: 'Ada Example', email: 'ada@example.com', avatarUrl: null }
++    authState.isIdentified = true
++    renderHome()
++
++    const trigger = screen.getByRole('button', { name: 'User menu' })
++    fireEvent.click(trigger)
++    const card = screen.getByText('ada@example.com').closest('div.absolute') as HTMLElement
++    expect(card).toBeTruthy()
++    // Opaque surface; z-[60] keeps it above any sibling the header row may gain.
++    expect(card.className).toContain('z-[60]')
++    expect(card.className).toContain('bg-popover')
++    expect(card.className).toContain('text-popover-foreground')
++    expect(card.className).not.toContain('bg-card')
++    // The fix proper: the header row stacks above the body (z-10), whose
++    // animated Home cards otherwise paint over the card.
++    const header = trigger.closest('div.shrink-0') as HTMLElement
++    const body = screen.getByText('home').closest('div') as HTMLElement
++    expect(header.className).toContain('z-30')
++    expect(body.className).toContain('z-10')
++    expect(header.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
++  })
++
+   it('has no profile avatar and no teammate cluster for an anonymous visitor', () => {
+     renderHome()
+ 
+diff --git a/apps/web/src/components/widget/widget-native-capture.tsx b/apps/web/src/components/widget/widget-native-capture.tsx
+index 9096406..7e3ca73 100644
+--- a/apps/web/src/components/widget/widget-native-capture.tsx
++++ b/apps/web/src/components/widget/widget-native-capture.tsx
+@@ -1,23 +1,51 @@
+ import { useSyncExternalStore } from 'react'
+ import { NATIVE_HOST_CONTRACT } from '@/lib/shared/widget/native-host'
+ 
+-let config: {origin: string; enabled: boolean; label: string} = {origin: '', enabled: false, label: ''}
++let config: { origin: string; enabled: boolean; label: string } = {
++  origin: '',
++  enabled: false,
++  label: '',
++}
+ const listeners = new Set<() => void>()
+-const empty = {origin: '', enabled: false, label: ''}
++const empty = { origin: '', enabled: false, label: '' }
+ export function configureNativeCapture(origin: string, payload: Record<string, unknown>) {
+-  config = {origin, enabled: payload.enabled === true,
+-    label: typeof payload.label === 'string' ? payload.label.slice(0, 100) : 'Report an issue'}
++  config = {
++    origin,
++    enabled: payload.enabled === true,
++    label: typeof payload.label === 'string' ? payload.label.slice(0, 100) : 'Report an issue',
++  }
+   for (const listener of listeners) listener()
+ }
+ 
+-/** Host owns capture/editor/consent; this is only the one native Home action. */
+-export function WidgetNativeCaptureAction() {
+-  const value = useSyncExternalStore((callback) => {listeners.add(callback); return () => {listeners.delete(callback)}},
+-    () => config, () => empty)
++/** Host owns capture/editor/consent; this is only the one native Home action.
++ *  Null unless an armed host origin configured it; the Home overview renders it
++ *  as its first action card. `request` asks that host (and only it) to capture. */
++export function useNativeCaptureAction(): { label: string; request: () => void } | null {
++  const value = useSyncExternalStore(
++    (callback) => {
++      listeners.add(callback)
++      return () => {
++        listeners.delete(callback)
++      }
++    },
++    () => config,
++    () => empty
++  )
+   if (!value.enabled || !value.origin) return null
+-  return <button type="button" className="mx-4 rounded-2xl border border-border/60 bg-card px-4 py-3 text-left hover:bg-accent"
+-    onClick={() => window.parent.postMessage({type: 'quackback:event', name: 'native-capture-request',
+-      payload: {contract: NATIVE_HOST_CONTRACT, audience: window.location.origin, hostOrigin: value.origin}}, value.origin)}>
+-    {value.label}
+-  </button>
++  return {
++    label: value.label,
++    request: () =>
++      window.parent.postMessage(
++        {
++          type: 'quackback:event',
++          name: 'native-capture-request',
++          payload: {
++            contract: NATIVE_HOST_CONTRACT,
++            audience: window.location.origin,
++            hostOrigin: value.origin,
++          },
++        },
++        value.origin
++      ),
++  }
+ }
+diff --git a/apps/web/src/components/widget/widget-overview.tsx b/apps/web/src/components/widget/widget-overview.tsx
+index 3a18491..0e95ec6 100644
+--- a/apps/web/src/components/widget/widget-overview.tsx
++++ b/apps/web/src/components/widget/widget-overview.tsx
+@@ -7,6 +7,7 @@ import {
+   MagnifyingGlassIcon,
+   ChevronRightIcon,
+   ArrowTopRightOnSquareIcon,
++  BugAntIcon,
+ } from '@heroicons/react/24/solid'
+ import { ScrollArea } from '@/components/ui/scroll-area'
+ import { Avatar } from '@/components/ui/avatar'
+@@ -20,7 +21,7 @@ import { useWidgetAuth } from './widget-auth-provider'
+ import { firstNameOf } from '@/lib/shared/conversation/personalize'
+ import { WidgetResumeCard } from './widget-resume-card'
+ import { WidgetRecentTicketsCard } from './widget-recent-tickets'
+-import { WidgetNativeCaptureAction } from './widget-native-capture'
++import { useNativeCaptureAction } from './widget-native-capture'
+ import { WidgetChangelogTeaser } from './widget-changelog-teaser'
+ import type { ConversationId } from '@quackback/ids'
+ import { type EnabledTabs } from './widget-nav'
+@@ -103,6 +104,8 @@ export function WidgetOverview({
+   const subtitle = home?.subtitle
+   const firstName = firstNameOf(user?.name)
+   const reduceMotion = useReducedMotion()
++  // Host-armed "Report an issue" action (native-1 capture-config); null otherwise.
++  const capture = useNativeCaptureAction()
+ 
+   // A recent-conversation resume card is a messenger concept — only fetched/shown
+   // when the Messages surface is enabled.
+@@ -332,6 +335,33 @@ export function WidgetOverview({
+               animate="visible"
+               variants={{ visible: { transition: { staggerChildren: 0.045 } } }}
+             >
++              {capture && (
++                // The host's report action leads Home, styled and staggered
++                // like every action card.
++                <m.div
++                  variants={{
++                    hidden: { opacity: 0, y: 8 },
++                    visible: {
++                      opacity: 1,
++                      y: 0,
++                      transition: { duration: 0.25, ease: [0.32, 0.72, 0, 1] },
++                    },
++                  }}
++                >
++                  <ActionCard
++                    icon={BugAntIcon}
++                    onClick={capture.request}
++                    title={capture.label}
++                    subtitle={
++                      <FormattedMessage
++                        id="widget.native.capture.sub"
++                        defaultMessage="Screenshot or screen recording"
++                      />
++                    }
++                  />
++                </m.div>
++              )}
++
+               {conversation && (
+                 // For Bearer-token visitors this can arrive after mount (SSR
+                 // can't see their token); fade it in rather than popping.
+@@ -389,7 +419,6 @@ export function WidgetOverview({
+                   </m.div>
+                 )
+               })}
+-              <WidgetNativeCaptureAction />
+             </m.div>
+           </div>
+         </div>
+diff --git a/apps/web/src/components/widget/widget-shell.tsx b/apps/web/src/components/widget/widget-shell.tsx
+index f482b3e..d9d2421 100644
+--- a/apps/web/src/components/widget/widget-shell.tsx
++++ b/apps/web/src/components/widget/widget-shell.tsx
+@@ -260,7 +260,9 @@ export function WidgetShell({
+       {/* The Home hero backdrop fills the panel behind the header row and
+           body; the header/content render transparently over it. */}
+       {backdrop}
+-      <div className="relative z-10 flex items-center justify-between gap-2 px-4 py-3 shrink-0">
++      {/* z-30: the header row (and the profile card it opens) stacks above the
++          body, whose animated Home cards create their own stacking contexts. */}
++      <div className="relative z-30 flex items-center justify-between gap-2 px-4 py-3 shrink-0">
+         {/* Left: back button on detail views; workspace logo on Home. min-w-0 so
+             header content (presence copy) truncates instead of pushing the
+             right-zone controls. */}
+@@ -531,7 +533,7 @@ function UserAvatarPopover({
+       </button>
+ 
+       {open && (
+-        <div className="absolute end-0 top-full mt-1.5 z-50 w-56 rounded-lg border border-border bg-card shadow-lg">
++        <div className="absolute end-0 top-full mt-1.5 z-[60] w-56 rounded-lg border border-border bg-popover text-popover-foreground shadow-xl">
+           <div className="px-3 py-3">
+             <div className="flex items-center gap-2.5">
+               <Avatar src={user.avatarUrl} name={user.name} className="size-9 text-sm" />
+diff --git a/apps/web/src/locales/ar.json b/apps/web/src/locales/ar.json
+index e4422ec..3abd513 100644
+--- a/apps/web/src/locales/ar.json
++++ b/apps/web/src/locales/ar.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "شاركنا أفكارك",
+   "widget.shell.heading.help": "المساعدة والدعم",
+   "widget.shell.heading.changelog": "آخر المستجدات",
+diff --git a/apps/web/src/locales/de.json b/apps/web/src/locales/de.json
+index e4fec04..1db3d78 100644
+--- a/apps/web/src/locales/de.json
++++ b/apps/web/src/locales/de.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "Teile deine Ideen",
+   "widget.shell.heading.help": "Hilfe & Support",
+   "widget.shell.heading.changelog": "Neuigkeiten",
+diff --git a/apps/web/src/locales/en.json b/apps/web/src/locales/en.json
+index 217eadc..6ba5597 100644
+--- a/apps/web/src/locales/en.json
++++ b/apps/web/src/locales/en.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "Share your ideas",
+   "widget.shell.heading.help": "Help & Support",
+   "widget.shell.heading.changelog": "What's new",
+diff --git a/apps/web/src/locales/es.json b/apps/web/src/locales/es.json
+index b93ae8e..06266e9 100644
+--- a/apps/web/src/locales/es.json
++++ b/apps/web/src/locales/es.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "Comparte tus ideas",
+   "widget.shell.heading.help": "Ayuda y soporte",
+   "widget.shell.heading.changelog": "Novedades",
+diff --git a/apps/web/src/locales/fr.json b/apps/web/src/locales/fr.json
+index a3a00eb..fa65f25 100644
+--- a/apps/web/src/locales/fr.json
++++ b/apps/web/src/locales/fr.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "Partagez vos idées",
+   "widget.shell.heading.help": "Aide et assistance",
+   "widget.shell.heading.changelog": "Nouveautés",
+diff --git a/apps/web/src/locales/nl.json b/apps/web/src/locales/nl.json
+index 8134a77..f8f7fc5 100644
+--- a/apps/web/src/locales/nl.json
++++ b/apps/web/src/locales/nl.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "Deel je ideeën",
+   "widget.shell.heading.help": "Help & ondersteuning",
+   "widget.shell.heading.changelog": "Wat is er nieuw",
+diff --git a/apps/web/src/locales/pl.json b/apps/web/src/locales/pl.json
+index ec9efc7..152f4ea 100644
+--- a/apps/web/src/locales/pl.json
++++ b/apps/web/src/locales/pl.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "Podziel się pomysłami",
+   "widget.shell.heading.help": "Pomoc i wsparcie",
+   "widget.shell.heading.changelog": "Co nowego",
+diff --git a/apps/web/src/locales/pt-br.json b/apps/web/src/locales/pt-br.json
+index 6e14861..148bfc5 100644
+--- a/apps/web/src/locales/pt-br.json
++++ b/apps/web/src/locales/pt-br.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "Compartilhe suas ideias",
+   "widget.shell.heading.help": "Central de Ajuda",
+   "widget.shell.heading.changelog": "Novidades",
+diff --git a/apps/web/src/locales/ru.json b/apps/web/src/locales/ru.json
+index abcc0b6..2d469b8 100644
+--- a/apps/web/src/locales/ru.json
++++ b/apps/web/src/locales/ru.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "Screenshot or screen recording",
+   "widget.shell.heading.feedback": "Поделитесь предложением",
+   "widget.shell.heading.help": "Помощь и поддержка",
+   "widget.shell.heading.changelog": "Что нового",
+diff --git a/apps/web/src/locales/th.json b/apps/web/src/locales/th.json
+index 3f265fc..c6e45c5 100644
+--- a/apps/web/src/locales/th.json
++++ b/apps/web/src/locales/th.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "ดูหลักฐาน {index}",
+   "widget.nativeEvidence.delete": "ลบหลักฐานส่วนตัว",
+   "widget.nativeEvidence.unavailable": "ไม่สามารถเปิดหลักฐานได้",
++  "widget.native.capture.sub": "จับภาพหน้าจอหรืออัดวิดีโอ",
+   "widget.shell.heading.feedback": "แบ่งปันไอเดีย",
+   "widget.shell.heading.help": "ความช่วยเหลือและบริการ",
+   "widget.shell.heading.changelog": "มีอะไรใหม่",
+diff --git a/apps/web/src/locales/zh-cn.json b/apps/web/src/locales/zh-cn.json
+index 3012407..00cf8c9 100644
+--- a/apps/web/src/locales/zh-cn.json
++++ b/apps/web/src/locales/zh-cn.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "截图或屏幕录制",
+   "widget.shell.heading.feedback": "分享你的想法",
+   "widget.shell.heading.help": "帮助与支持",
+   "widget.shell.heading.changelog": "最新动态",
+diff --git a/apps/web/src/locales/zh-tw.json b/apps/web/src/locales/zh-tw.json
+index 710bc03..91e45af 100644
+--- a/apps/web/src/locales/zh-tw.json
++++ b/apps/web/src/locales/zh-tw.json
+@@ -3,6 +3,7 @@
+   "widget.nativeEvidence.view": "View evidence {index}",
+   "widget.nativeEvidence.delete": "Delete private evidence",
+   "widget.nativeEvidence.unavailable": "Evidence unavailable",
++  "widget.native.capture.sub": "截圖或螢幕錄影",
+   "widget.shell.heading.feedback": "分享你的想法",
+   "widget.shell.heading.help": "說明與支援",
+   "widget.shell.heading.changelog": "最新消息",

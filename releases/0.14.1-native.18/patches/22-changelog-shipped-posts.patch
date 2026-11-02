@@ -1,0 +1,656 @@
+diff --git a/apps/web/src/components/admin/changelog/__tests__/changelog-linked-posts.test.tsx b/apps/web/src/components/admin/changelog/__tests__/changelog-linked-posts.test.tsx
+new file mode 100644
+index 0000000..f67f8d5
+--- /dev/null
++++ b/apps/web/src/components/admin/changelog/__tests__/changelog-linked-posts.test.tsx
+@@ -0,0 +1,211 @@
++// @vitest-environment happy-dom
++import { describe, it, expect, afterEach, vi } from 'vitest'
++import type { ReactElement } from 'react'
++import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import type { PostId } from '@quackback/ids'
++
++const hoisted = vi.hoisted(() => ({
++  listSegmentsFn: vi.fn(),
++  searchShippedPostsFn: vi.fn(),
++}))
++
++vi.mock('@/lib/server/functions/admin', () => ({
++  listSegmentsFn: hoisted.listSegmentsFn,
++}))
++vi.mock('@/lib/server/functions/changelog', () => ({
++  searchShippedPostsFn: hoisted.searchShippedPostsFn,
++}))
++vi.mock('@/lib/client/queries/changelog', () => ({
++  changelogSettingsQueries: {
++    get: () => ({
++      queryKey: ['changelog-settings'],
++      queryFn: async () => ({ emailsDisabled: false }),
++    }),
++  },
++  changelogCategoryQueries: {
++    list: () => ({ queryKey: ['changelog-categories'], queryFn: async () => [] }),
++  },
++}))
++vi.mock('@/lib/client/hooks/use-image-upload', () => ({
++  useImageUpload: () => ({ upload: vi.fn() }),
++}))
++
++import { ChangelogMetadataSidebarContent } from '../changelog-metadata-sidebar-content'
++
++afterEach(() => {
++  cleanup()
++  vi.clearAllMocks()
++})
++
++function renderWithClient(ui: ReactElement) {
++  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++  return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>)
++}
++
++const baseProps = {
++  publishState: { type: 'published' as const },
++  onPublishStateChange: () => {},
++  linkedPostIds: [] as PostId[],
++  onLinkedPostsChange: () => {},
++  categoryIds: [],
++  onCategoriesChange: () => {},
++  notify: true,
++  onNotifyChange: () => {},
++}
++
++describe('<ChangelogMetadataSidebarContent> linked shipped posts', () => {
++  it('requests limit 100 and forwards linkedPostIds as includeIds so linked cards always render', async () => {
++    hoisted.listSegmentsFn.mockResolvedValue([])
++    hoisted.searchShippedPostsFn.mockResolvedValue([
++      {
++        id: 'post_recent' as PostId,
++        title: 'Newly shipped post',
++        voteCount: 1,
++        boardSlug: 'feature-requests',
++        authorName: 'Alice',
++        createdAt: new Date('2026-03-01T00:00:00Z'),
++      },
++      {
++        id: 'post_linked_older' as PostId,
++        title: 'Older linked post beyond initial limit',
++        voteCount: 1,
++        boardSlug: 'bugs',
++        authorName: 'Bob',
++        createdAt: new Date('2025-01-01T00:00:00Z'),
++      },
++    ])
++
++    renderWithClient(
++      <ChangelogMetadataSidebarContent
++        {...baseProps}
++        linkedPostIds={['post_linked_older' as PostId]}
++      />
++    )
++
++    await waitFor(() =>
++      expect(hoisted.searchShippedPostsFn).toHaveBeenCalledWith({
++        data: {
++          query: undefined,
++          limit: 100,
++          includeIds: ['post_linked_older'],
++        },
++      })
++    )
++
++    expect(await screen.findByText('Older linked post beyond initial limit')).toBeInTheDocument()
++  })
++
++  it('keeps linked post cards visible in the sidebar while filtering the +Add popover search', async () => {
++    hoisted.listSegmentsFn.mockResolvedValue([])
++    hoisted.searchShippedPostsFn.mockImplementation(
++      async ({ data }: { data?: { query?: string; includeIds?: string[] } }) => {
++        const all = [
++          {
++            id: 'post_match' as PostId,
++            title: 'Dark mode support',
++            voteCount: 10,
++            boardSlug: 'feature-requests',
++            authorName: 'Alice',
++            createdAt: new Date('2026-03-01T00:00:00Z'),
++          },
++          {
++            id: 'post_linked' as PostId,
++            title: 'Already linked post',
++            voteCount: 2,
++            boardSlug: 'general',
++            authorName: 'Bob',
++            createdAt: new Date('2026-02-01T00:00:00Z'),
++          },
++        ]
++        if (!data?.query) return all
++        return all.filter(
++          (p) =>
++            p.title.toLowerCase().includes(data.query!.toLowerCase()) ||
++            data.includeIds?.includes(p.id)
++        )
++      }
++    )
++
++    renderWithClient(
++      <ChangelogMetadataSidebarContent {...baseProps} linkedPostIds={['post_linked' as PostId]} />
++    )
++
++    expect(await screen.findByText('Already linked post')).toBeInTheDocument()
++
++    // Open the +Add popover and filter by "Dark mode"
++    fireEvent.click(screen.getAllByRole('button', { name: /add/i }).at(-1)!)
++    const searchInput = await screen.findByPlaceholderText('Search shipped posts...')
++    fireEvent.change(searchInput, { target: { value: 'Dark mode' } })
++
++    await waitFor(() =>
++      expect(hoisted.searchShippedPostsFn).toHaveBeenCalledWith({
++        data: {
++          query: 'Dark mode',
++          limit: 100,
++          includeIds: ['post_linked'],
++        },
++      })
++    )
++
++    // Matching option is shown in the popover, and the already-linked card remains in the sidebar
++    expect(await screen.findByText('Dark mode support')).toBeInTheDocument()
++    expect(screen.getAllByText('Already linked post')).toHaveLength(1)
++  })
++
++  it('does not fire redundant searchShippedPostsFn requests when toggling an already-loaded post or removing a linked card', async () => {
++    hoisted.listSegmentsFn.mockResolvedValue([])
++    hoisted.searchShippedPostsFn.mockResolvedValue([
++      {
++        id: 'post_1' as PostId,
++        title: 'First shipped post',
++        voteCount: 5,
++        boardSlug: 'feature-requests',
++        authorName: 'Alice',
++        createdAt: new Date('2026-03-01T00:00:00Z'),
++      },
++      {
++        id: 'post_2' as PostId,
++        title: 'Second shipped post',
++        voteCount: 2,
++        boardSlug: 'bugs',
++        authorName: 'Bob',
++        createdAt: new Date('2026-02-01T00:00:00Z'),
++      },
++    ])
++
++    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++    const { rerender } = render(
++      <QueryClientProvider client={queryClient}>
++        <ChangelogMetadataSidebarContent {...baseProps} linkedPostIds={['post_1' as PostId]} />
++      </QueryClientProvider>
++    )
++
++    expect(await screen.findByText('First shipped post')).toBeInTheDocument()
++    expect(hoisted.searchShippedPostsFn).toHaveBeenCalledTimes(1)
++
++    // Linking post_2 (which is already in the loaded posts list) should not refetch
++    rerender(
++      <QueryClientProvider client={queryClient}>
++        <ChangelogMetadataSidebarContent
++          {...baseProps}
++          linkedPostIds={['post_1' as PostId, 'post_2' as PostId]}
++        />
++      </QueryClientProvider>
++    )
++
++    expect(await screen.findByText('Second shipped post')).toBeInTheDocument()
++    expect(hoisted.searchShippedPostsFn).toHaveBeenCalledTimes(1)
++
++    // Removing post_1 should also not refetch
++    rerender(
++      <QueryClientProvider client={queryClient}>
++        <ChangelogMetadataSidebarContent {...baseProps} linkedPostIds={['post_2' as PostId]} />
++      </QueryClientProvider>
++    )
++
++    expect(screen.queryByText('First shipped post')).not.toBeInTheDocument()
++    expect(screen.getByText('Second shipped post')).toBeInTheDocument()
++    expect(hoisted.searchShippedPostsFn).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/apps/web/src/components/admin/changelog/changelog-metadata-sidebar-content.tsx b/apps/web/src/components/admin/changelog/changelog-metadata-sidebar-content.tsx
+index 2572577..d133b0e 100644
+--- a/apps/web/src/components/admin/changelog/changelog-metadata-sidebar-content.tsx
++++ b/apps/web/src/components/admin/changelog/changelog-metadata-sidebar-content.tsx
+@@ -132,15 +132,44 @@ export function ChangelogMetadataSidebarContent({
+       'Pick a date'
+     )
+ 
++  type ShippedPostItem = Awaited<ReturnType<typeof searchShippedPostsFn>>[number]
++  const knownPostsRef = useRef<Map<PostId, ShippedPostItem>>(new Map())
++  const activeIncludeIdsRef = useRef<PostId[]>(linkedPostIds)
++  if (linkedPostIds.some((id) => !knownPostsRef.current.has(id))) {
++    const nextKey = linkedPostIds.join(',')
++    if (activeIncludeIdsRef.current.join(',') !== nextKey) {
++      activeIncludeIdsRef.current = linkedPostIds
++    }
++  }
++  const queryIncludeIds = activeIncludeIdsRef.current
++
+   // Search shipped posts
+   const { data: posts = [], isLoading: postsLoading } = useQuery({
+-    queryKey: ['shipped-posts', search],
+-    queryFn: () => searchShippedPostsFn({ data: { query: search || undefined, limit: 30 } }),
++    queryKey: ['shipped-posts', search, queryIncludeIds],
++    queryFn: () =>
++      searchShippedPostsFn({
++        data: {
++          query: search || undefined,
++          limit: 100,
++          ...(linkedPostIds.length > 0 && { includeIds: linkedPostIds }),
++        },
++      }),
++    placeholderData: (prev) => prev,
+     staleTime: 30 * 1000,
+   })
+ 
++  for (const post of posts) {
++    knownPostsRef.current.set(post.id, post)
++  }
++
+   // Get selected post details
+-  const selectedPosts = posts.filter((p) => linkedPostIds.includes(p.id))
++  const selectedPosts = Array.from(knownPostsRef.current.values()).filter((p) =>
++    linkedPostIds.includes(p.id)
++  )
++  const normalizedSearch = search.trim().toLowerCase()
++  const dropdownPosts = normalizedSearch
++    ? posts.filter((p) => p.title.toLowerCase().includes(normalizedSearch))
++    : posts
+ 
+   const handleStatusChange = (value: string) => {
+     const type = value as 'draft' | 'scheduled' | 'published'
+@@ -374,12 +403,12 @@ export function ChangelogMetadataSidebarContent({
+                 <div className="p-1">
+                   {postsLoading ? (
+                     <div className="py-6 text-center text-sm text-muted-foreground">Loading...</div>
+-                  ) : posts.length === 0 ? (
++                  ) : dropdownPosts.length === 0 ? (
+                     <div className="py-6 text-center text-sm text-muted-foreground">
+                       {search ? 'No shipped posts found.' : 'No shipped posts yet.'}
+                     </div>
+                   ) : (
+-                    posts.map((post) => {
++                    dropdownPosts.map((post) => {
+                       const isSelected = linkedPostIds.includes(post.id)
+                       return (
+                         <div
+diff --git a/apps/web/src/lib/server/domains/changelog/__tests__/changelog-shipped-posts.test.ts b/apps/web/src/lib/server/domains/changelog/__tests__/changelog-shipped-posts.test.ts
+new file mode 100644
+index 0000000..9f4ab46
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/changelog/__tests__/changelog-shipped-posts.test.ts
+@@ -0,0 +1,218 @@
++import { describe, it, expect, vi, beforeEach } from 'vitest'
++import type { PostId } from '@quackback/ids'
++import { searchShippedPosts } from '../changelog.query'
++
++const mockStatusesFindMany = vi.fn()
++const mockSelect = vi.fn()
++const mockOrderBy = vi.fn()
++const mockLimit = vi.fn()
++const mockWhere = vi.fn()
++
++vi.mock('@/lib/server/db', () => ({
++  db: {
++    query: {
++      postStatuses: {
++        findMany: (...args: unknown[]) => mockStatusesFindMany(...args),
++      },
++    },
++    select: (...args: unknown[]) => mockSelect(...args),
++  },
++  posts: {
++    id: 'posts.id',
++    title: 'posts.title',
++    voteCount: 'posts.voteCount',
++    boardId: 'posts.boardId',
++    principalId: 'posts.principalId',
++    statusId: 'posts.statusId',
++    createdAt: 'posts.createdAt',
++    updatedAt: 'posts.updatedAt',
++    deletedAt: 'posts.deletedAt',
++  },
++  boards: {
++    id: 'boards.id',
++    slug: 'boards.slug',
++  },
++  principal: {
++    id: 'principal.id',
++  },
++  postStatuses: {
++    id: 'postStatuses.id',
++    category: 'postStatuses.category',
++  },
++  eq: vi.fn((col, val) => ({ kind: 'eq', col, val })),
++  and: vi.fn((...args: unknown[]) => ({ kind: 'and', args })),
++  isNull: vi.fn((col) => ({ kind: 'isNull', col })),
++  desc: vi.fn((col) => ({ kind: 'desc', col })),
++  inArray: vi.fn((col, vals) => ({ kind: 'inArray', col, vals })),
++  sql: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
++    kind: 'sql',
++    strings: Array.from(strings),
++    values,
++    as: (alias: string) => ({ kind: 'sql_alias', alias }),
++  })),
++}))
++
++function createSelectChain(rows: unknown[]) {
++  const chain = {
++    from: vi.fn(() => chain),
++    innerJoin: vi.fn(() => chain),
++    where: vi.fn((cond: unknown) => {
++      mockWhere(cond)
++      return chain
++    }),
++    orderBy: vi.fn((...cols: unknown[]) => {
++      mockOrderBy(...cols)
++      // Secondary query for includeIds awaits .orderBy() directly; primary query chains .limit().
++      const orderPromise = Promise.resolve(rows) as Promise<unknown[]> & {
++        limit: (n: number) => Promise<unknown[]>
++      }
++      orderPromise.limit = (n: number) => {
++        mockLimit(n)
++        return Promise.resolve(rows)
++      }
++      return orderPromise
++    }),
++  }
++  return chain
++}
++
++beforeEach(() => {
++  vi.clearAllMocks()
++})
++
++describe('searchShippedPosts', () => {
++  it('returns empty array when no complete statuses exist', async () => {
++    mockStatusesFindMany.mockResolvedValue([])
++
++    const result = await searchShippedPosts({})
++
++    expect(result).toEqual([])
++    expect(mockSelect).not.toHaveBeenCalled()
++  })
++
++  it('orders by updatedAt DESC, voteCount DESC, createdAt DESC and defaults limit to 100', async () => {
++    mockStatusesFindMany.mockResolvedValue([{ id: 'status_complete' }])
++    const rows = [
++      {
++        id: 'post_recent' as PostId,
++        title: 'Newly shipped feature',
++        voteCount: 1,
++        boardSlug: 'feature-requests',
++        authorName: 'Alice',
++        createdAt: new Date('2026-01-01T00:00:00Z'),
++      },
++      {
++        id: 'post_older_popular' as PostId,
++        title: 'Older popular feature',
++        voteCount: 25,
++        boardSlug: 'feature-requests',
++        authorName: 'Bob',
++        createdAt: new Date('2025-06-01T00:00:00Z'),
++      },
++    ]
++    mockSelect.mockReturnValueOnce(createSelectChain(rows))
++
++    const result = await searchShippedPosts({})
++
++    expect(result).toEqual(rows)
++    expect(mockOrderBy).toHaveBeenCalledWith(
++      { kind: 'desc', col: 'posts.updatedAt' },
++      { kind: 'desc', col: 'posts.voteCount' },
++      { kind: 'desc', col: 'posts.createdAt' }
++    )
++    expect(mockLimit).toHaveBeenCalledWith(100)
++  })
++
++  it('fetches and appends missing includeIds when linked posts fall outside the primary query', async () => {
++    mockStatusesFindMany.mockResolvedValue([{ id: 'status_complete' }])
++    const primaryRows = [
++      {
++        id: 'post_1' as PostId,
++        title: 'First shipped post',
++        voteCount: 5,
++        boardSlug: 'general',
++        authorName: 'Alice',
++        createdAt: new Date('2026-02-01T00:00:00Z'),
++      },
++    ]
++    const includedRows = [
++      {
++        id: 'post_linked_beyond_limit' as PostId,
++        title: 'Older linked post beyond limit',
++        voteCount: 1,
++        boardSlug: 'bugs',
++        authorName: 'Charlie',
++        createdAt: new Date('2025-01-01T00:00:00Z'),
++      },
++    ]
++    mockSelect
++      .mockReturnValueOnce(createSelectChain(primaryRows))
++      .mockReturnValueOnce(createSelectChain(includedRows))
++
++    const result = await searchShippedPosts({
++      limit: 1,
++      includeIds: ['post_1' as PostId, 'post_linked_beyond_limit' as PostId],
++    })
++
++    expect(mockSelect).toHaveBeenCalledTimes(2)
++    expect(mockWhere).toHaveBeenNthCalledWith(2, {
++      kind: 'and',
++      args: [
++        { kind: 'inArray', col: 'posts.id', vals: ['post_linked_beyond_limit'] },
++        { kind: 'isNull', col: 'posts.deletedAt' },
++      ],
++    })
++    expect(result).toEqual([...primaryRows, ...includedRows])
++  })
++
++  it('returns linked includeIds even when a linked post was reopened out of complete status or no complete statuses exist', async () => {
++    mockStatusesFindMany.mockResolvedValue([])
++    const reopenedLinkedRows = [
++      {
++        id: 'post_reopened' as PostId,
++        title: 'Reopened linked post',
++        voteCount: 4,
++        boardSlug: 'bugs',
++        authorName: 'Dana',
++        createdAt: new Date('2025-11-01T00:00:00Z'),
++      },
++    ]
++    mockSelect.mockReturnValueOnce(createSelectChain(reopenedLinkedRows))
++
++    const result = await searchShippedPosts({
++      includeIds: ['post_reopened' as PostId, '' as PostId],
++    })
++
++    expect(mockSelect).toHaveBeenCalledTimes(1)
++    expect(mockWhere).toHaveBeenCalledWith({
++      kind: 'and',
++      args: [
++        { kind: 'inArray', col: 'posts.id', vals: ['post_reopened'] },
++        { kind: 'isNull', col: 'posts.deletedAt' },
++      ],
++    })
++    expect(result).toEqual(reopenedLinkedRows)
++  })
++
++  it('skips the secondary query when all includeIds are already in the primary results', async () => {
++    mockStatusesFindMany.mockResolvedValue([{ id: 'status_complete' }])
++    const primaryRows = [
++      {
++        id: 'post_1' as PostId,
++        title: 'Already present',
++        voteCount: 3,
++        boardSlug: 'general',
++        authorName: 'Alice',
++        createdAt: new Date('2026-02-01T00:00:00Z'),
++      },
++    ]
++    mockSelect.mockReturnValueOnce(createSelectChain(primaryRows))
++
++    const result = await searchShippedPosts({
++      includeIds: ['post_1' as PostId],
++    })
++
++    expect(mockSelect).toHaveBeenCalledTimes(1)
++    expect(result).toEqual(primaryRows)
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/changelog/changelog.query.ts b/apps/web/src/lib/server/domains/changelog/changelog.query.ts
+index c899e03..cc8195c 100644
+--- a/apps/web/src/lib/server/domains/changelog/changelog.query.ts
++++ b/apps/web/src/lib/server/domains/changelog/changelog.query.ts
+@@ -206,6 +206,7 @@ export async function searchShippedPosts(params: {
+   query?: string
+   boardId?: BoardId
+   limit?: number
++  includeIds?: PostId[]
+ }): Promise<
+   Array<{
+     id: PostId
+@@ -216,7 +217,7 @@ export async function searchShippedPosts(params: {
+     createdAt: Date
+   }>
+ > {
+-  const { query, boardId, limit = 20 } = params
++  const { query, boardId, limit = 100, includeIds } = params
+ 
+   // Get all status IDs with category 'complete'
+   const completeStatuses = await db.query.postStatuses.findMany({
+@@ -224,45 +225,76 @@ export async function searchShippedPosts(params: {
+     columns: { id: true },
+   })
+ 
+-  if (completeStatuses.length === 0) {
+-    return []
++  const selectColumns = {
++    id: posts.id,
++    title: posts.title,
++    voteCount: posts.voteCount,
++    boardSlug: boards.slug,
++    authorName: sql<string | null>`(
++      SELECT m.display_name FROM ${principal} m
++      WHERE m.id = ${posts.principalId}
++    )`.as('author_name'),
++    createdAt: posts.createdAt,
+   }
+ 
+-  const statusIds = completeStatuses.map((s) => s.id)
++  let results: Array<{
++    id: PostId
++    title: string
++    voteCount: number
++    boardSlug: string
++    authorName: string | null
++    createdAt: Date
++  }> = []
++
++  if (completeStatuses.length > 0) {
++    const statusIds = completeStatuses.map((s) => s.id)
+ 
+-  // Build conditions
+-  const conditions = [inArray(posts.statusId, statusIds), isNull(posts.deletedAt)]
++    // Build conditions
++    const conditions = [inArray(posts.statusId, statusIds), isNull(posts.deletedAt)]
+ 
+-  if (boardId) {
+-    conditions.push(eq(posts.boardId, boardId))
++    if (boardId) {
++      conditions.push(eq(posts.boardId, boardId))
++    }
++
++    // Search by title if query provided
++    if (query?.trim()) {
++      const searchTerm = `%${query.trim().toLowerCase()}%`
++      conditions.push(sql`LOWER(${posts.title}) LIKE ${searchTerm}`)
++    }
++
++    // Fetch posts with board slug and author info, most recently shipped/updated first
++    results = await db
++      .select(selectColumns)
++      .from(posts)
++      .innerJoin(boards, eq(boards.id, posts.boardId))
++      .where(and(...conditions))
++      .orderBy(desc(posts.updatedAt), desc(posts.voteCount), desc(posts.createdAt))
++      .limit(limit)
+   }
+ 
+-  // Search by title if query provided
+-  if (query?.trim()) {
+-    const searchTerm = `%${query.trim().toLowerCase()}%`
+-    conditions.push(sql`LOWER(${posts.title}) LIKE ${searchTerm}`)
++  const uniqueIncludeIds = Array.from(
++    new Set((includeIds ?? []).filter((id): id is PostId => id.trim().length > 0))
++  )
++  if (uniqueIncludeIds.length === 0) {
++    return results
+   }
+ 
+-  // Fetch posts with board slug and author info
+-  const results = await db
+-    .select({
+-      id: posts.id,
+-      title: posts.title,
+-      voteCount: posts.voteCount,
+-      boardSlug: boards.slug,
+-      authorName: sql<string | null>`(
+-        SELECT m.display_name FROM ${principal} m
+-        WHERE m.id = ${posts.principalId}
+-      )`.as('author_name'),
+-      createdAt: posts.createdAt,
+-    })
++  const seenIds = new Set(results.map((r) => r.id))
++  const missingIds = uniqueIncludeIds.filter((id) => !seenIds.has(id))
++  if (missingIds.length === 0) {
++    return results
++  }
++
++  // Fetch any missing linked posts regardless of current status category (e.g. if a
++  // linked post was later reopened), matching getChangelogById / linkPostsToChangelog.
++  const includedResults = await db
++    .select(selectColumns)
+     .from(posts)
+     .innerJoin(boards, eq(boards.id, posts.boardId))
+-    .where(and(...conditions))
+-    .orderBy(desc(posts.voteCount), desc(posts.createdAt))
+-    .limit(limit)
++    .where(and(inArray(posts.id, missingIds), isNull(posts.deletedAt)))
++    .orderBy(desc(posts.updatedAt), desc(posts.voteCount), desc(posts.createdAt))
+ 
+-  return results
++  return [...results, ...includedResults]
+ }
+ 
+ /**
+diff --git a/apps/web/src/lib/server/functions/changelog.ts b/apps/web/src/lib/server/functions/changelog.ts
+index da85925..10f0868 100644
+--- a/apps/web/src/lib/server/functions/changelog.ts
++++ b/apps/web/src/lib/server/functions/changelog.ts
+@@ -287,7 +287,8 @@ export const listPublicChangelogsFn = createServerFn({ method: 'GET' })
+ const searchShippedPostsSchema = z.object({
+   query: z.string().optional(),
+   boardId: z.string().optional(),
+-  limit: z.number().int().positive().max(50).optional(),
++  limit: z.number().int().positive().max(200).optional(),
++  includeIds: z.array(z.string().min(1)).optional(),
+ })
+ 
+ /**
+@@ -303,6 +304,7 @@ export const searchShippedPostsFn = createServerFn({ method: 'GET' })
+       query: data.query,
+       boardId: data.boardId as BoardId | undefined,
+       limit: data.limit,
++      includeIds: data.includeIds as PostId[] | undefined,
+     })
+   })
+ 

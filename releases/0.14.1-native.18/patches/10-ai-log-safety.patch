@@ -1,0 +1,1161 @@
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/logging-wire.regression.node.mjs b/apps/web/src/lib/server/domains/ai/__tests__/logging-wire.regression.node.mjs
+new file mode 100644
+index 000000000..782922fa1
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/__tests__/logging-wire.regression.node.mjs
+@@ -0,0 +1,139 @@
++// Fake provider only, with the application's exact installed SDK dependencies.
++// node logging-wire.regression.node.mjs EXACT_APP_DEPENDENCY_DIR
++import assert from 'node:assert/strict'
++import { readFileSync, readdirSync } from 'node:fs'
++import { resolve } from 'node:path'
++import { createRequire } from 'node:module'
++import { pathToFileURL } from 'node:url'
++import { getAIChatOptions, getOpenAIClientOptions, safeAIError } from '../client-options.ts'
++
++const deps = resolve(process.argv[2])
++for (const [name, version] of Object.entries({
++  openai: '7.15.0',
++  '@tanstack/ai': '0.54.0',
++  '@tanstack/ai-openai': '0.22.6',
++})) {
++  assert.equal(
++    JSON.parse(readFileSync(resolve(deps, 'node_modules', name, 'package.json'))).version,
++    version
++  )
++}
++const require = createRequire(resolve(deps, 'package.json'))
++const { default: OpenAI } = await import(pathToFileURL(require.resolve('openai')))
++const { chat } = await import(
++  pathToFileURL(resolve(deps, 'node_modules/@tanstack/ai/dist/esm/index.js'))
++)
++const { openaiCompatibleText } = await import(
++  pathToFileURL(resolve(deps, 'node_modules/@tanstack/ai-openai/dist/esm/compatible/index.js'))
++)
++const { z } = await import(pathToFileURL(require.resolve('zod')))
++
++function files(folder) {
++  return readdirSync(folder, { withFileTypes: true }).flatMap((entry) =>
++    entry.name === '__tests__'
++      ? []
++      : entry.isDirectory()
++        ? files(resolve(folder, entry.name))
++        : entry.name.endsWith('.ts')
++          ? [resolve(folder, entry.name)]
++          : []
++  )
++}
++let calls = 0
++for (const file of files(resolve(import.meta.dirname, '../..'))) {
++  const source = readFileSync(file, 'utf8')
++  const chatCalls = [...source.matchAll(/^\s*[^\n]*\bchat\(\{\n/gm)].length
++  if (!chatCalls) continue
++  assert.equal(
++    [...source.matchAll(/^\s*[^\n]*\bchat\(\{\n\s*\.\.\.getAIChatOptions\(\),/gm)].length,
++    chatCalls
++  )
++  calls += chatCalls
++}
++assert.equal(calls, 12)
++const CANARY = 'synthetic-provider-secret-canary'
++const options = getOpenAIClientOptions({
++  openaiApiKey: 'synthetic-unused-key',
++  openaiBaseUrl: 'https://gateway.example/v1',
++  openaiDefaultHeaders: '{"Authorization":null,"cf-aig-authorization":"Bearer synthetic-gateway"}',
++})
++const originalFetch = globalThis.fetch
++const originalLogLevel = process.env.OPENAI_LOG
++const methods = ['error', 'warn', 'info', 'debug', 'log', 'dir']
++const originalConsole = Object.fromEntries(methods.map((method) => [method, console[method]]))
++const logs = []
++let requests = 0
++process.env.OPENAI_LOG = 'debug'
++for (const method of methods) console[method] = (...args) => logs.push(args)
++globalThis.fetch = async (input, init) => {
++  const request = new Request(input, init)
++  assert.equal(request.headers.has('authorization'), false)
++  requests++
++  return Response.json(
++    { error: { message: CANARY, code: CANARY, type: 'authentication_error' } },
++    { status: 401, headers: { 'x-provider-private': CANARY } }
++  )
++}
++try {
++  const sdk = new OpenAI(options)
++  await assert.rejects(
++    sdk.chat.completions.create({ model: 'synthetic', messages: [] }),
++    (error) => {
++      assert.equal(
++        error.message.includes(CANARY),
++        true,
++        'Internal provider error remains available for classification'
++      )
++      assert.deepEqual(safeAIError(error), { httpStatus: 401 })
++      return true
++    }
++  )
++  await assert.rejects(sdk.embeddings.create({ model: 'synthetic', input: 'synthetic' }))
++  const adapter = openaiCompatibleText('synthetic', options)
++  for (const stream of [false, true]) {
++    try {
++      const response = chat({
++        ...getAIChatOptions(),
++        adapter,
++        messages: [{ role: 'user', content: 'synthetic' }],
++        stream,
++      })
++      if (stream) {
++        for await (const _chunk of response) {
++        }
++      } else await response
++    } catch (error) {
++      assert.equal(error.message.includes(CANARY), true)
++    }
++  }
++  await assert.rejects(
++    chat({
++      ...getAIChatOptions(),
++      adapter,
++      messages: [{ role: 'user', content: 'synthetic' }],
++      stream: false,
++      outputSchema: z.object({ ok: z.boolean() }),
++    })
++  )
++  assert.equal(requests, 5)
++  assert.equal(logs.length, 0)
++  const malformed = Object.defineProperty({}, 'status', {
++    get() {
++      throw new Error(CANARY)
++    },
++  })
++  assert.deepEqual(safeAIError(malformed), { httpStatus: null })
++  const cycle = { message: CANARY }
++  cycle.cause = cycle
++  assert.deepEqual(safeAIError(cycle), { httpStatus: null })
++  for (const status of [0, 99, 600, '401', NaN])
++    assert.deepEqual(safeAIError({ status, body: CANARY }), { httpStatus: null })
++  process.stdout.write(
++    'AI production logging: exact SDK/adapter errors,12 chat policies, closed status and canaries PASS; no remote fetch\n'
++  )
++} finally {
++  globalThis.fetch = originalFetch
++  for (const method of methods) console[method] = originalConsole[method]
++  if (originalLogLevel === undefined) delete process.env.OPENAI_LOG
++  else process.env.OPENAI_LOG = originalLogLevel
++}
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/retry.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/retry.test.ts
+index 7b1b99261..b6c178fb6 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/retry.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/retry.test.ts
+@@ -1,9 +1,18 @@
++// @vitest-environment node
+ /**
+  * Tests for retry utility with exponential backoff.
+  */
+ 
+ import { describe, it, expect, vi, beforeEach } from 'vitest'
+ import { withRetry, isRetryableError } from '../retry'
++import OpenAI from 'openai'
++import { getOpenAIClientOptions } from '../client-options'
++
++const diagnostic = vi.hoisted(() => ({ warn: vi.fn() }))
++vi.mock('@/lib/server/logger', () => {
++  const log = { warn: diagnostic.warn, child: () => log }
++  return { logger: log }
++})
+ 
+ describe('retry', () => {
+   beforeEach(() => {
+@@ -11,6 +20,97 @@ describe('retry', () => {
+   })
+ 
+   describe('withRetry', () => {
++    it.each([429, 503])('closes diagnostics on the actual SDK %s retry path', async (status) => {
++      const canary = 'synthetic-provider-secret-canary'
++      const requests: Request[] = []
++      const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
++        requests.push(new Request(input, init))
++        return Response.json(
++          { error: { message: `${status} ${canary}`, code: canary } },
++          { status, headers: { 'x-private-provider': canary } }
++        )
++      })
++      const errors: unknown[] = []
++      const sdk = new OpenAI({
++        ...getOpenAIClientOptions({
++          openaiApiKey: 'synthetic-unused-key',
++          openaiBaseUrl: 'https://gateway.example/v1',
++          openaiDefaultHeaders:
++            '{"Authorization":null,"cf-aig-authorization":"Bearer synthetic-gateway"}',
++        }),
++        maxRetries: 0,
++      })
++      try {
++        let escaped: unknown
++        try {
++          await withRetry(
++            async () => {
++              try {
++                return await sdk.chat.completions.create({ model: 'synthetic', messages: [] })
++              } catch (error) {
++                errors.push(error)
++                throw error
++              }
++            },
++            { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1 }
++          )
++        } catch (error) {
++          escaped = error
++        }
++        expect(escaped).toBe(errors[1])
++        expect(escaped).toMatchObject({ status, retryCount: 1 })
++        expect(requests).toHaveLength(2)
++        expect(requests.every((request) => !request.headers.has('authorization'))).toBe(true)
++        expect(diagnostic.warn).toHaveBeenCalledExactlyOnceWith(
++          {
++            attempt: 1,
++            max_retries: 1,
++            delay_ms: 1,
++            ai_error: { httpStatus: status },
++          },
++          'retrying ai call'
++        )
++        expect(JSON.stringify(diagnostic.warn.mock.calls)).not.toContain(canary)
++      } finally {
++        fetch.mockRestore()
++      }
++    })
++
++    it.each([429, 503])(
++      'keeps %s retry errors internally and exports no credential/body canary',
++      async (status) => {
++        const canary = 'synthetic-provider-secret-canary'
++        const error = Object.assign(new Error(`${status} upstream ${canary}`), {
++          status,
++          headers: { authorization: `Bearer ${canary}` },
++          error: { message: canary, token: canary },
++          body: canary,
++        })
++        const fn = vi.fn().mockRejectedValue(error)
++
++        await expect(withRetry(fn, { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1 })).rejects.toBe(
++          error
++        )
++
++        expect(fn).toHaveBeenCalledTimes(2)
++        expect(error).toMatchObject({
++          retryCount: 1,
++          headers: { authorization: `Bearer ${canary}` },
++          body: canary,
++        })
++        expect(diagnostic.warn).toHaveBeenCalledExactlyOnceWith(
++          {
++            attempt: 1,
++            max_retries: 1,
++            delay_ms: 1,
++            ai_error: { httpStatus: status },
++          },
++          'retrying ai call'
++        )
++        expect(JSON.stringify(diagnostic.warn.mock.calls)).not.toContain(canary)
++      }
++    )
++
+     it('should return { result, retryCount: 0 } on first success', async () => {
+       const fn = vi.fn().mockResolvedValue('hello')
+ 
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+index 62e2500e1..45eb164a2 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+@@ -9,6 +9,7 @@ import { z } from 'zod'
+ 
+ const hoisted = vi.hoisted(() => ({
+   chat: vi.fn(),
++  warn: vi.fn(),
+   cfg: {
+     openaiBaseUrl: 'https://llm.internal/v1' as string | null,
+     aiRequireParameters: undefined,
+@@ -34,7 +35,13 @@ vi.mock('@/lib/server/config', () => ({
+   },
+ }))
+ vi.mock('@/lib/server/logger', () => {
+-  const log = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, child: () => log }
++  const log = {
++    info: () => {},
++    warn: hoisted.warn,
++    error: () => {},
++    debug: () => {},
++    child: () => log,
++  }
+   return { logger: log }
+ })
+ 
+@@ -64,12 +71,31 @@ function rejection(message: string, param?: string) {
+ 
+ beforeEach(() => {
+   hoisted.chat.mockReset()
++  hoisted.warn.mockReset()
+   hoisted.cfg.openaiBaseUrl = 'https://llm.internal/v1'
+   hoisted.cfg.aiRequireParameters = undefined
+   resetStructuredFallbackMemory()
+ })
+ 
+ describe('structuredChat', () => {
++  it('preserves schema fallback while logging no provider body or endpoint canary', async () => {
++    const canary = 'synthetic-provider-secret-canary'
++    hoisted.cfg.openaiBaseUrl = `https://llm.internal/v1?private=${canary}`
++    hoisted.chat
++      .mockRejectedValueOnce(rejection(`json_schema is unsupported ${canary}`))
++      .mockRejectedValueOnce(rejection(`json_object is unsupported ${canary}`, 'response_format'))
++      .mockResolvedValueOnce('{"sentiment":"positive","confidence":1}')
++
++    expect(await structuredChat(base)).toEqual({ sentiment: 'positive', confidence: 1 })
++    expect(hoisted.chat).toHaveBeenCalledTimes(3)
++    expect(hoisted.chat.mock.calls.every(([options]) => options.debug === false)).toBe(true)
++    expect(hoisted.warn.mock.calls.map(([fields]) => fields)).toEqual([
++      { model: 'm', fallback: 'json_object', ai_error: { httpStatus: 400 } },
++      { model: 'm', fallback: 'none', ai_error: { httpStatus: 400 } },
++    ])
++    expect(JSON.stringify(hoisted.warn.mock.calls)).not.toContain(canary)
++  })
++
+   it('sends json_schema through outputSchema first', async () => {
+     hoisted.chat.mockResolvedValueOnce({ sentiment: 'positive', confidence: 0.9 })
+     const out = await structuredChat(base)
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/tracing-middleware.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/tracing-middleware.test.ts
+index d94ae5fa6..9cc9f6fca 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/tracing-middleware.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/tracing-middleware.test.ts
+@@ -223,7 +223,7 @@ describe('createAssistantTracingMiddleware', () => {
+     }
+   })
+ 
+-  it('marks the root span errored and records the infra exception on onError', () => {
++  it('marks the root span errored without exporting the provider exception', () => {
+     const { tracer, spans } = makeTestTracer()
+     const mw = createAssistantTracingMiddleware(ATTRS, tracer)
+     const c = ctx()
+@@ -235,7 +235,9 @@ describe('createAssistantTracingMiddleware', () => {
+     const root = spans.find((s) => s.name === 'assistant.turn')!
+     expect(root.ended).toBe(true)
+     expect(root.status?.code).toBe(2) // SpanStatusCode.ERROR
+-    expect(root.exceptions).toContain(err)
++    expect(root.exceptions).toEqual([])
++    expect(root.attributes['quackback.assistant.http_status']).toBe(0)
++    expect(JSON.stringify(root)).not.toContain(err.message)
+   })
+ 
+   it('closes an open tool span if the turn ends before onAfterToolCall', () => {
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/usage-log.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/usage-log.test.ts
+index e585e2cf8..8e118591d 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/usage-log.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/usage-log.test.ts
+@@ -127,7 +127,7 @@ describe('usage-log', () => {
+     it('should log error row and rethrow on failure', async () => {
+       const { withUsageLogging } = await import('../usage-log')
+ 
+-      const error = new Error('API failure') as Error & { retryCount?: number }
++      const error = new Error('synthetic-provider-secret-canary') as Error & { retryCount?: number }
+       error.retryCount = 3
+ 
+       await expect(
+@@ -141,13 +141,13 @@ describe('usage-log', () => {
+           () => Promise.reject(error),
+           () => ({ inputTokens: 0, totalTokens: 0 })
+         )
+-      ).rejects.toThrow('API failure')
++      ).rejects.toBe(error)
+ 
+       expect(mockValues).toHaveBeenCalledWith(
+         expect.objectContaining({
+           pipelineStep: 'sentiment',
+           status: 'error',
+-          error: 'API failure',
++          error: '{"httpStatus":null}',
+           retryCount: 3,
+           inputTokens: 0,
+           totalTokens: 0,
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/usage-middleware.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/usage-middleware.test.ts
+index ec0c02f3c..e477fe442 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/usage-middleware.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/usage-middleware.test.ts
+@@ -55,15 +55,20 @@ describe('createUsageLoggingMiddleware', () => {
+     )
+   })
+ 
+-  it('logs an error row with the error message', async () => {
++  it('logs an error row with only closed status', async () => {
+     const mw = createUsageLoggingMiddleware({ pipelineStep: 'extraction', model: 'm' })
+     const c = ctx('req-err')
+     mw.onStart?.(c)
+-    mw.onError?.(c, { error: new Error('boom') } as ErrorInfo)
++    mw.onError?.(c, { error: new Error('synthetic-provider-secret-canary') } as ErrorInfo)
+     await flush()
+ 
+     expect(logAiUsage).toHaveBeenCalledWith(
+-      expect.objectContaining({ status: 'error', error: 'boom', inputTokens: 0, totalTokens: 0 })
++      expect.objectContaining({
++        status: 'error',
++        error: '{"httpStatus":null}',
++        inputTokens: 0,
++        totalTokens: 0,
++      })
+     )
+   })
+ 
+diff --git a/apps/web/src/lib/server/domains/ai/client-options.ts b/apps/web/src/lib/server/domains/ai/client-options.ts
+index 42b8b39ae..eeb54c81b 100644
+--- a/apps/web/src/lib/server/domains/ai/client-options.ts
++++ b/apps/web/src/lib/server/domains/ai/client-options.ts
+@@ -71,6 +71,7 @@ export function parseOpenAIHeaders(value?: string): Record<string, string | null
+ export function getOpenAIClientOptions(config: ClientConfig) {
+   const defaultHeaders = parseOpenAIHeaders(config.openaiDefaultHeaders)
+   return {
++    logLevel: 'off' as const,
+     apiKey: config.openaiApiKey!,
+     baseURL: config.openaiBaseUrl!,
+     defaultHeaders,
+@@ -86,3 +87,20 @@ export function getOpenAIClientOptions(config: ClientConfig) {
+     },
+   }
+ }
++
++/** Disable library diagnostics that can render provider bodies before callers catch. */
++export function getAIChatOptions() {
++  return { debug: false as const }
++}
++
++/** Logging-only projection: preserve the original error for internal classification. */
++export function safeAIError(error: unknown): { httpStatus: number | null } {
++  try {
++    const status = Object.getOwnPropertyDescriptor(error, 'status')?.value
++    return {
++      httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,
++    }
++  } catch {
++    return { httpStatus: null }
++  }
++}
+diff --git a/apps/web/src/lib/server/domains/ai/retry.ts b/apps/web/src/lib/server/domains/ai/retry.ts
+index 3506c5a07..a6213cd02 100644
+--- a/apps/web/src/lib/server/domains/ai/retry.ts
++++ b/apps/web/src/lib/server/domains/ai/retry.ts
+@@ -6,6 +6,7 @@
+  */
+ 
+ import { logger } from '@/lib/server/logger'
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ 
+ const log = logger.child({ component: 'ai-retry' })
+ 
+@@ -59,7 +60,7 @@ export async function withRetry<T>(
+           attempt: attempt + 1,
+           max_retries: maxRetries,
+           delay_ms: Math.round(delay),
+-          err: lastError,
++          ai_error: safeAIError(lastError),
+         },
+         'retrying ai call'
+       )
+diff --git a/apps/web/src/lib/server/domains/ai/structured-chat.ts b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+index 585d1120c..e16a10ef4 100644
+--- a/apps/web/src/lib/server/domains/ai/structured-chat.ts
++++ b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+@@ -1,4 +1,8 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import {
++  getAIChatOptions,
++  getOpenAIClientOptions,
++  safeAIError,
++} from '@/lib/server/domains/ai/client-options'
+ /**
+  * Structured (schema-validated) chat requests.
+  *
+@@ -112,6 +116,7 @@ export async function structuredChat<S extends z.ZodType>(
+   if (!level) {
+     try {
+       return (await chat({
++        ...getAIChatOptions(),
+         ...common,
+         systemPrompts: input.systemPrompts,
+         outputSchema: input.schema,
+@@ -122,7 +127,7 @@ export async function structuredChat<S extends z.ZodType>(
+       level = rejectsResponseFormatEntirely(err) ? 'none' : 'json_object'
+       fallbackLevels.set(key, level)
+       log.warn(
+-        { base_url: baseURL, model: input.model, fallback: level, err },
++        { model: input.model, fallback: level, ai_error: safeAIError(err) },
+         'provider rejected response_format json_schema; describing the schema in the prompt instead'
+       )
+     }
+@@ -130,6 +135,7 @@ export async function structuredChat<S extends z.ZodType>(
+ 
+   const promptOnly = (lvl: FallbackLevel) =>
+     chat({
++      ...getAIChatOptions(),
+       ...common,
+       systemPrompts: [...input.systemPrompts, describeSchema(input.schema)],
+       modelOptions: {
+@@ -149,7 +155,7 @@ export async function structuredChat<S extends z.ZodType>(
+     level = 'none'
+     fallbackLevels.set(key, level)
+     log.warn(
+-      { base_url: baseURL, model: input.model, fallback: level, err },
++      { model: input.model, fallback: level, ai_error: safeAIError(err) },
+       'provider rejected response_format json_object; asking for JSON in the prompt alone'
+     )
+     text = await promptOnly(level)
+diff --git a/apps/web/src/lib/server/domains/ai/tracing-middleware.ts b/apps/web/src/lib/server/domains/ai/tracing-middleware.ts
+index af7ab8944..b6e9fc952 100644
+--- a/apps/web/src/lib/server/domains/ai/tracing-middleware.ts
++++ b/apps/web/src/lib/server/domains/ai/tracing-middleware.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * OpenTelemetry tracing for the agentic assistant turn, hung off TanStack AI's
+  * `ChatMiddleware` lifecycle hooks. One span per `chat()` invocation (the turn),
+@@ -174,12 +175,14 @@ export function createAssistantTracingMiddleware(
+     onError(ctx: ChatMiddlewareContext, info: ErrorInfo) {
+       endTurn(ctx, (state) => {
+         state.root.setAttribute('quackback.assistant.tool_call_count', state.toolCallCount)
+-        // Record the infra error (message/stack only — an infra failure, not
+-        // customer text). Deliberately does not attach any run content.
+-        if (info.error instanceof Error) state.root.recordException(info.error)
++        // Provider errors may echo prompts or credentials. Export closed status only.
++        state.root.setAttribute(
++          'quackback.assistant.http_status',
++          safeAIError(info.error).httpStatus ?? 0
++        )
+         state.root.setStatus({
+           code: SpanStatusCode.ERROR,
+-          message: info.error instanceof Error ? info.error.message : 'assistant turn failed',
++          message: 'assistant turn failed',
+         })
+       })
+     },
+diff --git a/apps/web/src/lib/server/domains/ai/usage-log.ts b/apps/web/src/lib/server/domains/ai/usage-log.ts
+index f9566be15..9a96ffa03 100644
+--- a/apps/web/src/lib/server/domains/ai/usage-log.ts
++++ b/apps/web/src/lib/server/domains/ai/usage-log.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * AI usage logging — records token usage, timing, and retry counts
+  * for every AI API call.
+@@ -132,7 +133,7 @@ export async function withUsageLogging<T>(
+     return result
+   } catch (error) {
+     const durationMs = Date.now() - start
+-    const errorMessage = error instanceof Error ? error.message : String(error)
++    const errorMessage = JSON.stringify(safeAIError(error))
+ 
+     // Extract retryCount from withRetry's error context if available
+     const retryCount =
+diff --git a/apps/web/src/lib/server/domains/ai/usage-middleware.ts b/apps/web/src/lib/server/domains/ai/usage-middleware.ts
+index b6c03c03b..1d22ead3b 100644
+--- a/apps/web/src/lib/server/domains/ai/usage-middleware.ts
++++ b/apps/web/src/lib/server/domains/ai/usage-middleware.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * ai_usage_log accounting hung off TanStack AI's `ChatMiddleware` lifecycle —
+  * the `chat()`-native counterpart of `withUsageLogging` for callers that have
+@@ -101,7 +102,7 @@ export function createUsageLoggingMiddleware(
+     onError(ctx: ChatMiddlewareContext, info: ErrorInfo) {
+       finalize(ctx, {
+         status: 'error',
+-        error: info.error instanceof Error ? info.error.message : String(info.error),
++        error: JSON.stringify(safeAIError(info.error)),
+       })
+     },
+ 
+diff --git a/apps/web/src/lib/server/domains/assistant/assistant.orchestrator.ts b/apps/web/src/lib/server/domains/assistant/assistant.orchestrator.ts
+index 92db2e241..b0c845ada 100644
+--- a/apps/web/src/lib/server/domains/assistant/assistant.orchestrator.ts
++++ b/apps/web/src/lib/server/domains/assistant/assistant.orchestrator.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Quinn turn orchestration — the assistant side of the conversation<->assistant
+  * cycle. `runAssistantTurnForConversation` runs one out-of-band turn for a widget
+@@ -422,7 +423,10 @@ export async function runAssistantTurnForConversation(
+     if (err instanceof InternalSourcedReplyError) {
+       log.error({ conversationId }, 'internal-sourced reply blocked; escalating to a human')
+     } else {
+-      log.error({ err, conversationId }, 'assistant turn failed; escalating to a human')
++      log.error(
++        { ai_error: safeAIError(err), conversationId },
++        'assistant turn failed; escalating to a human'
++      )
+     }
+     try {
+       await runAssistantFailureFloor(conversationId, assistantPrincipalId)
+diff --git a/apps/web/src/lib/server/domains/assistant/assistant.runtime.ts b/apps/web/src/lib/server/domains/assistant/assistant.runtime.ts
+index 151929dfe..2383be615 100644
+--- a/apps/web/src/lib/server/domains/assistant/assistant.runtime.ts
++++ b/apps/web/src/lib/server/domains/assistant/assistant.runtime.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ import type { Actor } from '@/lib/server/policy/types'
+ /**
+  * Quinn runtime seam.
+@@ -1379,7 +1380,7 @@ ${runtimeConfig.config.agents.workspace.instructions}`)
+         ) {
+           systemPrompts.push(ASSISTANT_STRUCTURAL_REPAIR_PROMPT)
+         }
+-        log.warn({ err: error }, 'assistant turn attempt failed, retrying once')
++        log.warn({ ai_error: safeAIError(error) }, 'assistant turn attempt failed, retrying once')
+       },
+     })
+ 
+@@ -1552,7 +1553,7 @@ export function streamAssistantTurn(
+       queue.end()
+     })
+     .catch((error: unknown) => {
+-      log.warn({ err: error }, 'assistant wire turn failed')
++      log.warn({ ai_error: safeAIError(error) }, 'assistant wire turn failed')
+       pairing.closeOpen()
+       closeOpenStep()
+       const { code, message } = mapError(error)
+diff --git a/apps/web/src/lib/server/domains/assistant/assistant.toolspec.ts b/apps/web/src/lib/server/domains/assistant/assistant.toolspec.ts
+index f6df0cbf1..43f9e6aa2 100644
+--- a/apps/web/src/lib/server/domains/assistant/assistant.toolspec.ts
++++ b/apps/web/src/lib/server/domains/assistant/assistant.toolspec.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ import { assistantGateEnvelopeSchema, withGateEnvelope } from './tool-output'
+ 
+ /**
+@@ -1029,7 +1030,10 @@ async function executeEndConversation(
+   try {
+     await classifyConversationAttributes(conversationId, { trigger: 'assistant_closed' })
+   } catch (err) {
+-    log.warn({ err, conversationId }, 'post-close attribute classification failed')
++    log.warn(
++      { ai_error: safeAIError(err), conversationId },
++      'post-close attribute classification failed'
++    )
+   }
+   return { closed: true }
+ }
+diff --git a/apps/web/src/lib/server/domains/assistant/conversation-summary.service.ts b/apps/web/src/lib/server/domains/assistant/conversation-summary.service.ts
+index 34042d832..addabd24d 100644
+--- a/apps/web/src/lib/server/domains/assistant/conversation-summary.service.ts
++++ b/apps/web/src/lib/server/domains/assistant/conversation-summary.service.ts
+@@ -1,4 +1,8 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import {
++  getAIChatOptions,
++  getOpenAIClientOptions,
++  safeAIError,
++} from '@/lib/server/domains/ai/client-options'
+ /**
+  * Conversation summary service (Quinn P2-A.4: past-conversation grounding).
+  *
+@@ -141,6 +145,7 @@ export async function summarizeConversationOnClose(
+     // counts as on-demand Summarize-chip calls; this fire-and-forget path
+     // must meter against aiTokensPerMonth without inflating that report.
+     const object = await chat({
++      ...getAIChatOptions(),
+       adapter: openaiCompatibleText(model, getOpenAIClientOptions(config)),
+       systemPrompts: [SYSTEM_PROMPT],
+       messages: [{ role: 'user', content: transcript }],
+@@ -203,6 +208,9 @@ export async function summarizeConversationOnClose(
+     )
+     if (written) log.info({ conversation_id: conversationId }, 'conversation summary generated')
+   } catch (err) {
+-    log.error({ err, conversation_id: conversationId }, 'conversation summary generation failed')
++    log.error(
++      { ai_error: safeAIError(err), conversation_id: conversationId },
++      'conversation summary generation failed'
++    )
+   }
+ }
+diff --git a/apps/web/src/lib/server/domains/assistant/document.service.ts b/apps/web/src/lib/server/domains/assistant/document.service.ts
+index 6f153809b..4146f32a8 100644
+--- a/apps/web/src/lib/server/domains/assistant/document.service.ts
++++ b/apps/web/src/lib/server/domains/assistant/document.service.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Knowledge-document ingest service: admin-uploaded files (PDFs and Word
+  * documents) whose extracted text grounds Quinn's answers.
+@@ -63,7 +64,10 @@ async function embedAssistantDocument(id: AssistantDocumentId, title: string, co
+ 
+     log.debug({ assistant_document_id: id }, 'assistant document embedded')
+   } catch (err) {
+-    log.error({ err, assistant_document_id: id }, 'assistant document embedding failed')
++    log.error(
++      { ai_error: safeAIError(err), assistant_document_id: id },
++      'assistant document embedding failed'
++    )
+   }
+ }
+ 
+diff --git a/apps/web/src/lib/server/domains/assistant/retrieval-sources.ts b/apps/web/src/lib/server/domains/assistant/retrieval-sources.ts
+index 11e859b54..43c32ca9a 100644
+--- a/apps/web/src/lib/server/domains/assistant/retrieval-sources.ts
++++ b/apps/web/src/lib/server/domains/assistant/retrieval-sources.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ import { can } from '@/lib/server/policy/authorize'
+ import { PERMISSIONS } from '@/lib/shared/permissions'
+ import type { Actor } from '@/lib/server/policy/types'
+@@ -400,7 +401,7 @@ export async function retrieveKnowledge(
+         })
+         .catch((error: unknown): RetrievedItem[] => {
+           log.warn(
+-            { err: error, sourceType: source.sourceType },
++            { ai_error: safeAIError(error), sourceType: source.sourceType },
+             'knowledge source retrieval failed; continuing without it'
+           )
+           return []
+diff --git a/apps/web/src/lib/server/domains/assistant/snippet.service.ts b/apps/web/src/lib/server/domains/assistant/snippet.service.ts
+index 14c88c1f2..79cee2568 100644
+--- a/apps/web/src/lib/server/domains/assistant/snippet.service.ts
++++ b/apps/web/src/lib/server/domains/assistant/snippet.service.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Snippets — short, private facts an admin curates for Quinn to ground
+  * answers on, alongside the knowledge base and (when enabled) feedback
+@@ -86,7 +87,10 @@ async function embedSnippet(
+       .returning()
+     return row ?? null
+   } catch (error) {
+-    log.error({ err: error, snippet_id: id }, 'snippet embedding generation failed')
++    log.error(
++      { ai_error: safeAIError(error), snippet_id: id },
++      'snippet embedding generation failed'
++    )
+     return null
+   }
+ }
+diff --git a/apps/web/src/lib/server/domains/assistant/synthesis-core.ts b/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
+index 51dac0d8e..5eb9abaee 100644
+--- a/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
++++ b/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
+@@ -1,4 +1,4 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import { getAIChatOptions, getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Shared synthesis engine behind Quinn's tool-using turn (assistant.runtime.ts)
+  * and Ask AI's one-shot answer (synthesis.ts). Both are thin wrappers around
+@@ -281,6 +281,7 @@ async function streamOnce<TContext>(
+   const tools = opts.tools
+   const stream = tools
+     ? chat({
++        ...getAIChatOptions(),
+         adapter,
+         messages: opts.messages,
+         systemPrompts: opts.systemPrompts,
+@@ -294,6 +295,7 @@ async function streamOnce<TContext>(
+         ...(opts.middleware ? { middleware: opts.middleware } : {}),
+       })
+     : chat({
++        ...getAIChatOptions(),
+         adapter,
+         messages: opts.messages,
+         systemPrompts: opts.systemPrompts,
+diff --git a/apps/web/src/lib/server/domains/assistant/synthesis.ts b/apps/web/src/lib/server/domains/assistant/synthesis.ts
+index 3dc452fc1..c223b441b 100644
+--- a/apps/web/src/lib/server/domains/assistant/synthesis.ts
++++ b/apps/web/src/lib/server/domains/assistant/synthesis.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Ask AI synthesis seam.
+  *
+@@ -181,7 +182,7 @@ export async function synthesizeAnswer(params: SynthesizeAnswerParams): Promise<
+           : 'no_answer'
+     },
+     onRetry: (_attempt, error) => {
+-      log.warn({ err: error }, 'ask ai attempt failed, retrying once')
++      log.warn({ ai_error: safeAIError(error) }, 'ask ai attempt failed, retrying once')
+     },
+   })
+ 
+diff --git a/apps/web/src/lib/server/domains/assistant/ticket-field-suggestion.service.ts b/apps/web/src/lib/server/domains/assistant/ticket-field-suggestion.service.ts
+index e52297f9b..6e8331ade 100644
+--- a/apps/web/src/lib/server/domains/assistant/ticket-field-suggestion.service.ts
++++ b/apps/web/src/lib/server/domains/assistant/ticket-field-suggestion.service.ts
+@@ -1,4 +1,8 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import {
++  getAIChatOptions,
++  getOpenAIClientOptions,
++  safeAIError,
++} from '@/lib/server/domains/ai/client-options'
+ /**
+  * Copilot auto-fill on conversion (convergence Phase 5,
+  * scratchpad/convergence-design.md): suggest values for a ticket type's
+@@ -234,6 +238,7 @@ export async function suggestTicketFieldValues(
+   let output: Record<string, unknown>
+   try {
+     output = (await chat({
++      ...getAIChatOptions(),
+       adapter: openaiCompatibleText(model, getOpenAIClientOptions(config)),
+       systemPrompts: [SYSTEM_PROMPT],
+       messages: [
+@@ -265,7 +270,10 @@ export async function suggestTicketFieldValues(
+   } catch (err) {
+     // The strict-json_schema path is known-flaky on OpenRouter: an error,
+     // timeout, or unparseable response is "unavailable", NEVER partials.
+-    log.warn({ err, conversationId, ticketTypeId }, 'ticket field suggestion completion failed')
++    log.warn(
++      { ai_error: safeAIError(err), conversationId, ticketTypeId },
++      'ticket field suggestion completion failed'
++    )
+     return { unavailable: true }
+   }
+ 
+diff --git a/apps/web/src/lib/server/domains/assistant/ticket-summary.service.ts b/apps/web/src/lib/server/domains/assistant/ticket-summary.service.ts
+index 1a31d9ea0..90de2794d 100644
+--- a/apps/web/src/lib/server/domains/assistant/ticket-summary.service.ts
++++ b/apps/web/src/lib/server/domains/assistant/ticket-summary.service.ts
+@@ -1,4 +1,8 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import {
++  getAIChatOptions,
++  getOpenAIClientOptions,
++  safeAIError,
++} from '@/lib/server/domains/ai/client-options'
+ /**
+  * Ticket resolution-summary service (Quinn Phase 4: ticket grounding).
+  *
+@@ -126,6 +130,7 @@ export async function summarizeTicketOnClose(
+     // chip's 'copilot_summary' (analytics/copilot-usage.ts counts only the
+     // latter), matching how the conversation on-close path stays off that report.
+     const object = await chat({
++      ...getAIChatOptions(),
+       adapter: openaiCompatibleText(model, getOpenAIClientOptions(config)),
+       systemPrompts: [SYSTEM_PROMPT],
+       messages: [{ role: 'user', content: truncated }],
+@@ -188,6 +193,9 @@ export async function summarizeTicketOnClose(
+     )
+     if (written) log.info({ ticket_id: ticketId }, 'ticket summary generated')
+   } catch (err) {
+-    log.error({ err, ticket_id: ticketId }, 'ticket summary generation failed')
++    log.error(
++      { ai_error: safeAIError(err), ticket_id: ticketId },
++      'ticket summary generation failed'
++    )
+   }
+ }
+diff --git a/apps/web/src/lib/server/domains/conversation-attributes/ai-classification.service.ts b/apps/web/src/lib/server/domains/conversation-attributes/ai-classification.service.ts
+index ab3fc2ce7..a141d4ecc 100644
+--- a/apps/web/src/lib/server/domains/conversation-attributes/ai-classification.service.ts
++++ b/apps/web/src/lib/server/domains/conversation-attributes/ai-classification.service.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Deterministic AI attribute classification (AI-ATTRIBUTES-PARITY-SPEC.md
+  * Phase 1). Unlike Quinn's `set_attribute` tool (best-effort, only fires when
+@@ -266,7 +267,10 @@ export async function classifyConversationAttributes(
+ 
+     return outcomes
+   } catch (err) {
+-    log.error({ err, conversationId, trigger: opts.trigger }, 'attribute classification failed')
++    log.error(
++      { ai_error: safeAIError(err), conversationId, trigger: opts.trigger },
++      'attribute classification failed'
++    )
+     return []
+   }
+ }
+diff --git a/apps/web/src/lib/server/domains/conversation-attributes/attribute-description-draft.service.ts b/apps/web/src/lib/server/domains/conversation-attributes/attribute-description-draft.service.ts
+index 4d653f59e..6b531ac12 100644
+--- a/apps/web/src/lib/server/domains/conversation-attributes/attribute-description-draft.service.ts
++++ b/apps/web/src/lib/server/domains/conversation-attributes/attribute-description-draft.service.ts
+@@ -1,4 +1,4 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import { getAIChatOptions, getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
+ /**
+  * "Draft descriptions" authoring assist (AI-ATTRIBUTES-PARITY-SPEC.md Phase
+  * 3): one chat call that turns an attribute label + its option labels into
+@@ -106,6 +106,7 @@ export async function draftAttributeDescriptions(
+   ].join('\n')
+ 
+   const object = await chat({
++    ...getAIChatOptions(),
+     adapter: openaiCompatibleText(model, getOpenAIClientOptions(config)),
+     systemPrompts: [DRAFT_SYSTEM_PROMPT],
+     messages: [{ role: 'user', content: userContent }],
+diff --git a/apps/web/src/lib/server/domains/conversation-attributes/classification-core.ts b/apps/web/src/lib/server/domains/conversation-attributes/classification-core.ts
+index c8fd268f4..bae3a3eda 100644
+--- a/apps/web/src/lib/server/domains/conversation-attributes/classification-core.ts
++++ b/apps/web/src/lib/server/domains/conversation-attributes/classification-core.ts
+@@ -1,4 +1,4 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import { getAIChatOptions, getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Shared classification core (AI-ATTRIBUTES-PARITY-SPEC.md Phase 3): the one
+  * structured-output model call + response parsing/validation used by BOTH the
+@@ -149,6 +149,7 @@ export async function runClassificationCall(
+   ].join('\n')
+ 
+   const object = await chat({
++    ...getAIChatOptions(),
+     adapter: openaiCompatibleText(model, getOpenAIClientOptions(config)),
+     systemPrompts: [CLASSIFICATION_SYSTEM_PROMPT],
+     messages: [{ role: 'user', content: userContent }],
+diff --git a/apps/web/src/lib/server/domains/conversation/conversation-translation.service.ts b/apps/web/src/lib/server/domains/conversation/conversation-translation.service.ts
+index a93d06608..af4ae3b7a 100644
+--- a/apps/web/src/lib/server/domains/conversation/conversation-translation.service.ts
++++ b/apps/web/src/lib/server/domains/conversation/conversation-translation.service.ts
+@@ -1,4 +1,8 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import {
++  getAIChatOptions,
++  getOpenAIClientOptions,
++  safeAIError,
++} from '@/lib/server/domains/ai/client-options'
+ /**
+  * Two-way inbox translation (P2-D.1).
+  *
+@@ -234,6 +238,7 @@ async function callInboxTranslationModel<T>(
+     metadata: { stage, ...metadata },
+   })
+   const result = await chat({
++    ...getAIChatOptions(),
+     adapter: openaiCompatibleText(model, getOpenAIClientOptions(config)),
+     systemPrompts: [system],
+     messages: [{ role: 'user', content: user }],
+@@ -315,7 +320,10 @@ export async function maybeDetectCustomerLanguage(
+       .returning()
+     return updated ?? conversation
+   } catch (err) {
+-    log.error({ err, conversation_id: conversation.id }, 'customer language detection failed')
++    log.error(
++      { ai_error: safeAIError(err), conversation_id: conversation.id },
++      'customer language detection failed'
++    )
+     return conversation
+   }
+ }
+@@ -373,7 +381,10 @@ export async function translateIncomingMessage(
+     // response (as well as on a network/provider failure) where the old
+     // hand-parse code had a separate JSON.parse catch branch — both collapse
+     // to the same BLOCK-the-send outcome here.
+-    log.error({ err, message_id: message.id }, 'inbox translation: unparseable AI response')
++    log.error(
++      { ai_error: safeAIError(err), message_id: message.id },
++      'inbox translation: unparseable AI response'
++    )
+     throw new TranslationUnavailableError()
+   }
+   if (!result) throw new TranslationUnavailableError()
+@@ -416,7 +427,10 @@ export async function translateOutgoingContent(
+       InboxTranslationSchema
+     )
+   } catch (err) {
+-    log.error({ err }, 'inbox translation: unparseable AI response (outgoing)')
++    log.error(
++      { ai_error: safeAIError(err) },
++      'inbox translation: unparseable AI response (outgoing)'
++    )
+     throw new TranslationUnavailableError()
+   }
+   if (!result) throw new TranslationUnavailableError()
+diff --git a/apps/web/src/lib/server/domains/conversation/conversation.spam-filter.ts b/apps/web/src/lib/server/domains/conversation/conversation.spam-filter.ts
+index 02b758925..280feda9b 100644
+--- a/apps/web/src/lib/server/domains/conversation/conversation.spam-filter.ts
++++ b/apps/web/src/lib/server/domains/conversation/conversation.spam-filter.ts
+@@ -1,4 +1,8 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import {
++  getAIChatOptions,
++  getOpenAIClientOptions,
++  safeAIError,
++} from '@/lib/server/domains/ai/client-options'
+ /**
+  * Inbound spam classification for new conversations.
+  *
+@@ -131,6 +135,7 @@ export async function classifyInboundAsSpam(input: ClassifyInboundSpamInput): Pr
+   let verdict: { spam: boolean }
+   try {
+     verdict = await chat({
++      ...getAIChatOptions(),
+       adapter: openaiCompatibleText(model, getOpenAIClientOptions(config)),
+       systemPrompts: [SYSTEM_PROMPT],
+       messages: [
+@@ -155,7 +160,7 @@ export async function classifyInboundAsSpam(input: ClassifyInboundSpamInput): Pr
+       ],
+     })
+   } catch (err) {
+-    log.warn({ err }, 'spam classification completion failed')
++    log.warn({ ai_error: safeAIError(err) }, 'spam classification completion failed')
+     return false
+   }
+ 
+diff --git a/apps/web/src/lib/server/domains/embeddings/embedding.service.ts b/apps/web/src/lib/server/domains/embeddings/embedding.service.ts
+index 95696c2ec..be28769e4 100644
+--- a/apps/web/src/lib/server/domains/embeddings/embedding.service.ts
++++ b/apps/web/src/lib/server/domains/embeddings/embedding.service.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Embedding service for semantic similarity search.
+  *
+@@ -72,7 +73,11 @@ export async function generateEmbedding(
+       return null
+     }
+     log.error(
+-      { pipeline_step: logContext?.pipelineStep, post_id: logContext?.postId, err: error },
++      {
++        pipeline_step: logContext?.pipelineStep,
++        post_id: logContext?.postId,
++        ai_error: safeAIError(error),
++      },
+       'embedding generation failed'
+     )
+     return null
+@@ -127,9 +132,12 @@ export async function generatePostEmbedding(
+     .then(({ checkPostForMergeCandidates }) => checkPostForMergeCandidates(postId))
+     .catch((err) => {
+       if (err instanceof TierLimitError) {
+-        log.info({ post_id: postId, err }, 'merge check skipped: ai budget unavailable')
++        log.info(
++          { post_id: postId, ai_error: safeAIError(err) },
++          'merge check skipped: ai budget unavailable'
++        )
+       } else {
+-        log.error({ post_id: postId, err }, 'merge check failed')
++        log.error({ post_id: postId, ai_error: safeAIError(err) }, 'merge check failed')
+       }
+     })
+ 
+diff --git a/apps/web/src/lib/server/domains/help-center/help-center-auto-translate.service.ts b/apps/web/src/lib/server/domains/help-center/help-center-auto-translate.service.ts
+index fa0aa2d2d..59ce4bb9c 100644
+--- a/apps/web/src/lib/server/domains/help-center/help-center-auto-translate.service.ts
++++ b/apps/web/src/lib/server/domains/help-center/help-center-auto-translate.service.ts
+@@ -1,4 +1,8 @@
+-import { getOpenAIClientOptions } from '@/lib/server/domains/ai/client-options'
++import {
++  getAIChatOptions,
++  getOpenAIClientOptions,
++  safeAIError,
++} from '@/lib/server/domains/ai/client-options'
+ /**
+  * Auto-translate (domains/languages §H3, fast-follow). On publish of a
+  * base-locale article, when helpCenterConfig.autoTranslate.enabled, one job
+@@ -156,6 +160,7 @@ export async function translateArticleForLocale(
+   let parsed: z.infer<typeof TranslationResultSchema>
+   try {
+     parsed = await chat({
++      ...getAIChatOptions(),
+       adapter: openaiCompatibleText(model, getOpenAIClientOptions(config)),
+       systemPrompts: [system],
+       messages: [{ role: 'user', content: user }],
+@@ -171,7 +176,10 @@ export async function translateArticleForLocale(
+       ],
+     })
+   } catch (err) {
+-    log.error({ err, article_id: articleId, locale }, 'auto-translate: unparseable AI response')
++    log.error(
++      { ai_error: safeAIError(err), article_id: articleId, locale },
++      'auto-translate: unparseable AI response'
++    )
+     return
+   }
+   if (!parsed.title || !parsed.content) {
+diff --git a/apps/web/src/lib/server/domains/merge-suggestions/merge-assessment.service.ts b/apps/web/src/lib/server/domains/merge-suggestions/merge-assessment.service.ts
+index 00cacb402..835e63721 100644
+--- a/apps/web/src/lib/server/domains/merge-suggestions/merge-assessment.service.ts
++++ b/apps/web/src/lib/server/domains/merge-suggestions/merge-assessment.service.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Merge assessment service — LLM verification of merge candidates.
+  *
+@@ -126,7 +127,7 @@ export async function assessMergeCandidates(
+     })
+   } catch (err) {
+     if (!isStructuredOutputError(err)) throw err
+-    log.error({ err }, 'failed to parse llm json')
++    log.error({ ai_error: safeAIError(err) }, 'failed to parse llm json')
+     return []
+   }
+ 
+diff --git a/apps/web/src/lib/server/domains/merge-suggestions/merge-check.service.ts b/apps/web/src/lib/server/domains/merge-suggestions/merge-check.service.ts
+index 473255cc0..5b63c8b60 100644
+--- a/apps/web/src/lib/server/domains/merge-suggestions/merge-check.service.ts
++++ b/apps/web/src/lib/server/domains/merge-suggestions/merge-check.service.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Merge check orchestrator — per-post checking and periodic sweep.
+  *
+@@ -194,7 +195,7 @@ async function _doSweep(): Promise<void> {
+           break
+         }
+         totalFailed++
+-        log.error({ err, post_id: id }, 'failed to check post')
++        log.error({ ai_error: safeAIError(err), post_id: id }, 'failed to check post')
+       }
+     }
+     if (stoppedByBudget) break
+diff --git a/apps/web/src/lib/server/domains/posts/post.autotag.ts b/apps/web/src/lib/server/domains/posts/post.autotag.ts
+index 389168f51..e5ad172ff 100644
+--- a/apps/web/src/lib/server/domains/posts/post.autotag.ts
++++ b/apps/web/src/lib/server/domains/posts/post.autotag.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * AI auto-tagging of new posts.
+  *
+@@ -136,7 +137,7 @@ async function evaluatePostAgainstTags(
+       ],
+     })
+   } catch (err) {
+-    log.warn({ err, post_id: postId }, 'auto-tag completion failed')
++    log.warn({ ai_error: safeAIError(err), post_id: postId }, 'auto-tag completion failed')
+     return []
+   }
+ 
+diff --git a/apps/web/src/lib/server/domains/sentiment/sentiment.service.ts b/apps/web/src/lib/server/domains/sentiment/sentiment.service.ts
+index 21ed6421b..fa11dafa0 100644
+--- a/apps/web/src/lib/server/domains/sentiment/sentiment.service.ts
++++ b/apps/web/src/lib/server/domains/sentiment/sentiment.service.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Sentiment analysis service.
+  *
+@@ -119,7 +120,7 @@ export async function analyzeSentiment(
+     // schema-invalid one (chat() throws on either with outputSchema set) —
+     // both collapse to the same best-effort null the old parse-and-validate
+     // branch returned.
+-    log.error({ err: error }, 'sentiment generation failed')
++    log.error({ ai_error: safeAIError(error) }, 'sentiment generation failed')
+     return null
+   }
+ }
+diff --git a/apps/web/src/lib/server/domains/summary/summary.service.ts b/apps/web/src/lib/server/domains/summary/summary.service.ts
+index 5dee3f06c..ec9c9da45 100644
+--- a/apps/web/src/lib/server/domains/summary/summary.service.ts
++++ b/apps/web/src/lib/server/domains/summary/summary.service.ts
+@@ -1,3 +1,4 @@
++import { safeAIError } from '@/lib/server/domains/ai/client-options'
+ /**
+  * Post summary service.
+  *
+@@ -185,7 +186,7 @@ export async function generateAndSavePostSummary(postId: PostId): Promise<void>
+     })
+   } catch (err) {
+     if (!isStructuredOutputError(err)) throw err
+-    log.error({ post_id: postId, err }, 'failed to parse summary json')
++    log.error({ post_id: postId, ai_error: safeAIError(err) }, 'failed to parse summary json')
+     return
+   }
+ 
+@@ -302,7 +303,7 @@ async function _doSweep(): Promise<void> {
+           break
+         }
+         totalFailed++
+-        log.error({ post_id: id, err }, 'failed to refresh post summary')
++        log.error({ post_id: id, ai_error: safeAIError(err) }, 'failed to refresh post summary')
+       }
+     }
+     if (stoppedByBudget) break

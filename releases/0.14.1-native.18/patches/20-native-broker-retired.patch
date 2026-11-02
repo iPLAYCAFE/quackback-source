@@ -1,0 +1,2791 @@
+diff --git a/apps/web/src/components/widget/__tests__/widget-native-evidence-delete.test.tsx b/apps/web/src/components/widget/__tests__/widget-native-evidence-delete.test.tsx
+deleted file mode 100644
+index aa59d997b383a6c17aef6b67b6fc7c5a70166991..0000000000000000000000000000000000000000
+--- a/apps/web/src/components/widget/__tests__/widget-native-evidence-delete.test.tsx
++++ /dev/null
+@@ -1,68 +0,0 @@
+-import {describe,it,expect,vi,beforeEach,afterEach} from 'vitest'
+-import {createIntl} from 'react-intl'
+-import en from '@/locales/en.json'
+-import th from '@/locales/th.json'
+-import {render,screen,fireEvent,waitFor,cleanup} from '@testing-library/react'
+-const ports = vi.hoisted(()=>({remove:vi.fn(),refetch:vi.fn(),setQueryData:vi.fn(),formatMessage:vi.fn(),locale:'en', data:{reports:[{evidence:[{evidenceId:'qbe_test'}]}]}}))
+-vi.mock('react-intl',async()=>({...await vi.importActual('react-intl'),useIntl:()=>({locale:ports.locale,formatMessage:ports.formatMessage})}))
+-vi.mock('@tanstack/react-query',()=>({useQueryClient:()=>({setQueryData:ports.setQueryData}),useQuery:()=>({data:ports.data,refetch:ports.refetch})}))
+-vi.mock('@/lib/server/functions/widget/native-evidence',()=>({nativeReadEvidenceFn:vi.fn(),nativeDeleteEvidenceFn:ports.remove}))
+-vi.mock('@/lib/client/widget-auth',()=>({getWidgetAuthHeaders:()=>({Authorization:'Bearer synthetic'})}))
+-import {WidgetNativeEvidence} from '../widget-native-evidence'
+-beforeEach(()=>{
+- ports.locale='en'
+- ports.formatMessage.mockImplementation((message,values)=>createIntl({locale:ports.locale,messages:ports.locale==='th'?th:en}).formatMessage(message,values))
+-})
+-afterEach(()=>{cleanup();vi.unstubAllGlobals()})
+-describe('native committed attachment removal',()=>{
+- it('removes only through authenticated own-ticket BFF and hides completed evidence',async()=>{
+-  ports.remove.mockResolvedValueOnce({deleted:true})
+-  render(<WidgetNativeEvidence ticketId={'ticket_owned' as never} sessionVersion={1}/>)
+-  fireEvent.click(screen.getByRole('button',{name:'Delete private evidence'}))
+-  await waitFor(()=>expect(ports.remove).toHaveBeenCalledWith({data:{ticketId:'ticket_owned'},headers:{Authorization:'Bearer synthetic'}}))
+-  await waitFor(()=>expect(screen.queryByText('Private evidence')).toBeNull())
+-  expect(ports.setQueryData).toHaveBeenCalledWith(['widget','native-evidence',1,'ticket_owned'],{ticketId:'ticket_owned',reports:[]})
+-  cleanup()
+- })
+- it('a response after session switch cannot remove the new session evidence',async()=>{
+-  let finish:(v:unknown)=>void=()=>{}
+-  ports.remove.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve}))
+-  const view=render(<WidgetNativeEvidence ticketId={'ticket_owned' as never} sessionVersion={1}/>)
+-  fireEvent.click(screen.getByRole('button',{name:'Delete private evidence'}))
+-  view.rerender(<WidgetNativeEvidence ticketId={'ticket_other' as never} sessionVersion={2}/>)
+-  finish({deleted:true})
+-  await waitFor(()=>expect(screen.getByText('Private evidence')).toBeTruthy())
+-  cleanup()
+- })
+-})
+-
+-describe('native evidence catalog messages',()=>{
+- it.each(['en','th'])('uses the %s catalog and ICU index for labels and failure',async locale=>{
+-  ports.locale=locale
+-  const catalog=locale==='th'?th:en
+-  const intl=createIntl({locale,messages:catalog})
+-  const message=(id:string,values?:Record<string,number>)=>intl.formatMessage({id},values)
+-  ports.remove.mockRejectedValueOnce(new Error('unavailable'))
+-  render(<WidgetNativeEvidence ticketId={'ticket_owned' as never} sessionVersion={1}/>)
+-  expect(screen.getByText(message('widget.nativeEvidence.heading'))).toBeTruthy()
+-  expect(screen.getByRole('button',{name:message('widget.nativeEvidence.view',{index:1})})).toBeTruthy()
+-  fireEvent.click(screen.getByRole('button',{name:message('widget.nativeEvidence.delete')}))
+-  await waitFor(()=>expect(screen.getByRole('alert').textContent).toBe(message('widget.nativeEvidence.unavailable')))
+-  expect(ports.formatMessage).toHaveBeenCalledWith(expect.objectContaining({id:'widget.nativeEvidence.view'}),{index:1})
+- })
+- it.each(['en','th'])('uses the %s catalog for image alternative text and upstream close label',async locale=>{
+-  ports.locale=locale
+-  const catalog=locale==='th'?th:en
+-  const intl=createIntl({locale,messages:catalog})
+-  const message=(id:string,values?:Record<string,number>)=>intl.formatMessage({id},values)
+-  vi.stubGlobal('fetch',vi.fn().mockResolvedValue(new Response(new Blob(['image']),{headers:{'Content-Type':'image/png'}})))
+-  vi.spyOn(URL,'createObjectURL').mockReturnValue('blob:synthetic')
+-  vi.spyOn(URL,'revokeObjectURL').mockImplementation(()=>{})
+-  render(<WidgetNativeEvidence ticketId={'ticket_owned' as never} sessionVersion={1}/>)
+-  fireEvent.click(screen.getByRole('button',{name:message('widget.nativeEvidence.view',{index:1})}))
+-  await waitFor(()=>expect(screen.getByRole('img',{name:message('widget.nativeEvidence.heading')})).toBeTruthy())
+-  fireEvent.click(screen.getByRole('button',{name:message('files.viewer.close')}))
+-  expect(screen.queryByRole('img')).toBeNull()
+-  expect(ports.formatMessage).toHaveBeenCalledWith(expect.objectContaining({id:'files.viewer.close'}))
+- })
+-})
+diff --git a/apps/web/src/components/widget/widget-messenger.tsx b/apps/web/src/components/widget/widget-messenger.tsx
+index bb0715df19dcba5edd50b37ae940300659898ebb..5e023c5df64a6e5c9b85441786969f6acb530072 100644
+--- a/apps/web/src/components/widget/widget-messenger.tsx
++++ b/apps/web/src/components/widget/widget-messenger.tsx
+@@ -8,7 +8,6 @@ import { VisitorSurfaceRpcProvider } from '@/lib/client/visitor-surface-rpc'
+ import { widgetVisitorRpc } from '@/lib/client/widget-visitor-rpc'
+ import { useConversationPresence, markAgentPresentInCache } from './use-messenger-presence'
+ import { useWidgetFileUpload } from './use-widget-file-upload'
+-import { WidgetNativeEvidence } from './widget-native-evidence'
+ 
+ interface WidgetMessengerProps {
+   /** Whether the help center is available (gates in-conversation article suggestions). */
+@@ -80,8 +79,6 @@ export function WidgetMessenger({
+         showHeader={false}
+         autofocusComposer={autofocusComposer}
+         compact
+-        renderTicketAccessory={(ticket) => <WidgetNativeEvidence key={`${sessionVersion}:${ticket.id}`}
+-          ticketId={ticket.id} sessionVersion={sessionVersion} />}
+       />
+     </VisitorSurfaceRpcProvider>
+   )
+diff --git a/apps/web/src/components/widget/widget-native-evidence.tsx b/apps/web/src/components/widget/widget-native-evidence.tsx
+deleted file mode 100644
+index 79934943da2b1cacdfc82c2b502ed13075739564..0000000000000000000000000000000000000000
+--- a/apps/web/src/components/widget/widget-native-evidence.tsx
++++ /dev/null
+@@ -1,86 +0,0 @@
+-import { useEffect, useRef, useState } from 'react'
+-import { useQuery, useQueryClient } from '@tanstack/react-query'
+-import { useIntl } from 'react-intl'
+-import type { TicketId } from '@quackback/ids'
+-import { nativeReadEvidenceFn, nativeDeleteEvidenceFn } from '@/lib/server/functions/widget/native-evidence'
+-import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
+-
+-/** Private bytes stay in the iframe; URLs are revoked on close/switch/unmount. */
+-export function WidgetNativeEvidence({ticketId, sessionVersion}: {ticketId: TicketId; sessionVersion: number}) {
+-  const intl = useIntl()
+-  const queryClient = useQueryClient()
+-  const requests = useRef(new Set<AbortController>())
+-  const urls = useRef(new Set<string>())
+-  const [preview, setPreview] = useState<{url: string; video: boolean} | null>(null)
+-  const [busy, setBusy] = useState(false)
+-  const [failed, setFailed] = useState(false)
+-  const ownerKey = `${sessionVersion}:${ticketId}`
+-  const owner = useRef(ownerKey); owner.current = ownerKey
+-  const [deletedOwner, setDeletedOwner] = useState<string|null>(null)
+-  const {data} = useQuery({
+-    queryKey: ['widget', 'native-evidence', sessionVersion, ticketId],
+-    queryFn: () => nativeReadEvidenceFn({data: {ticketId}, headers: getWidgetAuthHeaders()}),
+-    retry: false,
+-  })
+-  useEffect(() => () => {
+-    for (const request of requests.current) request.abort()
+-    for (const url of urls.current) URL.revokeObjectURL(url)
+-    urls.current.clear()
+-  }, [sessionVersion, ticketId])
+-  function close() {
+-    if (preview) { URL.revokeObjectURL(preview.url); urls.current.delete(preview.url) }
+-    setPreview(null)
+-  }
+-  async function remove() {
+-    if (busy) return
+-    const generation = owner.current
+-    for (const request of requests.current) request.abort()
+-    close(); setBusy(true); setFailed(false)
+-    try {
+-      const result = await nativeDeleteEvidenceFn({data:{ticketId},headers:getWidgetAuthHeaders()})
+-      if (owner.current === generation) {
+-        if (!result.deleted) throw new Error('unavailable')
+-        queryClient.setQueryData(['widget','native-evidence',sessionVersion,ticketId],{ticketId,reports:[]})
+-        setDeletedOwner(generation)
+-      }
+-    } catch { if (owner.current === generation) setFailed(true) }
+-    finally { if (owner.current === generation) setBusy(false) }
+-  }
+-  useEffect(()=>{setBusy(false);setFailed(false);setPreview(null)},[ownerKey])
+-  async function open(evidenceId: string) {
+-    if (busy) return
+-    close(); setBusy(true); setFailed(false)
+-    const controller = new AbortController(); requests.current.add(controller)
+-    try {
+-      const response = await fetch('/api/widget/evidence/private', {
+-        method: 'POST', headers: {...getWidgetAuthHeaders(), 'Content-Type': 'application/json'},
+-        body: JSON.stringify({ticketId, evidenceId}), signal: controller.signal,
+-      })
+-      const mime = response.headers.get('content-type')?.split(';')[0] ?? ''
+-      if (!response.ok || !/^(image\/(png|jpeg|webp|gif)|video\/(mp4|webm))$/.test(mime)) throw new Error('unavailable')
+-      const blob = await response.blob()
+-      if (controller.signal.aborted || blob.size > 50 * 1024 * 1024) throw new Error('unavailable')
+-      const url = URL.createObjectURL(blob); urls.current.add(url)
+-      setPreview({url, video: mime.startsWith('video/')})
+-    } catch { if (!controller.signal.aborted) setFailed(true) }
+-    finally { requests.current.delete(controller); if (!controller.signal.aborted) setBusy(false) }
+-  }
+-  const evidence = data?.reports.flatMap(report => report.evidence) ?? []
+-  if (!evidence.length || deletedOwner === ownerKey) return null
+-  return <section className="border-b p-3 text-sm">
+-    <p>{intl.formatMessage({id: 'widget.nativeEvidence.heading', defaultMessage: 'Private evidence'})}</p>
+-    <div className="flex flex-wrap gap-2">{evidence.map((item, index) => <button key={item.evidenceId}
+-      type="button" className="rounded border px-2 py-1" disabled={busy} onClick={() => void open(item.evidenceId)}>
+-      {intl.formatMessage({id: 'widget.nativeEvidence.view', defaultMessage: 'View evidence {index}'}, {index: index + 1})}
+-    </button>)}</div>
+-    <button type="button" className="mt-2 rounded border px-2 py-1" disabled={busy} onClick={()=>void remove()}>
+-      {intl.formatMessage({id: 'widget.nativeEvidence.delete', defaultMessage: 'Delete private evidence'})}
+-    </button>
+-    {failed && <p role="alert">{intl.formatMessage({id: 'widget.nativeEvidence.unavailable', defaultMessage: 'Evidence unavailable'})}</p>}
+-    {preview && <div>
+-      <button type="button" onClick={close}>{intl.formatMessage({id: 'files.viewer.close', defaultMessage: 'Close'})}</button>
+-      {preview.video ? <video src={preview.url} controls className="w-full" /> :
+-        <img src={preview.url} alt={intl.formatMessage({id: 'widget.nativeEvidence.heading', defaultMessage: 'Private evidence'})} className="w-full" />}
+-    </div>}
+-  </section>
+-}
+diff --git a/apps/web/src/lib/client/__tests__/native-host-controller.test.ts b/apps/web/src/lib/client/__tests__/native-host-controller.test.ts
+index 7f7d882d1246144c8b5dee6349fd6e2d2e1ec354..97ffedb7981aafea46addd9fb91c931c900e045f 100644
+--- a/apps/web/src/lib/client/__tests__/native-host-controller.test.ts
++++ b/apps/web/src/lib/client/__tests__/native-host-controller.test.ts
+@@ -173,41 +173,28 @@ describe('authoritative native retirement', () => {
+ })
+ 
+ 
+-describe('native report abort acknowledgement',()=>{
+-  const reportId='brp_00000000-0000-4000-8000-000000000001'
+-  it('requires identified ownership and exact parent origin before abort',async()=>{
++describe('retired native evidence-broker commands',()=>{
++  const retired=['evidence-capability','bind-evidence','abort-evidence','read-evidence','delete-evidence']
++  it('drops every broker command without an action or ACK, even for an identified host',async()=>{
+     const p=ports(),bridge=createNativeHostController(p)
+-    await bridge.receive(command('abort-evidence',{reportId}),origin)
+-    expect(p.action).not.toHaveBeenCalled()
+     await bridge.receive(command('identify'),origin)
+-    await bridge.receive(command('abort-evidence',{reportId}),'https://other.example.test')
++    const acks=p.respond.mock.calls.length
++    const reportId='brp_00000000-0000-4000-8000-000000000001',ticketId='ticket_01h455vb4pex5vsknk084sn02q'
++    for(const type of retired){
++      const payload=type==='read-evidence'||type==='delete-evidence'?{ticketId}:{reportId}
++      await bridge.receive(command(type,payload),origin)
++    }
+     expect(p.action).not.toHaveBeenCalled()
++    expect(p.respond.mock.calls.length).toBe(acks)
+   })
+-  it('returns the exact operation and durable abort result through the existing ACK',async()=>{
++  it('keeps the generic upload-attachment command behind the identity gate',async()=>{
+     const p=ports(),bridge=createNativeHostController(p)
++    await bridge.receive(command('upload-attachment',{name:'a.png'}),origin)
++    expect(p.action).not.toHaveBeenCalled()
++    expect(p.respond).toHaveBeenLastCalledWith(origin,'native-result',expect.objectContaining({type:'upload-attachment',success:false,error:'IDENTITY_REQUIRED'}))
+     await bridge.receive(command('identify'),origin)
+-    p.action.mockResolvedValueOnce({reportId,aborted:true})
+-    const op=command('abort-evidence',{reportId})
+-    await bridge.receive(op,origin)
+-    expect(p.action).toHaveBeenCalledWith('abort-evidence',{reportId},expect.objectContaining({operationId:op.operationId,hostOrigin:origin}))
+-    expect(p.respond).toHaveBeenLastCalledWith(origin,'native-result',expect.objectContaining({operationId:op.operationId,type:'abort-evidence',audience,hostOrigin:origin,success:true,result:{reportId,aborted:true}}))
+-  })
+-  it('refuses cleanup acknowledgement when abort authority is committed or ambiguous',async()=>{
+-    const p=ports(),bridge=createNativeHostController(p)
+-    await bridge.receive(command('identify'),origin)
+-    p.action.mockRejectedValueOnce(new Error('EVIDENCE_BINDING_CONFLICT'))
+-    await bridge.receive(command('abort-evidence',{reportId}),origin)
+-    expect(p.respond).toHaveBeenLastCalledWith(origin,'native-result',expect.objectContaining({type:'abort-evidence',success:false,error:'EVIDENCE_BINDING_CONFLICT'}))
+-  })
+-  it('fences a late abort result on identity switch',async()=>{
+-    const p=ports(),bridge=createNativeHostController(p)
+-    await bridge.receive(command('identify'),origin)
+-    let resolve!:(value:Record<string,unknown>)=>void
+-    p.action.mockImplementationOnce(()=>new Promise(r=>{resolve=r}))
+-    const op=command('abort-evidence',{reportId}),pending=bridge.receive(op,origin)
+-    expect(p.action).toHaveBeenCalledTimes(1)
+-    await bridge.receive(command('identify'),origin)
+-    resolve({reportId,aborted:true});await pending
+-    expect(p.respond.mock.calls.some(([, , value])=>value.operationId===op.operationId)).toBe(false)
++    p.action.mockResolvedValueOnce({fileId:'file_1'})
++    await bridge.receive(command('upload-attachment',{name:'a.png'}),origin)
++    expect(p.action).toHaveBeenCalledWith('upload-attachment',{name:'a.png'},expect.objectContaining({hostOrigin:origin}))
+   })
+ })
+diff --git a/apps/web/src/lib/server/evidence/__tests__/native.test.ts b/apps/web/src/lib/server/evidence/__tests__/native.test.ts
+deleted file mode 100644
+index c8fad9a6a44190a17ccfe791df2866a4dba6cc04..0000000000000000000000000000000000000000
+--- a/apps/web/src/lib/server/evidence/__tests__/native.test.ts
++++ /dev/null
+@@ -1,682 +0,0 @@
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
+-import type { AuthContext } from '@/lib/server/functions/auth-helpers'
+-import { evidenceServerConfig, verifyEvidenceCapability } from '../qbe1'
+-
+-const fixture = vi.hoisted(() => ({
+-  row: null as Record<string, unknown> | null,
+-  binding: null as Record<string, unknown> | null,
+-  deletion: null as Record<string, unknown> | null,
+-  active: true,
+-  identified: true,
+-  ownPrincipal: true,
+-  ownTicket: true,
+-  nativeBound: true,
+-  mapped: { ticket_id: 'ticket_owned', body_digest: 'a'.repeat(64) },
+-  calls: [] as { text: string; values: unknown[] }[],
+-  sessionId: 'session-native',
+-}))
+-vi.mock('@tanstack/react-start/server', () => ({
+-  getRequestHeaders: () => new Headers({ Authorization: 'Bearer test-session' }),
+-}))
+-vi.mock('@/lib/server/config', () => ({
+-  config: {
+-    secretKey: 'test-only-master-secret-for-qbe1-domain',
+-    baseUrl: 'https://quackback.example',
+-  },
+-}))
+-vi.mock('@quackback/ids', () => ({
+-  isValidTypeId: (value: string, kind: string) => kind === 'ticket' && value.startsWith('ticket_'),
+-}))
+-vi.mock('@/lib/server/db', () => {
+-  const table = (name: string, fields: string[]) =>
+-    Object.fromEntries([['table', name], ...fields.map((f) => [f, `${name}.${f}`])])
+-  const session = table('session', ['id', 'token', 'userId', 'expiresAt', 'scope'])
+-  const principal = table('principal', ['id', 'userId', 'type', 'role'])
+-  const tickets = table('tickets', ['id', 'requesterPrincipalId', 'type', 'deletedAt'])
+-  const widgetIdentifiedSession = table('identified', ['sessionId', 'hmacVerified'])
+-  const select = () => {
+-    let from = ''
+-    let joined = false
+-    const q = {
+-      from: (t: { table: string }) => {
+-        from = t.table
+-        return q
+-      },
+-      where: () => q,
+-      innerJoin: () => {
+-        joined = true
+-        return q
+-      },
+-      for: () => q,
+-      limit: async () =>
+-        from === 'session'
+-          ? fixture.active &&
+-            (!joined || (fixture.identified && fixture.ownPrincipal && fixture.ownTicket))
+-            ? [{ id: fixture.sessionId, userId: 'user_native' }]
+-            : []
+-          : from === 'identified'
+-            ? [{ verified: fixture.identified }]
+-            : from === 'principal'
+-              ? fixture.ownPrincipal
+-                ? [{ id: 'principal_native' }]
+-                : []
+-              : fixture.ownTicket
+-                ? [{ id: 'ticket_owned' }]
+-                : [],
+-    }
+-    return q
+-  }
+-  const execute = async (query: { text: string; values: unknown[] }) => {
+-    fixture.calls.push(query)
+-    if (query.text.includes('INSERT INTO ipc_native_evidence_deletion')) {
+-      fixture.deletion ??= {binding_ref:query.values[1], phase:'deleting'}
+-      return []
+-    }
+-    if (query.text.includes('UPDATE ipc_native_evidence_deletion')) {
+-      fixture.deletion!.phase = 'deleted'; return []
+-    }
+-    if (query.text.includes('FROM ipc_native_evidence_deletion')) return fixture.deletion ? [fixture.deletion] : []
+-    if (query.text.includes('FROM ipc_native_session_binding'))
+-      return fixture.nativeBound ? [{ session_id: fixture.sessionId }] : []
+-    if (query.text.includes('pg_advisory')) return []
+-    if (query.text.includes('INSERT INTO ipc_native_evidence_report')) {
+-      const [report, issuance, owner, tenant, sid, kinds] = query.values
+-      fixture.row = {
+-        report_id: report,
+-        issuance_ref: issuance,
+-        principal_id: owner,
+-        tenant_ref: tenant,
+-        session_id: sid,
+-        allowed_kinds: JSON.parse(kinds as string),
+-        submission_id: null,
+-        body_digest: null,
+-        ticket_id: null,
+-        evidence_ids: null,
+-      }
+-      return []
+-    }
+-    if (query.text.includes('INSERT INTO ipc_native_evidence_binding')) {
+-      const [report_id, binding_ref, tuple_json] = query.values
+-      fixture.binding ??= { report_id, binding_ref, tuple_json, phase: 'preparing' }
+-      return []
+-    }
+-    if (query.text.includes('UPDATE ipc_native_evidence_binding')) {
+-      const phase = /SET phase='([^']+)'/.exec(query.text)![1]
+-      const previous = /AND phase='([^']+)'/.exec(query.text)![1]
+-      if (fixture.binding?.phase === previous) fixture.binding.phase = phase
+-      return []
+-    }
+-    if (query.text.includes('FROM ipc_native_evidence_binding')) {
+-      if (query.text.includes("phase='confirmed'") && fixture.binding?.phase !== 'confirmed')
+-        return []
+-      return fixture.binding ? [fixture.binding] : []
+-    }
+-    if (query.text.includes('FROM ipc_native_submission')) return [fixture.mapped]
+-    if (query.text.includes('UPDATE ipc_native_evidence_report')) {
+-      const [submission, digest, ticket, ids] = query.values
+-      Object.assign(fixture.row!, {
+-        submission_id: submission,
+-        body_digest: digest,
+-        ticket_id: ticket,
+-        evidence_ids: JSON.parse(ids as string),
+-      })
+-      return []
+-    }
+-    return fixture.row ? [fixture.row] : []
+-  }
+-  const db = {
+-    select,
+-    execute,
+-    transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+-      const saved = structuredClone(fixture.row)
+-      const savedBinding = structuredClone(fixture.binding)
+-      const savedDeletion = structuredClone(fixture.deletion)
+-      try {
+-        return await fn({ select, execute })
+-      } catch (error) {
+-        fixture.row = saved
+-        fixture.binding = savedBinding
+-        fixture.deletion = savedDeletion
+-        throw error
+-      }
+-    },
+-  }
+-  const sql = (strings: TemplateStringsArray, ...values: unknown[]) => ({
+-    text: strings.join('?'),
+-    values,
+-  })
+-  return {
+-    db,
+-    sql,
+-    session,
+-    principal,
+-    tickets,
+-    widgetIdentifiedSession,
+-    eq: () => null,
+-    and: () => null,
+-    gt: () => null,
+-    isNull: () => null,
+-    inArray: () => null,
+-  }
+-})
+-
+-import {
+-  introspectNativeEvidenceCapability,
+-  runBindNativeEvidence,
+-  runAbortNativeEvidenceBinding,
+-  runIssueNativeEvidenceCapability,
+-  runReadNativeEvidence,
+-  runOpenNativeEvidence,
+-  runDeleteNativeEvidence,
+-} from '../native'
+-const ctx = {
+-  scope: 'widget',
+-  principal: { id: 'principal_native', type: 'user', role: 'user' },
+-  user: { id: 'user_native' },
+-  settings: { id: 'workspace_native' },
+-} as unknown as AuthContext
+-const reportId = 'brp_11111111-1111-4111-8111-111111111111'
+-const evidenceId = 'qbe_11111111-1111-4111-8111-111111111111'
+-const submissionId = '22222222-2222-4222-8222-222222222222'
+-const input = { reportId, ticketId: 'ticket_owned', submissionId, evidenceIds: [evidenceId] }
+-function ready() {
+-  const created = Date.now()
+-  return {
+-    schemaVersion: 1,
+-    evidenceId,
+-    kind: 'screenshot',
+-    status: 'uploaded',
+-    outcome: null,
+-    reasonCode: null,
+-    createdAt: new Date(created).toISOString(),
+-    expiresAt: new Date(created + 86400000).toISOString(),
+-    rawDeleteBy: new Date(created + 86400000).toISOString(),
+-    revision: 4,
+-    sourceRevision: 2,
+-    processingRevision: 4,
+-    processingStatus: 'ready',
+-    processingReasonCode: null,
+-    sanitizedDerivativeExpiresAt: new Date(created + 30 * 86400000).toISOString(),
+-    processingRequired: false,
+-    sanitizedDerivativeAvailable: true,
+-    textReportMaySubmit: true,
+-    deletionPending: false,
+-    idempotentReplay: false,
+-    upload: null,
+-  }
+-}
+-beforeEach(() => {
+-  fixture.row = null
+-  fixture.binding = null
+-  fixture.deletion = null
+-  fixture.active = true
+-  fixture.identified = true
+-  fixture.ownPrincipal = true
+-  fixture.ownTicket = true
+-  fixture.nativeBound = true
+-  fixture.mapped = { ticket_id: 'ticket_owned', body_digest: 'a'.repeat(64) }
+-  fixture.calls = []
+-  fixture.sessionId = 'session-native'
+-  vi.stubEnv('EVIDENCE_BROKER_URL', 'https://broker.example')
+-  vi.stubEnv('NATIVE_WIDGET_PRIVATE_EVIDENCE', 'true')
+-  vi.stubEnv('NATIVE_WIDGET_SCREEN_RECORDING', 'false')
+-  vi.stubEnv('NATIVE_WIDGET_BROAD_MEDIA_UPLOAD', 'false')
+-  vi.stubGlobal(
+-    'fetch',
+-    vi.fn(async (url: string, options?: RequestInit) =>
+-      url.includes('/bindings/')
+-        ? Response.json({
+-            bindingRef: JSON.parse(options!.body as string).bindingRef,
+-            state: url.endsWith('/prepare')
+-              ? 'prepared'
+-              : url.endsWith('/commit')
+-                ? 'bound'
+-                : 'released',
+-          })
+-        : Response.json(ready())
+-    )
+-  )
+-})
+-describe('native capability issuance and revocation', () => {
+-  it.each(['raw-pending','sanitized-ready','unknown-reason'])('never confirms deletion from %s broker metadata',async(mode)=>{
+-    await runIssueNativeEvidenceCapability(ctx,{reportId}); await runBindNativeEvidence(ctx,input)
+-    const terminal = {...ready(),sourceRevision:4,processingRevision:5,revision:7,status:'deleted',outcome:'discarded',reasonCode:'REPORTER_DISCARDED',
+-      deletionPending:false,processingStatus:'deleted',processingReasonCode:'SOURCE_REVOKED',
+-      sanitizedDerivativeAvailable:false,sanitizedDerivativeExpiresAt:null}
+-    if(mode==='raw-pending') terminal.deletionPending=true
+-    if(mode==='sanitized-ready') terminal.sanitizedDerivativeAvailable=true
+-    if(mode==='unknown-reason') terminal.processingReasonCode='UNKNOWN'
+-    vi.stubGlobal('fetch',vi.fn(async()=>Response.json(terminal)))
+-    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow('EVIDENCE_DELETION_UNAVAILABLE')
+-    expect(fixture.deletion?.phase).toBe('deleting')
+-  })
+-  it('committed deletion retains Ticket tuple, fences reads before remote calls, and recovers exact retry', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, {reportId})
+-    await runBindNativeEvidence(ctx, input)
+-    const bound = structuredClone(fixture.row)
+-    const remote = vi.fn(async (_url: string, options: RequestInit) => {
+-      expect(fixture.deletion?.phase).toBe('deleting')
+-      const body = JSON.parse(options.body as string)
+-      const claims = verifyEvidenceCapability((options.headers as Record<string,string>).Authorization.slice(7), evidenceServerConfig(process.env,'test-only-master-secret-for-qbe1-domain')!.signingKey)!
+-      expect(claims.scope).toBe('evidence:bound-delete')
+-      expect(await introspectNativeEvidenceCapability((options.headers as Record<string,string>).Authorization.slice(7))).toMatchObject({scope:'evidence:bound-delete'})
+-      expect(await introspectNativeEvidenceCapability((await runIssueNativeEvidenceCapability(ctx,{reportId}).catch(()=>null))?.attachToken ?? '')).toBeNull()
+-      await expect(runOpenNativeEvidence(ctx,{ticketId:input.ticketId,evidenceId})).rejects.toThrow()
+-      return Response.json({...ready(),sourceRevision:4,processingRevision:5,revision:7,evidenceId:body.evidenceId,status:'deleted',outcome:'discarded',reasonCode:'REPORTER_DISCARDED',deletionPending:false,processingStatus:'deleted',processingReasonCode:'SOURCE_REVOKED',sanitizedDerivativeAvailable:false,sanitizedDerivativeExpiresAt:null})
+-    })
+-    vi.stubGlobal('fetch', remote)
+-    expect(await runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).toMatchObject({deleted:true})
+-    expect(fixture.row).toEqual(bound)
+-    expect(fixture.binding?.phase).toBe('confirmed')
+-    expect(fixture.deletion?.phase).toBe('deleted')
+-    expect(await runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).toMatchObject({deleted:true})
+-    expect(remote).toHaveBeenCalledTimes(1)
+-  })
+-  it('refuses deletion without fresh identified ownership or confirmed exact tuple', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, {reportId})
+-    await runBindNativeEvidence(ctx, input)
+-    fixture.ownTicket = false
+-    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
+-    fixture.ownTicket = true; fixture.identified = false
+-    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
+-    fixture.identified = true; fixture.binding!.phase = 'committed'
+-    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
+-    fixture.binding!.phase = 'confirmed'; fixture.binding!.tuple_json = '{}'
+-    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
+-    expect(fixture.deletion).toBeNull()
+-  })
+-  it('unknown remote deletion leaves durable intent and retryable read fence', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, {reportId})
+-    await runBindNativeEvidence(ctx, input)
+-    vi.stubGlobal('fetch', vi.fn(async()=>{throw new Error('synthetic unavailable')}))
+-    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
+-    expect(fixture.deletion?.phase).toBe('deleting')
+-    await expect(runReadNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
+-  })
+-  it('preserves the same opaque report issuance, narrows kind gates, and never discloses server-read grants', async () => {
+-    const issued = await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    const replay = await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    expect(replay.binding).toEqual(issued.binding)
+-    expect(issued.allowedKinds).toEqual(['screenshot'])
+-    const claims = await introspectNativeEvidenceCapability(issued.attachToken)
+-    expect(claims).toMatchObject({ scope: 'evidence:attach', allowedKinds: ['screenshot'] })
+-    expect(Object.keys(issued).sort()).toEqual([
+-      'allowedKinds',
+-      'attachToken',
+-      'binding',
+-      'brokerOrigin',
+-      'cleanupToken',
+-      'expiresAt',
+-      'reportId',
+-    ])
+-    expect(fixture.calls.some((c) => c.values.includes(`ipc-evidence:${reportId}`))).toBe(true)
+-  })
+-  it.each(['active', 'identified', 'ownPrincipal', 'nativeBound'] as const)(
+-    'denies invalid native %s',
+-    async (field) => {
+-      fixture[field] = false
+-      await expect(runIssueNativeEvidenceCapability(ctx, { reportId })).rejects.toThrow(
+-        'EVIDENCE_DENIED'
+-      )
+-      expect(fixture.row).toBeNull()
+-    }
+-  )
+-  it.each(['dashboard', 'portal'] as const)('denies %s context', async (scope) => {
+-    await expect(runIssueNativeEvidenceCapability({ ...ctx, scope }, { reportId })).rejects.toThrow(
+-      'EVIDENCE_DENIED'
+-    )
+-  })
+-  it('denies anonymous and keeps all grants default off', async () => {
+-    await expect(
+-      runIssueNativeEvidenceCapability(
+-        { ...ctx, principal: { ...ctx.principal, type: 'anonymous' } },
+-        { reportId }
+-      )
+-    ).rejects.toThrow('EVIDENCE_DENIED')
+-    vi.stubEnv('NATIVE_WIDGET_PRIVATE_EVIDENCE', 'false')
+-    await expect(runIssueNativeEvidenceCapability(ctx, { reportId })).rejects.toThrow(
+-      'EVIDENCE_DISABLED'
+-    )
+-  })
+-  it('revokes attach on logout, account switch, gate disable, and binding; cleanup survives only as discard', async () => {
+-    const issued = await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    fixture.active = false
+-    expect(await introspectNativeEvidenceCapability(issued.attachToken)).toBeNull()
+-    expect(await introspectNativeEvidenceCapability(issued.cleanupToken)).toMatchObject({
+-      scope: 'evidence:discard',
+-    })
+-    fixture.active = true
+-    fixture.ownPrincipal = false
+-    expect(await introspectNativeEvidenceCapability(issued.attachToken)).toBeNull()
+-    fixture.ownPrincipal = true
+-    vi.stubEnv('NATIVE_WIDGET_PRIVATE_EVIDENCE', 'false')
+-    expect(await introspectNativeEvidenceCapability(issued.attachToken)).toBeNull()
+-    vi.stubEnv('NATIVE_WIDGET_PRIVATE_EVIDENCE', 'true')
+-    fixture.row!.ticket_id = 'ticket_owned'
+-    expect(await introspectNativeEvidenceCapability(issued.attachToken)).toBeNull()
+-  })
+-  it('does not transfer report issuance between identities or native sessions', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    fixture.row!.principal_id = 'principal_other'
+-    await expect(runIssueNativeEvidenceCapability(ctx, { reportId })).rejects.toThrow(
+-      'EVIDENCE_DENIED'
+-    )
+-    fixture.row!.principal_id = ctx.principal.id
+-    fixture.sessionId = 'new-session'
+-    await expect(runIssueNativeEvidenceCapability(ctx, { reportId })).rejects.toThrow(
+-      'EVIDENCE_DENIED'
+-    )
+-  })
+-})
+-describe('immutable native ticket evidence binding', () => {
+-  it('binds the server-owned digest and exact handles only after ready proof, with idempotent replay', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    const first = await runBindNativeEvidence(ctx, input)
+-    expect(first.evidence).toHaveLength(1)
+-    expect(fixture.row).toMatchObject({
+-      body_digest: 'a'.repeat(64),
+-      ticket_id: 'ticket_owned',
+-      submission_id: submissionId,
+-      evidence_ids: [evidenceId],
+-    })
+-    await expect(runBindNativeEvidence(ctx, input)).resolves.toMatchObject({
+-      ticketId: 'ticket_owned',
+-      reportId,
+-    })
+-    expect(
+-      fixture.calls.filter((c) => c.text.includes('UPDATE ipc_native_evidence_report'))
+-    ).toHaveLength(1)
+-    expect(
+-      fixture.calls.some((c) => c.values.includes(`ipc-native:${ctx.principal.id}:${submissionId}`))
+-    ).toBe(true)
+-  })
+-  it('keeps unknown broker commit fail-closed and recovers the exact lost-ACK retry', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    const normal = fetch
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, options: RequestInit) => {
+-        if (url.endsWith('/bindings/commit')) throw new Error('lost acknowledgement')
+-        return normal(url, options)
+-      })
+-    )
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_BINDING_UNAVAILABLE')
+-    await expect(runReadNativeEvidence(ctx, { ticketId: input.ticketId })).rejects.toThrow(
+-      'EVIDENCE_BINDING_UNAVAILABLE'
+-    )
+-    vi.stubGlobal('fetch', normal)
+-    await expect(runBindNativeEvidence(ctx, input)).resolves.toMatchObject({
+-      ticketId: input.ticketId,
+-    })
+-    expect(
+-      fixture.calls.filter((c) => c.text.includes('UPDATE ipc_native_evidence_report'))
+-    ).toHaveLength(1)
+-  })
+-  it('refuses old issuance preparation after session switch and keeps deterministic original authority', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    const normal = fetch
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, options: RequestInit) => {
+-        if (url.endsWith('/bindings/prepare')) throw new Error('lost prepare ACK')
+-        return normal(url, options)
+-      })
+-    )
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_BINDING_UNAVAILABLE')
+-    const previous = structuredClone(fixture.binding)
+-    fixture.sessionId = 'different-session'
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_DENIED')
+-    expect(fixture.binding).toEqual(previous)
+-  })
+-  it('abort records absence before its grant, fences late bind retry and never releases committed state', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    const normal = fetch
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, options: RequestInit) => {
+-        if (url.endsWith('/bindings/prepare')) throw new Error('ambiguous preparation')
+-        return normal(url, options)
+-      })
+-    )
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_BINDING_UNAVAILABLE')
+-    vi.stubGlobal('fetch', normal)
+-    await runAbortNativeEvidenceBinding(ctx, { reportId })
+-    expect(fixture.binding!.phase).toBe('aborted')
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_BINDING_CONFLICT')
+-    await expect(runAbortNativeEvidenceBinding(ctx, { reportId })).resolves.toMatchObject({
+-      aborted: true,
+-    })
+-  })
+-  it('lost abort ACK retries the same tombstone and a changed native session cannot abort original issuance', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    const normal = fetch
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, options: RequestInit) => {
+-        if (url.endsWith('/bindings/prepare')) throw new Error('lost prepare ACK')
+-        return normal(url, options)
+-      })
+-    )
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_BINDING_UNAVAILABLE')
+-    const prepare = structuredClone(fixture.binding)
+-    const originalSession = fixture.sessionId
+-    fixture.sessionId = 'switched-session'
+-    await expect(runAbortNativeEvidenceBinding(ctx, { reportId })).rejects.toThrow(
+-      'EVIDENCE_DENIED'
+-    )
+-    expect(fixture.binding).toEqual(prepare)
+-    fixture.sessionId = originalSession
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, options: RequestInit) => {
+-        if (url.endsWith('/bindings/abort')) throw new Error('lost abort ACK')
+-        return normal(url, options)
+-      })
+-    )
+-    await expect(runAbortNativeEvidenceBinding(ctx, { reportId })).rejects.toThrow(
+-      'EVIDENCE_BINDING_UNAVAILABLE'
+-    )
+-    expect(fixture.binding!.phase).toBe('aborted')
+-    const tombstone = structuredClone(fixture.binding)
+-    vi.stubGlobal('fetch', normal)
+-    await expect(runAbortNativeEvidenceBinding(ctx, { reportId })).resolves.toEqual({
+-      reportId,
+-      aborted: true,
+-    })
+-    expect(fixture.binding).toEqual(tombstone)
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_BINDING_CONFLICT')
+-  })
+-  it('cancel refuses committed or confirmed authority, including a lost broker commit ACK', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    const normal = fetch
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, options: RequestInit) => {
+-        if (url.endsWith('/bindings/commit')) throw new Error('lost commit ACK')
+-        return normal(url, options)
+-      })
+-    )
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_BINDING_UNAVAILABLE')
+-    expect(fixture.binding!.phase).toBe('committed')
+-    await expect(runAbortNativeEvidenceBinding(ctx, { reportId })).rejects.toThrow(
+-      'EVIDENCE_BINDING_CONFLICT'
+-    )
+-    expect(fixture.binding!.phase).toBe('committed')
+-    vi.stubGlobal('fetch', normal)
+-    await runBindNativeEvidence(ctx, input)
+-    expect(fixture.binding!.phase).toBe('confirmed')
+-    await expect(runAbortNativeEvidenceBinding(ctx, { reportId })).rejects.toThrow(
+-      'EVIDENCE_BINDING_CONFLICT'
+-    )
+-    expect(fixture.binding!.phase).toBe('confirmed')
+-  })
+-  it('phase grants never widen tuple ownership and commit grants require durable SQL commit', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    let prepareToken = '',
+-      commitToken = ''
+-    const normal = fetch
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, options: RequestInit) => {
+-        if (url.includes('/bindings/')) {
+-          const token = (options.headers as Record<string, string>).Authorization.slice(7)
+-          if (url.endsWith('/prepare')) {
+-            prepareToken = token
+-            expect(await introspectNativeEvidenceCapability(token)).toMatchObject({
+-              scope: 'evidence:bind-prepare',
+-            })
+-            expect(fixture.binding!.phase).toBe('preparing')
+-          } else if (url.endsWith('/commit')) {
+-            commitToken = token
+-            expect(fixture.binding!.phase).toBe('committed')
+-            expect(await introspectNativeEvidenceCapability(token)).toMatchObject({
+-              scope: 'evidence:bind-commit',
+-            })
+-          }
+-        }
+-        return normal(url, options)
+-      })
+-    )
+-    await runBindNativeEvidence(ctx, input)
+-    fixture.binding!.phase = 'preparing'
+-    expect(await introspectNativeEvidenceCapability(commitToken)).toBeNull()
+-    fixture.binding!.phase = 'aborted'
+-    expect(await introspectNativeEvidenceCapability(prepareToken)).toBeNull()
+-  })
+-  it('fails atomically on unowned ticket, mismatched submission, and scan failure', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    fixture.ownTicket = false
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_DENIED')
+-    fixture.ownTicket = true
+-    fixture.mapped.ticket_id = 'ticket_other'
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_SUBMISSION_DENIED')
+-    fixture.mapped.ticket_id = 'ticket_owned'
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (url: string, options?: RequestInit) =>
+-        url.includes('/bindings/')
+-          ? Response.json({
+-              bindingRef: JSON.parse(options!.body as string).bindingRef,
+-              state: 'prepared',
+-            })
+-          : Response.json({ ...ready(), processingStatus: 'processing' })
+-      )
+-    )
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_NOT_READY')
+-    expect(fixture.row!.ticket_id).toBeNull()
+-    expect(fixture.calls.some((c) => c.text.includes('UPDATE ipc_native_evidence_report'))).toBe(
+-      false
+-    )
+-  })
+-  it('does not rebind an established tuple with a new digest or handles', async () => {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    await runBindNativeEvidence(ctx, input)
+-    fixture.mapped.body_digest = 'b'.repeat(64)
+-    await expect(runBindNativeEvidence(ctx, input)).rejects.toThrow('EVIDENCE_BINDING_CONFLICT')
+-    fixture.mapped.body_digest = 'a'.repeat(64)
+-    await expect(
+-      runBindNativeEvidence(ctx, {
+-        ...input,
+-        evidenceIds: ['qbe_22222222-2222-4222-8222-222222222222'],
+-      })
+-    ).rejects.toThrow('EVIDENCE_BINDING_CONFLICT')
+-  })
+-  it('retains report issuance in broker read grants and keeps native read requester-only', async () => {
+-    const issued = await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    await runBindNativeEvidence(ctx, input)
+-    const read = await runReadNativeEvidence(ctx, { ticketId: 'ticket_owned' })
+-    expect(read.reports).toHaveLength(1)
+-    const fetcher = vi.mocked(fetch)
+-    const options = fetcher.mock.calls.find((c) => (c[1]?.method ?? 'GET') === 'GET')![1]!
+-    const authorization = (options.headers as Record<string, string>).Authorization
+-    const server = evidenceServerConfig(
+-      { EVIDENCE_BROKER_URL: 'https://broker.example' },
+-      'test-only-master-secret-for-qbe1-domain'
+-    )!
+-    expect(verifyEvidenceCapability(authorization.slice(7), server.signingKey)).toMatchObject({
+-      issuanceRef: issued.binding.issuanceRef,
+-      scope: 'evidence:read',
+-    })
+-    fixture.ownTicket = false
+-    await expect(runReadNativeEvidence(ctx, { ticketId: 'ticket_owned' })).rejects.toThrow(
+-      'EVIDENCE_DENIED'
+-    )
+-  })
+-})
+-
+-describe('native private derivative proxy', () => {
+-  const bytes = () =>
+-    new Response(new Uint8Array(900).fill(42), {
+-      headers: {
+-        'content-type': 'image/png',
+-        'content-length': '900',
+-        'x-private-storage-key': 'must-not-forward',
+-      },
+-    })
+-  async function bound() {
+-    await runIssueNativeEvidenceCapability(ctx, { reportId })
+-    await runBindNativeEvidence(ctx, input)
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async () => bytes())
+-    )
+-  }
+-  it('streams only bound own-ticket bytes and keeps every broker credential/coordinate server-only', async () => {
+-    await bound()
+-    const result = await runOpenNativeEvidence(ctx, { ticketId: input.ticketId, evidenceId })
+-    expect(result.headers.get('cache-control')).toBe('no-store')
+-    expect(result.headers.get('x-private-storage-key')).toBeNull()
+-    expect((await result.arrayBuffer()).byteLength).toBe(900)
+-    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
+-      `https://broker.example/v1/evidence/${evidenceId}/derivative`
+-    )
+-  })
+-  it('denies an unbound handle, unowned ticket, or a missing native session binding', async () => {
+-    await bound()
+-    await expect(
+-      runOpenNativeEvidence(ctx, {
+-        ticketId: input.ticketId,
+-        evidenceId: 'qbe_22222222-2222-4222-8222-222222222222',
+-      })
+-    ).rejects.toThrow('EVIDENCE_DENIED')
+-    fixture.ownTicket = false
+-    await expect(
+-      runOpenNativeEvidence(ctx, { ticketId: input.ticketId, evidenceId })
+-    ).rejects.toThrow('EVIDENCE_DENIED')
+-    fixture.ownTicket = true
+-    fixture.nativeBound = false
+-    await expect(
+-      runOpenNativeEvidence(ctx, { ticketId: input.ticketId, evidenceId })
+-    ).rejects.toThrow('EVIDENCE_DENIED')
+-    expect(fetch).not.toHaveBeenCalled()
+-  })
+-  it.each(['logout', 'native-binding-revoked', 'promoted-principal', 'ticket-reassigned'] as const)(
+-    'rechecks %s before delivering a stream chunk',
+-    async (race) => {
+-      await bound()
+-      const result = await runOpenNativeEvidence(ctx, { ticketId: input.ticketId, evidenceId })
+-      if (race === 'logout') fixture.active = false
+-      if (race === 'native-binding-revoked') fixture.nativeBound = false
+-      if (race === 'promoted-principal') fixture.ownPrincipal = false
+-      if (race === 'ticket-reassigned') fixture.ownTicket = false
+-      await expect(result.arrayBuffer()).rejects.toThrow('EVIDENCE_UNAVAILABLE')
+-    }
+-  )
+-  it('denies unsafe content type and oversized/partial responses', async () => {
+-    await bound()
+-    const invalidHeaders: Record<string, string>[] = [
+-      { 'content-type': 'text/html', 'content-length': '900' },
+-      { 'content-type': 'image/png', 'content-length': String(50 * 1024 * 1024 + 1) },
+-      { 'content-type': 'image/png', 'content-length': '900', 'content-range': 'bytes 0-899/1000' },
+-    ]
+-    for (const headers of invalidHeaders) {
+-      vi.stubGlobal(
+-        'fetch',
+-        vi.fn(async () => new Response(new Uint8Array(900), { headers }))
+-      )
+-      await expect(
+-        runOpenNativeEvidence(ctx, { ticketId: input.ticketId, evidenceId })
+-      ).rejects.toThrow('EVIDENCE_UNAVAILABLE')
+-    }
+-  })
+-})
+diff --git a/apps/web/src/lib/server/evidence/__tests__/qbe1-golden-v1.json b/apps/web/src/lib/server/evidence/__tests__/qbe1-golden-v1.json
+deleted file mode 100644
+index 8dc8a16777f5fe83f8994ad2493eb1fe7d8f3f3d..0000000000000000000000000000000000000000
+--- a/apps/web/src/lib/server/evidence/__tests__/qbe1-golden-v1.json
++++ /dev/null
+@@ -1,25 +0,0 @@
+-{
+-  "schemaVersion": 1,
+-  "algorithm": "HMAC-SHA-256",
+-  "domain": "qbe1.",
+-  "testOnlySigningKeyHex": "3031323334353637383961626364656630313233343536373839616263646566",
+-  "nowMs": 1784808000000,
+-  "claims": {
+-    "v": 1,
+-    "iss": "quackback",
+-    "aud": "quackback-evidence-browser",
+-    "scope": "evidence:attach",
+-    "tenantRef": "workspace_12345678",
+-    "subjectRef": "principal_12345678",
+-    "reportId": "brp_11111111-1111-4111-8111-111111111111",
+-    "issuanceRef": "qbi_33333333333333333333333333333333",
+-    "jti": "33333333-3333-4333-8333-333333333333",
+-    "iat": 1784808000,
+-    "exp": 1784808300,
+-    "allowedKinds": [
+-      "screenshot",
+-      "screen_recording"
+-    ]
+-  },
+-  "token": "qbe1.eyJ2IjoxLCJpc3MiOiJxdWFja2JhY2siLCJhdWQiOiJxdWFja2JhY2stZXZpZGVuY2UtYnJvd3NlciIsInNjb3BlIjoiZXZpZGVuY2U6YXR0YWNoIiwidGVuYW50UmVmIjoid29ya3NwYWNlXzEyMzQ1Njc4Iiwic3ViamVjdFJlZiI6InByaW5jaXBhbF8xMjM0NTY3OCIsInJlcG9ydElkIjoiYnJwXzExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMSIsImlzc3VhbmNlUmVmIjoicWJpXzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzIiwianRpIjoiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzIiwiaWF0IjoxNzg0ODA4MDAwLCJleHAiOjE3ODQ4MDgzMDAsImFsbG93ZWRLaW5kcyI6WyJzY3JlZW5zaG90Iiwic2NyZWVuX3JlY29yZGluZyJdfQ.MJi9skv7qB6lc4lEYBKf_femsGmJRBhweI1uR9MVVww"
+-}
+diff --git a/apps/web/src/lib/server/evidence/__tests__/qbe1.test.ts b/apps/web/src/lib/server/evidence/__tests__/qbe1.test.ts
+deleted file mode 100644
+index ccfd1650a14cecf60ea67c1a4c596608d8a8ee0b..0000000000000000000000000000000000000000
+--- a/apps/web/src/lib/server/evidence/__tests__/qbe1.test.ts
++++ /dev/null
+@@ -1,208 +0,0 @@
+-import { createHmac } from 'node:crypto'
+-import { describe, expect, it, vi } from 'vitest'
+-import golden from './qbe1-golden-v1.json'
+-import {
+-  canonicalKinds,
+-  evidenceServerConfig,
+-  mintEvidenceCapability,
+-  readPrivateEvidence,
+-  verifiedPrivateEvidence,
+-  verifyEvidenceCapability,
+-  type EvidenceBinding,
+-} from '../qbe1'
+-
+-const key = Buffer.from(golden.testOnlySigningKeyHex, 'hex')
+-const binding: EvidenceBinding = { audience: 'quackback-evidence', ...golden.claims }
+-const id = 'qbe_11111111-1111-4111-8111-111111111111'
+-const now = golden.nowMs
+-function projection() {
+-  return {
+-    schemaVersion: 1,
+-    evidenceId: id,
+-    kind: 'screenshot',
+-    status: 'uploaded',
+-    outcome: null,
+-    reasonCode: null,
+-    createdAt: new Date(now).toISOString(),
+-    expiresAt: new Date(now + 86400000).toISOString(),
+-    rawDeleteBy: new Date(now + 86400000).toISOString(),
+-    revision: 4,
+-    sourceRevision: 2,
+-    processingRevision: 4,
+-    processingStatus: 'ready',
+-    processingReasonCode: null,
+-    sanitizedDerivativeExpiresAt: new Date(now + 30 * 86400000).toISOString(),
+-    processingRequired: false,
+-    sanitizedDerivativeAvailable: true,
+-    textReportMaySubmit: true,
+-    deletionPending: false,
+-    idempotentReplay: false,
+-    upload: null,
+-  }
+-}
+-function signed(value: unknown) {
+-  const p = Buffer.from(typeof value === 'string' ? value : JSON.stringify(value)).toString(
+-    'base64url'
+-  )
+-  return `qbe1.${p}.${createHmac('sha256', key).update(`qbe1.${p}`).digest('base64url')}`
+-}
+-describe('approved qbe1 wire semantics', () => {
+-  it('matches the existing tracked broker golden byte for byte', () => {
+-    const minted = mintEvidenceCapability(
+-      binding,
+-      ['screenshot', 'screen_recording'],
+-      key,
+-      'browser_attach',
+-      now,
+-      () => golden.claims.jti
+-    )
+-    expect(minted.capability).toBe(golden.token)
+-    expect(verifyEvidenceCapability(golden.token, key, now)).toEqual(golden.claims)
+-  })
+-  it.each(['browser_attach', 'browser_cleanup', 'server_read'] as const)(
+-    'issues a route-limited %s grant',
+-    (purpose) => {
+-      const cap = mintEvidenceCapability(binding, ['screenshot'], key, purpose, now)
+-      expect(verifyEvidenceCapability(cap.capability, key, now)).toEqual(cap.claims)
+-      expect(verifyEvidenceCapability(cap.capability, key, now + 300000)).toBeNull()
+-      expect(cap.claims.exp - cap.claims.iat).toBe(300)
+-    }
+-  )
+-  it.each([
+-    { ...golden.claims, tenantRef: 12345678 },
+-    { ...golden.claims, subjectRef: null },
+-    { ...golden.claims, allowedKinds: ['video', 'screenshot'] },
+-    { ...golden.claims, allowedKinds: ['screenshot', 'screenshot'] },
+-    { ...golden.claims, aud: 'quackback-evidence-server' },
+-    { ...golden.claims, exp: golden.claims.iat + 301 },
+-    { ...golden.claims, extra: 'forbidden' },
+-    { ...golden.claims, issuanceRef: 'qbc_' + 'a'.repeat(32) },
+-  ])('denies malformed or broadened claims %#', (claims) =>
+-    expect(verifyEvidenceCapability(signed(claims), key, now)).toBeNull()
+-  )
+-  it('rejects altered signatures and duplicate keys', () => {
+-    expect(verifyEvidenceCapability(golden.token.slice(0, -1) + 'A', key, now)).toBeNull()
+-    expect(
+-      verifyEvidenceCapability(
+-        signed(JSON.stringify(golden.claims).replace('"v":1', '"v":1,"v":1')),
+-        key,
+-        now
+-      )
+-    ).toBeNull()
+-  })
+-  it('keeps domains isolated and denies unsafe origins', () => {
+-    const a = evidenceServerConfig(
+-      { EVIDENCE_BROKER_URL: 'https://broker.example' },
+-      'a'.repeat(32)
+-    )!
+-    expect(a.signingKey).toHaveLength(32)
+-    expect(a.signingKey.equals(Buffer.from('a'.repeat(32)))).toBe(false)
+-    for (const origin of [
+-      'http://broker.example',
+-      'https://broker.example/path',
+-      'https://user:pass@broker.example',
+-      'https://broker.example/?x=1',
+-    ]) {
+-      expect(evidenceServerConfig({ EVIDENCE_BROKER_URL: origin }, 'a'.repeat(32))).toBeNull()
+-    }
+-    expect(canonicalKinds([])).toBe(false)
+-  })
+-})
+-describe('private scan and lifecycle boundary', () => {
+-  it('projects only scan-ready opaque metadata', () => {
+-    expect(verifiedPrivateEvidence(projection(), id, ['screenshot'], now)).toEqual({
+-      evidenceId: id,
+-      revision: 4,
+-      status: 'ready',
+-      expiresAt: new Date(now + 30 * 86400000).toISOString(),
+-    })
+-  })
+-  it.each([
+-    { processingStatus: 'processing' },
+-    { sanitizedDerivativeAvailable: false },
+-    { deletionPending: true },
+-    { outcome: 'discarded' },
+-    { processingReasonCode: 'SCAN_FAILED' },
+-    { upload: { url: 'https://public.example' } },
+-    { url: 'https://public.example' },
+-    { revision: 99 },
+-    { sourceRevision: 4 },
+-    { sanitizedDerivativeExpiresAt: new Date(now + 31 * 86400000).toISOString() },
+-  ])('denies incomplete, failed, purged, or public projection %#', (changes) => {
+-    expect(
+-      verifiedPrivateEvidence({ ...projection(), ...changes }, id, ['screenshot'], now)
+-    ).toBeNull()
+-  })
+-  it('denies ownership ID, kind, and raw expiry mismatch on initial bind', () => {
+-    expect(
+-      verifiedPrivateEvidence(projection(), id.replace('11111111', '22222222'), ['screenshot'], now)
+-    ).toBeNull()
+-    expect(verifiedPrivateEvidence(projection(), id, ['video'], now)).toBeNull()
+-    expect(verifiedPrivateEvidence(projection(), id, ['screenshot'], now + 86400000)).toBeNull()
+-  })
+-  it('retains established sanitized metadata through exact day30 after raw expiry/purge, never discard', () => {
+-    const expired = {
+-      ...projection(),
+-      status: 'expired',
+-      outcome: 'expired',
+-      reasonCode: 'ABSOLUTE_TTL_EXPIRED',
+-      deletionPending: true,
+-      sourceRevision: 3,
+-      revision: 5,
+-    }
+-    expect(
+-      verifiedPrivateEvidence(expired, id, ['screenshot'], now + 86400001, 'read')
+-    ).not.toBeNull()
+-    const deleted = {
+-      ...expired,
+-      status: 'deleted',
+-      deletionPending: false,
+-      sourceRevision: 4,
+-      revision: 6,
+-    }
+-    expect(
+-      verifiedPrivateEvidence(deleted, id, ['screenshot'], now + 29 * 86400000, 'read')
+-    ).not.toBeNull()
+-    expect(
+-      verifiedPrivateEvidence(deleted, id, ['screenshot'], now + 30 * 86400000, 'read')
+-    ).toBeNull()
+-    expect(
+-      verifiedPrivateEvidence(
+-        { ...deleted, outcome: 'discarded', reasonCode: 'REPORTER_DISCARDED' },
+-        id,
+-        ['screenshot'],
+-        now + 86400001,
+-        'read'
+-      )
+-    ).toBeNull()
+-  })
+-  it('uses only server-read grant, omits cookies, forbids redirects, and fails all on partial read', async () => {
+-    vi.spyOn(Date, 'now').mockReturnValue(now)
+-    const fetcher = vi.fn().mockResolvedValue(Response.json(projection()))
+-    const server = { brokerOrigin: 'https://broker.example', signingKey: key }
+-    await expect(
+-      readPrivateEvidence(binding, [id], ['screenshot'], server, fetcher)
+-    ).resolves.toHaveLength(1)
+-    const [url, options] = fetcher.mock.calls[0]
+-    expect(url).toBe(`https://broker.example/v1/evidence/${id}`)
+-    expect(options).toMatchObject({
+-      method: 'GET',
+-      credentials: 'omit',
+-      cache: 'no-store',
+-      redirect: 'error',
+-    })
+-    expect(verifyEvidenceCapability(options.headers.Authorization.slice(7), key, now)?.scope).toBe(
+-      'evidence:read'
+-    )
+-    fetcher.mockResolvedValueOnce(
+-      Response.json({ ...projection(), processingStatus: 'processing' })
+-    )
+-    await expect(
+-      readPrivateEvidence(binding, [id], ['screenshot'], server, fetcher)
+-    ).rejects.toThrow('EVIDENCE_NOT_READY')
+-    await expect(
+-      readPrivateEvidence(binding, [id, id], ['screenshot'], server, fetcher)
+-    ).rejects.toThrow('EVIDENCE_INVALID_HANDLES')
+-    vi.restoreAllMocks()
+-  })
+-})
+diff --git a/apps/web/src/lib/server/evidence/native.ts b/apps/web/src/lib/server/evidence/native.ts
+deleted file mode 100644
+index 2a7ad71c3cbc4b84b6226ddaae26f0fa0e7aecad..0000000000000000000000000000000000000000
+--- a/apps/web/src/lib/server/evidence/native.ts
++++ /dev/null
+@@ -1,717 +0,0 @@
+-import { randomUUID } from 'node:crypto'
+-import { getRequestHeaders } from '@tanstack/react-start/server'
+-import { isValidTypeId, type TicketId } from '@quackback/ids'
+-import {
+-  db,
+-  sql,
+-  eq,
+-  and,
+-  gt,
+-  isNull,
+-  inArray,
+-  session,
+-  principal,
+-  tickets,
+-  widgetIdentifiedSession,
+-  type Transaction,
+-} from '@/lib/server/db'
+-import type { AuthContext } from '@/lib/server/functions/auth-helpers'
+-import { rawSessionToken } from '@/lib/server/auth/session-token'
+-import { config } from '@/lib/server/config'
+-import {
+-  canonicalKinds,
+-  evidenceServerConfig,
+-  mintEvidenceCapability,
+-  readPrivateEvidence,
+-  nativeEvidenceBindingCommand,
+-  deleteBoundPrivateEvidence,
+-  transitionPrivateEvidenceBinding,
+-  verifyEvidenceCapability,
+-  REPORT_ID,
+-  validBinding,
+-  type EvidenceBinding,
+-  type EvidenceClaims,
+-  type EvidenceKind,
+-} from './qbe1'
+-
+-interface ReportRow {
+-  report_id: string
+-  issuance_ref: string
+-  principal_id: string
+-  tenant_ref: string
+-  session_id: string
+-  allowed_kinds: EvidenceKind[]
+-  submission_id: string | null
+-  body_digest: string | null
+-  ticket_id: string | null
+-  evidence_ids: string[] | null
+-}
+-
+-function gates(env = process.env): readonly EvidenceKind[] {
+-  if (env.NATIVE_WIDGET_PRIVATE_EVIDENCE !== 'true') return []
+-  return [
+-    'screenshot',
+-    ...(env.NATIVE_WIDGET_SCREEN_RECORDING === 'true' ? ['screen_recording' as const] : []),
+-    ...(env.NATIVE_WIDGET_BROAD_MEDIA_UPLOAD === 'true'
+-      ? ['image' as const, 'animated_image' as const, 'video' as const]
+-      : []),
+-  ]
+-}
+-
+-function serverConfig() {
+-  const result = evidenceServerConfig(process.env, config.secretKey)
+-  if (!result) throw new Error('EVIDENCE_UNAVAILABLE')
+-  return result
+-}
+-
+-function binding(row: ReportRow): EvidenceBinding {
+-  const b: EvidenceBinding = {
+-    audience: 'quackback-evidence',
+-    issuanceRef: row.issuance_ref,
+-    reportId: row.report_id,
+-    subjectRef: row.principal_id,
+-    tenantRef: row.tenant_ref,
+-  }
+-  if (!validBinding(b) || !canonicalKinds(row.allowed_kinds)) throw new Error('EVIDENCE_DENIED')
+-  return b
+-}
+-
+-async function requireIdentifiedSession(ctx: AuthContext, tx: Transaction) {
+-  if (ctx.scope !== 'widget' || ctx.principal.type !== 'user' || ctx.principal.role !== 'user')
+-    throw new Error('EVIDENCE_DENIED')
+-  const bearer = getRequestHeaders().get('authorization')
+-  if (!bearer?.startsWith('Bearer ') || bearer.length > 4096) throw new Error('EVIDENCE_DENIED')
+-  const active = await tx
+-    .select({ id: session.id })
+-    .from(session)
+-    .where(
+-      and(
+-        eq(session.token, rawSessionToken(bearer.slice(7))),
+-        eq(session.userId, ctx.user.id),
+-        gt(session.expiresAt, new Date()),
+-        inArray(session.scope, ['widget', 'portal'])
+-      )
+-    )
+-    .for('update')
+-    .limit(1)
+-  if (!active[0]) throw new Error('EVIDENCE_DENIED')
+-  const nativeBound = await tx.execute(sql`SELECT session_id FROM ipc_native_session_binding
+-    WHERE session_id = ${active[0].id} AND principal_id = ${ctx.principal.id}
+-      AND audience = ${new URL(config.baseUrl).origin} FOR UPDATE`)
+-  if (nativeBound.length !== 1) throw new Error('EVIDENCE_DENIED')
+-  const identified = await tx
+-    .select({ verified: widgetIdentifiedSession.hmacVerified })
+-    .from(widgetIdentifiedSession)
+-    .where(eq(widgetIdentifiedSession.sessionId, active[0].id))
+-    .for('update')
+-    .limit(1)
+-  const owner = await tx
+-    .select({ id: principal.id })
+-    .from(principal)
+-    .where(
+-      and(
+-        eq(principal.id, ctx.principal.id),
+-        eq(principal.userId, ctx.user.id),
+-        eq(principal.type, 'user'),
+-        eq(principal.role, 'user')
+-      )
+-    )
+-    .for('update')
+-    .limit(1)
+-  if (!identified[0]?.verified || !owner[0]) throw new Error('EVIDENCE_DENIED')
+-  return active[0].id
+-}
+-
+-async function lockReport(tx: Transaction, reportId: string): Promise<ReportRow | null> {
+-  if (!REPORT_ID.test(reportId)) throw new Error('EVIDENCE_INVALID_REPORT')
+-  await tx.execute(
+-    sql`SELECT pg_advisory_xact_lock(hashtextextended(${`ipc-evidence:${reportId}`}, 0))`
+-  )
+-  const rows = await tx.execute(
+-    sql`SELECT * FROM ipc_native_evidence_report WHERE report_id = ${reportId} FOR UPDATE`
+-  )
+-  return (rows[0] as unknown as ReportRow) ?? null
+-}
+-
+-function assertOwner(
+-  row: ReportRow | null,
+-  ctx: AuthContext,
+-  sessionId: string
+-): asserts row is ReportRow {
+-  if (
+-    !row ||
+-    row.principal_id !== ctx.principal.id ||
+-    row.tenant_ref !== ctx.settings.id ||
+-    row.session_id !== sessionId
+-  )
+-    throw new Error('EVIDENCE_DENIED')
+-}
+-
+-export async function runIssueNativeEvidenceCapability(
+-  ctx: AuthContext,
+-  input: { reportId: string }
+-) {
+-  const server = serverConfig()
+-  const allowedKinds = gates()
+-  if (!canonicalKinds(allowedKinds)) throw new Error('EVIDENCE_DISABLED')
+-  return db.transaction(async (tx) => {
+-    const sessionId = await requireIdentifiedSession(ctx, tx)
+-    let row = await lockReport(tx, input.reportId)
+-    if (!row) {
+-      const issuanceRef = `qbi_${randomUUID().replaceAll('-', '')}`
+-      await tx.execute(sql`INSERT INTO ipc_native_evidence_report
+-        (report_id, issuance_ref, principal_id, tenant_ref, session_id, allowed_kinds)
+-        VALUES (${input.reportId}, ${issuanceRef}, ${ctx.principal.id}, ${ctx.settings.id}, ${sessionId}, ${JSON.stringify(allowedKinds)}::jsonb)`)
+-      row = await lockReport(tx, input.reportId)
+-    }
+-    assertOwner(row, ctx, sessionId)
+-    if (row.ticket_id !== null) throw new Error('EVIDENCE_REPORT_ALREADY_BOUND')
+-    const b = binding(row)
+-    const effective = row.allowed_kinds.filter((kind) => allowedKinds.includes(kind))
+-    if (!canonicalKinds(effective)) throw new Error('EVIDENCE_DISABLED')
+-    const attach = mintEvidenceCapability(b, effective, server.signingKey, 'browser_attach')
+-    const cleanup = mintEvidenceCapability(
+-      b,
+-      row.allowed_kinds,
+-      server.signingKey,
+-      'browser_cleanup'
+-    )
+-    return {
+-      reportId: input.reportId,
+-      binding: b,
+-      brokerOrigin: server.brokerOrigin,
+-      allowedKinds: effective,
+-      attachToken: attach.capability,
+-      cleanupToken: cleanup.capability,
+-      expiresAt: attach.expiresAt,
+-    }
+-  })
+-}
+-
+-export interface NativeEvidenceBind {
+-  reportId: string
+-  submissionId: string
+-  ticketId: string
+-  evidenceIds: string[]
+-}
+-
+-export async function runBindNativeEvidence(ctx: AuthContext, input: NativeEvidenceBind) {
+-  const server = serverConfig()
+-  if (
+-    !isValidTypeId(input.ticketId, 'ticket') ||
+-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+-      input.submissionId
+-    )
+-  )
+-    throw new Error('EVIDENCE_SUBMISSION_DENIED')
+-  if (
+-    input.evidenceIds.length < 1 ||
+-    input.evidenceIds.length > 5 ||
+-    new Set(input.evidenceIds).size !== input.evidenceIds.length
+-  )
+-    throw new Error('EVIDENCE_INVALID_HANDLES')
+-  async function locked(tx: Transaction) {
+-    const sessionId = await requireIdentifiedSession(ctx, tx)
+-    const row = await lockReport(tx, input.reportId)
+-    assertOwner(row, ctx, sessionId)
+-    await tx.execute(
+-      sql`SELECT pg_advisory_xact_lock(hashtextextended(${`ipc-native:${ctx.principal.id}:${input.submissionId}`}, 0))`
+-    )
+-    const mapped = await tx.execute(sql`SELECT ticket_id, body_digest FROM ipc_native_submission
+-      WHERE principal_id = ${ctx.principal.id} AND submission_id = ${input.submissionId} FOR UPDATE`)
+-    const submission = mapped[0]
+-    if (
+-      !submission ||
+-      submission.ticket_id !== input.ticketId ||
+-      typeof submission.body_digest !== 'string' ||
+-      !/^[0-9a-f]{64}$/.test(submission.body_digest)
+-    )
+-      throw new Error('EVIDENCE_SUBMISSION_DENIED')
+-    const own = await tx
+-      .select({ id: tickets.id })
+-      .from(tickets)
+-      .where(
+-        and(
+-          eq(tickets.id, input.ticketId as TicketId),
+-          eq(tickets.requesterPrincipalId, ctx.principal.id),
+-          eq(tickets.type, 'customer'),
+-          isNull(tickets.deletedAt)
+-        )
+-      )
+-      .for('update')
+-      .limit(1)
+-    if (!own[0]) throw new Error('EVIDENCE_DENIED')
+-    if (
+-      row.ticket_id !== null &&
+-      (row.ticket_id !== input.ticketId ||
+-        row.submission_id !== input.submissionId ||
+-        row.body_digest !== submission.body_digest ||
+-        JSON.stringify(row.evidence_ids) !== JSON.stringify([...input.evidenceIds].sort()))
+-    )
+-      throw new Error('EVIDENCE_BINDING_CONFLICT')
+-    const allowed = row.allowed_kinds.filter((kind) => gates().includes(kind))
+-    if (!canonicalKinds(allowed)) throw new Error('EVIDENCE_DISABLED')
+-    const tuple = nativeEvidenceBindingCommand(binding(row), {
+-      ...input,
+-      bodyDigest: submission.body_digest as string,
+-    })
+-    await tx.execute(sql`INSERT INTO ipc_native_evidence_binding(report_id,binding_ref,tuple_json,phase)
+-      VALUES(${input.reportId},${tuple.command.bindingRef},${tuple.tupleJson},'preparing') ON CONFLICT(report_id) DO NOTHING`)
+-    const states = await tx.execute(
+-      sql`SELECT * FROM ipc_native_evidence_binding WHERE report_id=${input.reportId} FOR UPDATE`
+-    )
+-    const state = states[0]
+-    if (
+-      !state ||
+-      state.binding_ref !== tuple.command.bindingRef ||
+-      state.tuple_json !== tuple.tupleJson ||
+-      !['preparing', 'committed', 'confirmed'].includes(state.phase as string)
+-    )
+-      throw new Error('EVIDENCE_BINDING_CONFLICT')
+-    return { row, allowed, tuple, state }
+-  }
+-  // Commit durable preparing authority before the broker introspects a grant.
+-  // A failed/unknown request leaves a bounded hold; exact retry recovers it.
+-  const prepared = await db.transaction(locked)
+-  await transitionPrivateEvidenceBinding(
+-    binding(prepared.row),
+-    prepared.tuple.command,
+-    prepared.allowed,
+-    server,
+-    'prepare'
+-  )
+-  await db.transaction(async (tx) => {
+-    const current = await locked(tx)
+-    await readPrivateEvidence(
+-      binding(current.row),
+-      input.evidenceIds,
+-      current.allowed,
+-      server,
+-      fetch,
+-      current.state.phase === 'preparing' ? 'bind' : 'read'
+-    )
+-    if (current.row.ticket_id === null)
+-      await tx.execute(sql`UPDATE ipc_native_evidence_report
+-        SET submission_id=${input.submissionId},body_digest=${current.tuple.command.bodyDigest},
+-        ticket_id=${input.ticketId},evidence_ids=${JSON.stringify(current.tuple.command.evidenceIds)}::jsonb
+-        WHERE report_id=${input.reportId}`)
+-    await tx.execute(sql`UPDATE ipc_native_evidence_binding SET phase='committed'
+-      WHERE report_id=${input.reportId} AND phase='preparing'`)
+-  })
+-  // Never release on a SQL exception: its commit state can be ambiguous.
+-  await transitionPrivateEvidenceBinding(
+-    binding(prepared.row),
+-    prepared.tuple.command,
+-    prepared.allowed,
+-    server,
+-    'commit'
+-  )
+-  return db.transaction(async (tx) => {
+-    const current = await locked(tx)
+-    if (!['committed', 'confirmed'].includes(current.state.phase as string))
+-      throw new Error('EVIDENCE_BINDING_UNAVAILABLE')
+-    await tx.execute(sql`UPDATE ipc_native_evidence_binding SET phase='confirmed'
+-      WHERE report_id=${input.reportId} AND phase='committed'`)
+-    const evidence = await readPrivateEvidence(
+-      binding(current.row),
+-      input.evidenceIds,
+-      current.allowed,
+-      server,
+-      fetch,
+-      'read'
+-    )
+-    return { ticketId: input.ticketId, reportId: input.reportId, evidence }
+-  })
+-}
+-
+-/** Explicit abort requires durable native absence. Unknown SQL commit is never an abort signal. */
+-export async function runAbortNativeEvidenceBinding(ctx: AuthContext, input: { reportId: string }) {
+-  const server = serverConfig()
+-  const stopped = await db.transaction(async (tx) => {
+-    const sessionId = await requireIdentifiedSession(ctx, tx)
+-    const row = await lockReport(tx, input.reportId)
+-    assertOwner(row, ctx, sessionId)
+-    const states = await tx.execute(
+-      sql`SELECT * FROM ipc_native_evidence_binding WHERE report_id=${input.reportId}`
+-    )
+-    const state = states[0]
+-    if (
+-      !state ||
+-      row.ticket_id !== null ||
+-      !['preparing', 'aborted'].includes(state.phase as string)
+-    )
+-      throw new Error('EVIDENCE_BINDING_CONFLICT')
+-    const tuple = JSON.parse(state.tuple_json as string)
+-    await tx.execute(
+-      sql`SELECT pg_advisory_xact_lock(hashtextextended(${`ipc-native:${ctx.principal.id}:${tuple.submissionId}`},0))`
+-    )
+-    const canonical = nativeEvidenceBindingCommand(binding(row), tuple)
+-    if (
+-      canonical.tupleJson !== state.tuple_json ||
+-      canonical.command.bindingRef !== state.binding_ref
+-    )
+-      throw new Error('EVIDENCE_BINDING_CONFLICT')
+-    await tx.execute(
+-      sql`UPDATE ipc_native_evidence_binding SET phase='aborted' WHERE report_id=${input.reportId} AND phase='preparing'`
+-    )
+-    return { row, command: canonical.command }
+-  })
+-  await transitionPrivateEvidenceBinding(
+-    binding(stopped.row),
+-    stopped.command,
+-    stopped.row.allowed_kinds,
+-    server,
+-    'abort'
+-  )
+-  return { reportId: input.reportId, aborted: true }
+-}
+-
+-async function requireConfirmedBinding(tx: Transaction, row: ReportRow) {
+-  const deletion = await tx.execute(sql`SELECT phase FROM ipc_native_evidence_deletion WHERE report_id=${row.report_id}`)
+-  if (deletion.length) throw new Error('EVIDENCE_DELETED')
+-  const states = await tx.execute(sql`SELECT phase FROM ipc_native_evidence_binding
+-    WHERE report_id=${row.report_id} AND phase='confirmed' FOR UPDATE`)
+-  if (states.length !== 1) throw new Error('EVIDENCE_BINDING_UNAVAILABLE')
+-}
+-
+-/** Delete the exact committed attachment set while retaining its customer Ticket. */
+-export async function runDeleteNativeEvidence(ctx: AuthContext, input: {ticketId:string}) {
+-  const server = serverConfig()
+-  if (!isValidTypeId(input.ticketId,'ticket')) throw new Error('EVIDENCE_DENIED')
+-  async function locked(tx:Transaction) {
+-    await requireIdentifiedSession(ctx,tx)
+-    const rows = await tx.execute(sql`SELECT * FROM ipc_native_evidence_report
+-      WHERE ticket_id=${input.ticketId} AND principal_id=${ctx.principal.id} AND tenant_ref=${ctx.settings.id} FOR UPDATE`)
+-    const row = rows[0] as unknown as ReportRow | undefined
+-    const own = await tx.select({id:tickets.id}).from(tickets).where(and(
+-      eq(tickets.id,input.ticketId as TicketId),eq(tickets.requesterPrincipalId,ctx.principal.id),
+-      eq(tickets.type,'customer'),isNull(tickets.deletedAt))).for('update').limit(1)
+-    if (rows.length !== 1 || !row || !own[0] || row.ticket_id !== input.ticketId ||
+-      row.principal_id !== ctx.principal.id || row.tenant_ref !== ctx.settings.id ||
+-      !row.submission_id || !row.body_digest || !row.evidence_ids?.length) throw new Error('EVIDENCE_DENIED')
+-    const state = (await tx.execute(sql`SELECT * FROM ipc_native_evidence_binding WHERE report_id=${row.report_id} FOR UPDATE`))[0]
+-    const tuple = nativeEvidenceBindingCommand(binding(row),{reportId:row.report_id,ticketId:row.ticket_id,
+-      submissionId:row.submission_id,bodyDigest:row.body_digest,evidenceIds:row.evidence_ids})
+-    if (!state || state.phase !== 'confirmed' || state.binding_ref !== tuple.command.bindingRef ||
+-      state.tuple_json !== tuple.tupleJson) throw new Error('EVIDENCE_BINDING_CONFLICT')
+-    await tx.execute(sql`INSERT INTO ipc_native_evidence_deletion(report_id,binding_ref,phase)
+-      VALUES(${row.report_id},${tuple.command.bindingRef},'deleting') ON CONFLICT(report_id) DO NOTHING`)
+-    const deletion = (await tx.execute(sql`SELECT * FROM ipc_native_evidence_deletion WHERE report_id=${row.report_id} FOR UPDATE`))[0]
+-    if (!deletion || deletion.binding_ref !== tuple.command.bindingRef || !['deleting','deleted'].includes(deletion.phase as string))
+-      throw new Error('EVIDENCE_BINDING_CONFLICT')
+-    return {row,tuple,deletion}
+-  }
+-  // This commit precedes every remote request and fences metadata, old read
+-  // grants and every ongoing native stream pull. Unknown outcomes never undo it.
+-  const selected = await db.transaction(locked)
+-  if (selected.deletion.phase !== 'deleted') {
+-    await deleteBoundPrivateEvidence(binding(selected.row),selected.tuple.command,selected.row.allowed_kinds,server)
+-    await db.transaction(async tx => {
+-      const current = await locked(tx)
+-      await tx.execute(sql`UPDATE ipc_native_evidence_deletion SET phase='deleted',completed_at=now()
+-        WHERE report_id=${current.row.report_id} AND phase='deleting'`)
+-    })
+-  }
+-  return {ticketId:input.ticketId,deleted:true}
+-}
+-
+-export async function runReadNativeEvidence(ctx: AuthContext, input: { ticketId: string }) {
+-  const server = serverConfig()
+-  if (!isValidTypeId(input.ticketId, 'ticket')) throw new Error('EVIDENCE_DENIED')
+-  return db.transaction(async (tx) => {
+-    await requireIdentifiedSession(ctx, tx)
+-    // Match bind's report-before-ticket lock order, including reads by a new
+-    // native session for the same principal. Avoid cross-session deadlocks.
+-    const rows = await tx.execute(sql`SELECT * FROM ipc_native_evidence_report
+-      WHERE ticket_id = ${input.ticketId} AND principal_id = ${ctx.principal.id} AND tenant_ref = ${ctx.settings.id} FOR UPDATE`)
+-    const own = await tx
+-      .select({ id: tickets.id })
+-      .from(tickets)
+-      .where(
+-        and(
+-          eq(tickets.id, input.ticketId as TicketId),
+-          eq(tickets.requesterPrincipalId, ctx.principal.id),
+-          eq(tickets.type, 'customer'),
+-          isNull(tickets.deletedAt)
+-        )
+-      )
+-      .for('update')
+-      .limit(1)
+-    if (!own[0]) throw new Error('EVIDENCE_DENIED')
+-    if (rows.length === 0) return { ticketId: input.ticketId, reports: [] }
+-    const reports = await Promise.all(
+-      rows.map(async (raw) => {
+-        const row = raw as unknown as ReportRow
+-        await requireConfirmedBinding(tx, row)
+-        const evidence = await readPrivateEvidence(
+-          binding(row),
+-          row.evidence_ids ?? [],
+-          row.allowed_kinds,
+-          server,
+-          fetch,
+-          'read'
+-        )
+-        return { reportId: row.report_id, evidence }
+-      })
+-    )
+-    return { ticketId: input.ticketId, reports }
+-  })
+-}
+-
+-/** Broker-only, value-only claims. Browser attach remains revocable per session. */
+-export async function introspectNativeEvidenceCapability(
+-  token: string
+-): Promise<EvidenceClaims | null> {
+-  const claims = verifyEvidenceCapability(token, serverConfig().signingKey)
+-  if (!claims) return null
+-  const rows = await db.execute(
+-    sql`SELECT * FROM ipc_native_evidence_report WHERE report_id = ${claims.reportId}`
+-  )
+-  const row = rows[0] as unknown as ReportRow | undefined
+-  if (
+-    !row ||
+-    row.issuance_ref !== claims.issuanceRef ||
+-    row.principal_id !== claims.subjectRef ||
+-    row.tenant_ref !== claims.tenantRef ||
+-    !canonicalKinds(row.allowed_kinds) ||
+-    claims.allowedKinds.some((k) => !row.allowed_kinds.includes(k))
+-  )
+-    return null
+-  // Binding is authoritative even when the host lost the ACK. A browser
+-  // cleanup grant must never remove media that now belongs to a native Ticket.
+-  const deletion = await db.execute(sql`SELECT binding_ref,phase FROM ipc_native_evidence_deletion WHERE report_id=${claims.reportId}`)
+-  if (claims.scope === 'evidence:bound-delete') {
+-    return row.ticket_id !== null && deletion.length === 1 && deletion[0].binding_ref === claims.jti &&
+-      ['deleting','deleted'].includes(deletion[0].phase as string) ? claims : null
+-  }
+-  if (deletion.length) return null
+-  if (claims.scope.startsWith('evidence:bind-')) {
+-    const states = await db.execute(
+-      sql`SELECT binding_ref,phase FROM ipc_native_evidence_binding WHERE report_id=${claims.reportId}`
+-    )
+-    const state = states[0]
+-    const phases =
+-      claims.scope === 'evidence:bind-prepare'
+-        ? ['preparing', 'committed', 'confirmed']
+-        : claims.scope === 'evidence:bind-commit'
+-          ? ['committed', 'confirmed']
+-          : ['aborted']
+-    return state?.binding_ref === claims.jti && phases.includes(state.phase as string)
+-      ? claims
+-      : null
+-  }
+-  if (claims.scope === 'evidence:discard' && row.ticket_id !== null) return null
+-  if (claims.scope !== 'evidence:attach') return claims
+-  if (row.ticket_id !== null) return null
+-  const active = await db
+-    .select({ userId: session.userId })
+-    .from(session)
+-    .where(
+-      and(
+-        eq(session.id, row.session_id),
+-        inArray(session.scope, ['widget', 'portal']),
+-        gt(session.expiresAt, new Date())
+-      )
+-    )
+-    .limit(1)
+-  if (!active[0]) return null
+-  const nativeBound = await db.execute(sql`SELECT session_id FROM ipc_native_session_binding
+-    WHERE session_id = ${row.session_id} AND principal_id = ${claims.subjectRef}
+-      AND audience = ${new URL(config.baseUrl).origin}`)
+-  if (nativeBound.length !== 1) return null
+-  const verified = await db
+-    .select({ verified: widgetIdentifiedSession.hmacVerified })
+-    .from(widgetIdentifiedSession)
+-    .where(eq(widgetIdentifiedSession.sessionId, row.session_id))
+-    .limit(1)
+-  const owner = await db
+-    .select({ id: principal.id })
+-    .from(principal)
+-    .where(
+-      and(
+-        eq(principal.id, claims.subjectRef as AuthContext['principal']['id']),
+-        eq(principal.userId, active[0].userId),
+-        eq(principal.type, 'user'),
+-        eq(principal.role, 'user')
+-      )
+-    )
+-    .limit(1)
+-  if (!verified[0]?.verified || !owner[0]) return null
+-  const allowedKinds = claims.allowedKinds.filter((kind) => gates().includes(kind))
+-  return canonicalKinds(allowedKinds) ? { ...claims, allowedKinds } : null
+-}
+-
+-/** Native iframe reads bytes; broker read grants and storage coordinates stay server-only. */
+-export async function runOpenNativeEvidence(
+-  ctx: AuthContext,
+-  input: { ticketId: string; evidenceId: string },
+-  signal?: AbortSignal
+-): Promise<Response> {
+-  const server = serverConfig()
+-  if (
+-    !isValidTypeId(input.ticketId, 'ticket') ||
+-    !/^qbe_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+-      input.evidenceId
+-    )
+-  )
+-    throw new Error('EVIDENCE_DENIED')
+-  const selected = await db.transaction(async (tx) => {
+-    const sessionId = await requireIdentifiedSession(ctx, tx)
+-    const rows = await tx.execute(sql`SELECT * FROM ipc_native_evidence_report
+-      WHERE ticket_id = ${input.ticketId} AND principal_id = ${ctx.principal.id} AND tenant_ref = ${ctx.settings.id} FOR UPDATE`)
+-    const row = rows[0] as unknown as ReportRow | undefined
+-    const own = await tx
+-      .select({ id: tickets.id })
+-      .from(tickets)
+-      .where(
+-        and(
+-          eq(tickets.id, input.ticketId as TicketId),
+-          eq(tickets.requesterPrincipalId, ctx.principal.id),
+-          eq(tickets.type, 'customer'),
+-          isNull(tickets.deletedAt)
+-        )
+-      )
+-      .for('update')
+-      .limit(1)
+-    if (!own[0] || !row || !row.evidence_ids?.includes(input.evidenceId))
+-      throw new Error('EVIDENCE_DENIED')
+-    await requireConfirmedBinding(tx, row)
+-    return { sessionId, row }
+-  })
+-  const grant = mintEvidenceCapability(
+-    binding(selected.row),
+-    selected.row.allowed_kinds,
+-    server.signingKey,
+-    'server_read'
+-  )
+-  // Capture bound native workspace methods before response streaming exits the
+-  // request's AsyncLocalStorage scope. Never resolve another workspace in pull.
+-  const select = db.select,
+-    execute = db.execute
+-  const fence = async () => {
+-    const deletion = await execute(sql`SELECT phase FROM ipc_native_evidence_deletion WHERE report_id=${selected.row.report_id}`)
+-    if (deletion.length) throw new Error('EVIDENCE_DELETED')
+-    const live = await select({ id: session.id })
+-      .from(session)
+-      .innerJoin(widgetIdentifiedSession, eq(widgetIdentifiedSession.sessionId, session.id))
+-      .innerJoin(principal, eq(principal.userId, session.userId))
+-      .innerJoin(tickets, eq(tickets.requesterPrincipalId, principal.id))
+-      .where(
+-        and(
+-          eq(session.id, selected.sessionId),
+-          eq(session.userId, ctx.user.id),
+-          gt(session.expiresAt, new Date()),
+-          inArray(session.scope, ['widget', 'portal']),
+-          eq(widgetIdentifiedSession.hmacVerified, true),
+-          eq(principal.id, ctx.principal.id),
+-          eq(principal.type, 'user'),
+-          eq(principal.role, 'user'),
+-          eq(tickets.id, input.ticketId as TicketId),
+-          eq(tickets.type, 'customer'),
+-          isNull(tickets.deletedAt)
+-        )
+-      )
+-      .limit(1)
+-    const nativeBound = await execute(sql`SELECT session_id FROM ipc_native_session_binding
+-      WHERE session_id = ${selected.sessionId} AND principal_id = ${ctx.principal.id}
+-        AND audience = ${new URL(config.baseUrl).origin}`)
+-    if (!live[0] || nativeBound.length !== 1 || Date.now() >= grant.claims.exp * 1000)
+-      throw new Error('EVIDENCE_DENIED')
+-  }
+-  const abort = new AbortController()
+-  const timer = setTimeout(() => abort.abort(), 8000)
+-  let response: Response
+-  try {
+-    response = await fetch(`${server.brokerOrigin}/v1/evidence/${input.evidenceId}/derivative`, {
+-      method: 'GET',
+-      credentials: 'omit',
+-      cache: 'no-store',
+-      redirect: 'error',
+-      signal: abort.signal,
+-      headers: { Authorization: `Bearer ${grant.capability}` },
+-    })
+-  } catch {
+-    clearTimeout(timer)
+-    throw new Error('EVIDENCE_UNAVAILABLE')
+-  }
+-  clearTimeout(timer)
+-  const contentType = response.headers.get('content-type')
+-  const length = response.headers.get('content-length')
+-  if (
+-    response.status !== 200 ||
+-    !response.body ||
+-    !contentType ||
+-    !['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'video/mp4', 'video/webm'].includes(
+-      contentType
+-    ) ||
+-    !length ||
+-    !/^[1-9][0-9]*$/.test(length) ||
+-    Number(length) > 50 * 1024 * 1024 ||
+-    response.headers.has('content-range')
+-  ) {
+-    if (response.body) void response.body.cancel().catch(() => {})
+-    throw new Error('EVIDENCE_UNAVAILABLE')
+-  }
+-  try {
+-    await fence()
+-  } catch (caught) {
+-    void response.body.cancel().catch(() => {})
+-    throw caught
+-  }
+-  const reader = response.body.getReader()
+-  const stop = () => {
+-    abort.abort()
+-    void reader.cancel().catch(() => {})
+-  }
+-  signal?.addEventListener('abort', stop, { once: true })
+-  const deadline = setTimeout(stop, Math.max(1, grant.claims.exp * 1000 - Date.now()))
+-  const clear = () => {
+-    clearTimeout(deadline)
+-    signal?.removeEventListener('abort', stop)
+-  }
+-  if (signal?.aborted) stop()
+-  let delivered = 0
+-  const body = new ReadableStream<Uint8Array>(
+-    {
+-      async pull(controller) {
+-        try {
+-          await fence()
+-          const next = await reader.read()
+-          await fence()
+-          if (next.done) {
+-            if (delivered !== Number(length)) throw new Error('EVIDENCE_UNAVAILABLE')
+-            reader.releaseLock()
+-            clear()
+-            controller.close()
+-            return
+-          }
+-          if (!(next.value instanceof Uint8Array) || next.value.length > Number(length) - delivered)
+-            throw new Error('EVIDENCE_UNAVAILABLE')
+-          delivered += next.value.length
+-          controller.enqueue(next.value)
+-        } catch {
+-          clear()
+-          abort.abort()
+-          void reader.cancel().catch(() => {})
+-          controller.error(new Error('EVIDENCE_UNAVAILABLE'))
+-        }
+-      },
+-      cancel() {
+-        clear()
+-        abort.abort()
+-        void reader.cancel().catch(() => {})
+-      },
+-    },
+-    { highWaterMark: 0 }
+-  )
+-  return new Response(body, {
+-    headers: {
+-      'Content-Type': contentType,
+-      'Content-Length': length,
+-      'Cache-Control': 'no-store',
+-      'X-Content-Type-Options': 'nosniff',
+-      'Content-Disposition': 'inline; filename="private-evidence"',
+-      'Content-Security-Policy': "default-src 'none'; sandbox",
+-    },
+-  })
+-}
+diff --git a/apps/web/src/lib/server/evidence/qbe1.ts b/apps/web/src/lib/server/evidence/qbe1.ts
+deleted file mode 100644
+index 1a73d12d311b77e731ffbf58d17941df3e97e80d..0000000000000000000000000000000000000000
+--- a/apps/web/src/lib/server/evidence/qbe1.ts
++++ /dev/null
+@@ -1,504 +0,0 @@
+-import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+-
+-// Protocol preserved from the approved tracked ipc evidence patches. No Posts,
+-// old exchange receipt, or canary identity implementation is carried forward.
+-export const REPORT_ID =
+-  /^brp_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+-export const EVIDENCE_ID =
+-  /^qbe_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+-const ISSUANCE_REF = /^qbi_[0-9a-f]{32}$/
+-const OPAQUE_REF = /^[A-Za-z0-9_-]{8,128}$/
+-const KIND_ORDER = ['screenshot', 'screen_recording', 'image', 'animated_image', 'video'] as const
+-export type EvidenceKind = (typeof KIND_ORDER)[number]
+-export type EvidencePurpose =
+-  | 'browser_attach'
+-  | 'browser_cleanup'
+-  | 'server_read'
+-  | 'server_bind_prepare'
+-  | 'server_bind_commit'
+-  | 'server_bind_abort'
+-  | 'server_bound_delete'
+-const PURPOSE = {
+-  server_bound_delete: { aud: 'quackback-evidence-server-bound-delete', scope: 'evidence:bound-delete' },
+-  browser_attach: { aud: 'quackback-evidence-browser', scope: 'evidence:attach' },
+-  browser_cleanup: { aud: 'quackback-evidence-browser-cleanup', scope: 'evidence:discard' },
+-  server_read: { aud: 'quackback-evidence-server', scope: 'evidence:read' },
+-  server_bind_prepare: {
+-    aud: 'quackback-evidence-server-binding-prepare',
+-    scope: 'evidence:bind-prepare',
+-  },
+-  server_bind_commit: {
+-    aud: 'quackback-evidence-server-binding-commit',
+-    scope: 'evidence:bind-commit',
+-  },
+-  server_bind_abort: {
+-    aud: 'quackback-evidence-server-binding-abort',
+-    scope: 'evidence:bind-abort',
+-  },
+-} as const
+-export interface EvidenceBinding {
+-  audience: 'quackback-evidence'
+-  issuanceRef: string
+-  reportId: string
+-  subjectRef: string
+-  tenantRef: string
+-}
+-export interface EvidenceClaims {
+-  v: 1
+-  iss: 'quackback'
+-  aud: (typeof PURPOSE)[EvidencePurpose]['aud']
+-  scope: (typeof PURPOSE)[EvidencePurpose]['scope']
+-  tenantRef: string
+-  subjectRef: string
+-  reportId: string
+-  issuanceRef: string
+-  jti: string
+-  iat: number
+-  exp: number
+-  allowedKinds: readonly EvidenceKind[]
+-}
+-const CLAIM_KEYS = [
+-  'allowedKinds',
+-  'aud',
+-  'exp',
+-  'iat',
+-  'iss',
+-  'issuanceRef',
+-  'jti',
+-  'reportId',
+-  'scope',
+-  'subjectRef',
+-  'tenantRef',
+-  'v',
+-]
+-
+-export function canonicalKinds(value: unknown): value is readonly EvidenceKind[] {
+-  if (!Array.isArray(value) || value.length < 1 || value.length > KIND_ORDER.length) return false
+-  let previous = -1
+-  for (const kind of value) {
+-    const index = KIND_ORDER.indexOf(kind)
+-    if (index <= previous) return false
+-    previous = index
+-  }
+-  return true
+-}
+-
+-export function validBinding(value: EvidenceBinding): boolean {
+-  return (
+-    value.audience === 'quackback-evidence' &&
+-    typeof value.issuanceRef === 'string' &&
+-    ISSUANCE_REF.test(value.issuanceRef) &&
+-    typeof value.reportId === 'string' &&
+-    REPORT_ID.test(value.reportId) &&
+-    typeof value.subjectRef === 'string' &&
+-    OPAQUE_REF.test(value.subjectRef) &&
+-    typeof value.tenantRef === 'string' &&
+-    OPAQUE_REF.test(value.tenantRef)
+-  )
+-}
+-
+-export function evidenceServerConfig(env: Record<string, string | undefined>, appSecret: string) {
+-  if (!env.EVIDENCE_BROKER_URL || appSecret.length < 32) return null
+-  try {
+-    const url = new URL(env.EVIDENCE_BROKER_URL)
+-    const local =
+-      url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+-    if (
+-      (url.protocol !== 'https:' && !local) ||
+-      url.username ||
+-      url.password ||
+-      url.pathname !== '/' ||
+-      url.search ||
+-      url.hash
+-    )
+-      return null
+-    return {
+-      brokerOrigin: url.origin,
+-      signingKey: createHmac('sha256', appSecret)
+-        .update('iplaycafe/quackback-evidence-capability/qbe1/v1')
+-        .digest(),
+-    }
+-  } catch {
+-    return null
+-  }
+-}
+-
+-export function mintEvidenceCapability(
+-  binding: EvidenceBinding,
+-  allowedKinds: readonly EvidenceKind[],
+-  signingKey: Buffer,
+-  purpose: EvidencePurpose,
+-  nowMs = Date.now(),
+-  idFactory: () => string = randomUUID
+-) {
+-  const use = PURPOSE[purpose]
+-  const jti = idFactory()
+-  if (
+-    !validBinding(binding) ||
+-    !canonicalKinds(allowedKinds) ||
+-    signingKey.byteLength !== 32 ||
+-    !Number.isSafeInteger(nowMs) ||
+-    nowMs < 0 ||
+-    !use ||
+-    !OPAQUE_REF.test(jti)
+-  ) {
+-    throw new Error('EVIDENCE_CAPABILITY_INVALID')
+-  }
+-  const iat = Math.floor(nowMs / 1000)
+-  const claims: EvidenceClaims = {
+-    v: 1,
+-    iss: 'quackback',
+-    ...use,
+-    tenantRef: binding.tenantRef,
+-    subjectRef: binding.subjectRef,
+-    reportId: binding.reportId,
+-    issuanceRef: binding.issuanceRef,
+-    jti,
+-    iat,
+-    exp: iat + 300,
+-    allowedKinds: [...allowedKinds],
+-  }
+-  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url')
+-  const signature = createHmac('sha256', signingKey).update(`qbe1.${payload}`).digest('base64url')
+-  return {
+-    capability: `qbe1.${payload}.${signature}`,
+-    claims,
+-    expiresAt: new Date(claims.exp * 1000).toISOString(),
+-  }
+-}
+-
+-export function verifyEvidenceCapability(
+-  token: string,
+-  key: Buffer,
+-  nowMs = Date.now()
+-): EvidenceClaims | null {
+-  if (token.length > 4096 || key.byteLength !== 32 || !Number.isSafeInteger(nowMs) || nowMs < 0)
+-    return null
+-  const match = /^qbe1\.([A-Za-z0-9_-]{1,3072})\.([A-Za-z0-9_-]{43})$/.exec(token)
+-  if (!match) return null
+-  const supplied = Buffer.from(match[2], 'base64url')
+-  const wanted = createHmac('sha256', key).update(`qbe1.${match[1]}`).digest()
+-  if (
+-    supplied.length !== wanted.length ||
+-    !timingSafeEqual(supplied, wanted) ||
+-    supplied.toString('base64url') !== match[2]
+-  )
+-    return null
+-  try {
+-    const decoded = Buffer.from(match[1], 'base64url')
+-    if (decoded.toString('base64url') !== match[1]) return null
+-    const claims = JSON.parse(decoded.toString('utf8')) as EvidenceClaims
+-    const keys = Object.keys(claims).sort()
+-    if (
+-      keys.length !== CLAIM_KEYS.length ||
+-      keys.some((k, i) => k !== CLAIM_KEYS[i]) ||
+-      claims.v !== 1 ||
+-      claims.iss !== 'quackback' ||
+-      !Object.values(PURPOSE).some((p) => p.aud === claims.aud && p.scope === claims.scope) ||
+-      !validBinding({ audience: 'quackback-evidence', ...claims }) ||
+-      !canonicalKinds(claims.allowedKinds) ||
+-      typeof claims.jti !== 'string' ||
+-      !OPAQUE_REF.test(claims.jti) ||
+-      !Number.isSafeInteger(claims.iat) ||
+-      !Number.isSafeInteger(claims.exp) ||
+-      claims.iat < 0 ||
+-      claims.exp <= claims.iat ||
+-      claims.exp - claims.iat > 300 ||
+-      claims.iat > Math.floor(nowMs / 1000) + 30 ||
+-      claims.exp <= Math.floor(nowMs / 1000)
+-    )
+-      return null
+-    // Reject duplicate JSON keys, alternate serialization, and extra fields.
+-    if (JSON.stringify(claims) !== decoded.toString('utf8')) return null
+-    return claims
+-  } catch {
+-    return null
+-  }
+-}
+-
+-export interface PrivateEvidenceProjection {
+-  evidenceId: string
+-  revision: number
+-  status: 'ready'
+-  expiresAt: string
+-}
+-const RESPONSE_KEYS = [
+-  'createdAt',
+-  'deletionPending',
+-  'evidenceId',
+-  'expiresAt',
+-  'idempotentReplay',
+-  'kind',
+-  'outcome',
+-  'processingReasonCode',
+-  'processingRequired',
+-  'processingRevision',
+-  'processingStatus',
+-  'rawDeleteBy',
+-  'reasonCode',
+-  'revision',
+-  'sanitizedDerivativeAvailable',
+-  'sanitizedDerivativeExpiresAt',
+-  'schemaVersion',
+-  'sourceRevision',
+-  'status',
+-  'textReportMaySubmit',
+-  'upload',
+-].sort()
+-function timestamp(value: unknown): number | null {
+-  if (typeof value !== 'string') return null
+-  const t = Date.parse(value)
+-  return Number.isSafeInteger(t) && new Date(t).toISOString() === value ? t : null
+-}
+-
+-/** Scan-ready metadata only. No bytes, storage paths, or public URLs enter a Ticket. */
+-export function verifiedPrivateEvidence(
+-  value: unknown,
+-  evidenceId: string,
+-  allowedKinds: readonly EvidenceKind[],
+-  nowMs = Date.now(),
+-  purpose: 'bind' | 'read' = 'bind'
+-): PrivateEvidenceProjection | null {
+-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+-  const r = value as Record<string, unknown>
+-  const keys = Object.keys(r).sort()
+-  const created = timestamp(r.createdAt),
+-    raw = timestamp(r.rawDeleteBy),
+-    expires = timestamp(r.expiresAt)
+-  const derivative = timestamp(r.sanitizedDerivativeExpiresAt)
+-  // An established ticket may retain a sanitized derivative after the broker
+-  // expires/purges raw data at 24h. Reporter discard never retains it.
+-  const sourceDelta =
+-    r.status === 'uploaded' &&
+-    r.outcome === null &&
+-    r.reasonCode === null &&
+-    r.deletionPending === false
+-      ? 0
+-      : purpose === 'read' &&
+-          r.outcome === 'expired' &&
+-          r.reasonCode === 'ABSOLUTE_TTL_EXPIRED' &&
+-          r.status === 'expired' &&
+-          r.deletionPending === true
+-        ? 1
+-        : purpose === 'read' &&
+-            r.outcome === 'expired' &&
+-            r.reasonCode === 'ABSOLUTE_TTL_EXPIRED' &&
+-            r.status === 'deleted' &&
+-            r.deletionPending === false
+-          ? 2
+-          : null
+-  if (
+-    keys.length !== RESPONSE_KEYS.length ||
+-    keys.some((k, i) => k !== RESPONSE_KEYS[i]) ||
+-    r.schemaVersion !== 1 ||
+-    r.evidenceId !== evidenceId ||
+-    !EVIDENCE_ID.test(evidenceId) ||
+-    !allowedKinds.includes(r.kind as EvidenceKind) ||
+-    sourceDelta === null ||
+-    created === null ||
+-    raw === null ||
+-    expires === null ||
+-    expires !== raw ||
+-    raw !== created + 86400000 ||
+-    (purpose === 'bind' && raw <= nowMs) ||
+-    (sourceDelta > 0 && raw > nowMs) ||
+-    !Number.isSafeInteger(r.sourceRevision) ||
+-    (r.sourceRevision as number) - sourceDelta < 1 ||
+-    !Number.isSafeInteger(r.processingRevision) ||
+-    (r.processingRevision as number) <= (r.sourceRevision as number) - sourceDelta ||
+-    r.revision !== (r.processingRevision as number) + sourceDelta ||
+-    r.textReportMaySubmit !== true ||
+-    r.idempotentReplay !== false ||
+-    r.upload !== null ||
+-    r.processingStatus !== 'ready' ||
+-    r.processingReasonCode !== null ||
+-    r.processingRequired !== false ||
+-    r.sanitizedDerivativeAvailable !== true ||
+-    derivative === null ||
+-    derivative <= nowMs ||
+-    derivative !== created + 30 * 86400000
+-  )
+-    return null
+-  return {
+-    evidenceId,
+-    revision: r.revision as number,
+-    status: 'ready',
+-    expiresAt: r.sanitizedDerivativeExpiresAt as string,
+-  }
+-}
+-
+-export async function readPrivateEvidence(
+-  binding: EvidenceBinding,
+-  ids: readonly string[],
+-  allowedKinds: readonly EvidenceKind[],
+-  server: NonNullable<ReturnType<typeof evidenceServerConfig>>,
+-  fetchImpl: (url: string, init: RequestInit) => Promise<Response> = fetch,
+-  purpose: 'bind' | 'read' = 'bind'
+-) {
+-  if (
+-    ids.length < 1 ||
+-    ids.length > 5 ||
+-    new Set(ids).size !== ids.length ||
+-    ids.some((id) => !EVIDENCE_ID.test(id))
+-  )
+-    throw new Error('EVIDENCE_INVALID_HANDLES')
+-  const grant = mintEvidenceCapability(binding, allowedKinds, server.signingKey, 'server_read')
+-  const abort = new AbortController()
+-  const timer = setTimeout(() => abort.abort(), 3000)
+-  try {
+-    const projections = await Promise.all(
+-      ids.map(async (id) => {
+-        try {
+-          const response = await fetchImpl(`${server.brokerOrigin}/v1/evidence/${id}`, {
+-            method: 'GET',
+-            credentials: 'omit',
+-            cache: 'no-store',
+-            redirect: 'error',
+-            signal: abort.signal,
+-            headers: { Accept: 'application/json', Authorization: `Bearer ${grant.capability}` },
+-          })
+-          if (!response.ok) return null
+-          const length = Number(response.headers.get('content-length'))
+-          if (Number.isFinite(length) && length > 8192) return null
+-          const text = await response.text()
+-          if (text.length > 8192) return null
+-          return verifiedPrivateEvidence(JSON.parse(text), id, allowedKinds, Date.now(), purpose)
+-        } catch {
+-          return null
+-        }
+-      })
+-    )
+-    if (projections.some((p) => p === null)) throw new Error('EVIDENCE_NOT_READY')
+-    return projections as PrivateEvidenceProjection[]
+-  } finally {
+-    clearTimeout(timer)
+-  }
+-}
+-
+-export interface NativeEvidenceBindingCommand {
+-  bindingRef: string
+-  reportId: string
+-  ticketId: string
+-  submissionId: string
+-  bodyDigest: string
+-  evidenceIds: string[]
+-}
+-
+-/** Server only; a successful DELETE must prove both raw and sanitized terminal state. */
+-export async function deleteBoundPrivateEvidence(
+-  binding: EvidenceBinding,
+-  command: NativeEvidenceBindingCommand,
+-  allowedKinds: readonly EvidenceKind[],
+-  server: NonNullable<ReturnType<typeof evidenceServerConfig>>
+-) {
+-  const grant = mintEvidenceCapability(binding, allowedKinds, server.signingKey, 'server_bound_delete', Date.now(), () => command.bindingRef)
+-  for (const evidenceId of command.evidenceIds) {
+-    const abort = new AbortController(), timer = setTimeout(() => abort.abort(), 8000)
+-    try {
+-      const response = await fetch(`${server.brokerOrigin}/v1/evidence/${evidenceId}`, {
+-        method:'DELETE', credentials:'omit', cache:'no-store', redirect:'error', signal:abort.signal,
+-        headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${grant.capability}`},
+-        body:JSON.stringify({schemaVersion:1,evidenceId,idempotencyKey:`idem_${command.bindingRef}`}),
+-      })
+-      if (response.status !== 200) throw new Error()
+-      const text = await response.text()
+-      if (text.length > 8192) throw new Error()
+-      const value = JSON.parse(text)
+-      const created = timestamp(value.createdAt), raw = timestamp(value.rawDeleteBy)
+-      if (Object.keys(value).sort().join() !== RESPONSE_KEYS.join() || value.schemaVersion !== 1 ||
+-        value.evidenceId !== evidenceId || !allowedKinds.includes(value.kind) || value.status !== 'deleted' ||
+-        !((value.outcome === 'discarded' && value.reasonCode === 'REPORTER_DISCARDED') ||
+-          (value.outcome === 'expired' && value.reasonCode === 'ABSOLUTE_TTL_EXPIRED')) ||
+-        created === null || raw !== created + 86400000 || timestamp(value.expiresAt) !== raw ||
+-        !Number.isSafeInteger(value.sourceRevision) || value.sourceRevision < 3 ||
+-        !Number.isSafeInteger(value.processingRevision) || value.processingRevision <= value.sourceRevision - 2 ||
+-        value.revision !== value.processingRevision + 2 || typeof value.idempotentReplay !== 'boolean' || value.textReportMaySubmit !== true ||
+-        value.deletionPending !== false || value.processingStatus !== 'deleted' || !['SOURCE_REVOKED','RETENTION_EXPIRED'].includes(value.processingReasonCode) ||
+-        value.processingRequired !== false || value.sanitizedDerivativeAvailable !== false ||
+-        value.sanitizedDerivativeExpiresAt !== null || value.upload !== null) throw new Error()
+-    } catch { throw new Error('EVIDENCE_DELETION_UNAVAILABLE') }
+-    finally { clearTimeout(timer) }
+-  }
+-}
+-export function nativeEvidenceBindingCommand(
+-  binding: EvidenceBinding,
+-  input: Omit<NativeEvidenceBindingCommand, 'bindingRef'>
+-) {
+-  const tuple = {
+-    tenantRef: binding.tenantRef,
+-    subjectRef: binding.subjectRef,
+-    issuanceRef: binding.issuanceRef,
+-    reportId: binding.reportId,
+-    ticketId: input.ticketId,
+-    submissionId: input.submissionId,
+-    bodyDigest: input.bodyDigest,
+-    evidenceIds: [...input.evidenceIds].sort(),
+-  }
+-  const tupleJson = JSON.stringify(tuple)
+-  const bindingRef = `qnb_${createHash('sha256').update(tupleJson).digest('hex')}`
+-  return {
+-    tupleJson,
+-    command: {
+-      bindingRef,
+-      reportId: tuple.reportId,
+-      ticketId: tuple.ticketId,
+-      submissionId: tuple.submissionId,
+-      bodyDigest: tuple.bodyDigest,
+-      evidenceIds: tuple.evidenceIds,
+-    },
+-  }
+-}
+-/** Server-only phase grants bind the entire deterministic immutable tuple. */
+-export async function transitionPrivateEvidenceBinding(
+-  binding: EvidenceBinding,
+-  command: NativeEvidenceBindingCommand,
+-  allowedKinds: readonly EvidenceKind[],
+-  server: NonNullable<ReturnType<typeof evidenceServerConfig>>,
+-  operation: 'prepare' | 'commit' | 'abort'
+-) {
+-  const grant = mintEvidenceCapability(
+-    binding,
+-    allowedKinds,
+-    server.signingKey,
+-    `server_bind_${operation}`,
+-    Date.now(),
+-    () => command.bindingRef
+-  )
+-  const abort = new AbortController(),
+-    timer = setTimeout(() => abort.abort(), 3000)
+-  try {
+-    const response = await fetch(`${server.brokerOrigin}/v1/evidence/bindings/${operation}`, {
+-      method: 'POST',
+-      credentials: 'omit',
+-      cache: 'no-store',
+-      redirect: 'error',
+-      signal: abort.signal,
+-      headers: {
+-        'Content-Type': 'application/json',
+-        Accept: 'application/json',
+-        Authorization: `Bearer ${grant.capability}`,
+-      },
+-      body: JSON.stringify(command),
+-    })
+-    if (!response.ok) throw new Error()
+-    const text = await response.text()
+-    if (text.length > 1024) throw new Error()
+-    const value = JSON.parse(text)
+-    const states =
+-      operation === 'prepare'
+-        ? ['prepared', 'bound']
+-        : operation === 'commit'
+-          ? ['bound']
+-          : ['released']
+-    if (
+-      Object.keys(value).sort().join() !== 'bindingRef,state' ||
+-      value.bindingRef !== command.bindingRef ||
+-      !states.includes(value.state)
+-    )
+-      throw new Error()
+-  } catch {
+-    throw new Error('EVIDENCE_BINDING_UNAVAILABLE')
+-  } finally {
+-    clearTimeout(timer)
+-  }
+-}
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts
+deleted file mode 100644
+index 915c4ebda16836ff8a1269562b7a3b579a66651e..0000000000000000000000000000000000000000
+--- a/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts
++++ /dev/null
+@@ -1,47 +0,0 @@
+-import {beforeEach,describe,expect,it,vi} from 'vitest'
+-vi.mock('@tanstack/react-start',()=>({createServerFn:()=>{
+-  let schema:{parse(v:unknown):unknown},handler:(args:{data:unknown})=>Promise<unknown>
+-  const fn=async(args:{data:unknown})=>handler({data:schema.parse(args.data)})
+-  fn.validator=(value:typeof schema)=>{schema=value;return fn}
+-  fn.handler=(value:typeof handler)=>{handler=value;return fn}
+-  return fn
+-}}))
+-const p=vi.hoisted(()=>({auth:vi.fn(),bound:vi.fn(),abort:vi.fn(),remove:vi.fn(),bearer:'native-test-bearer'}))
+-vi.mock('@/lib/server/functions/widget-auth',()=>({requireWidgetAuth:p.auth}))
+-vi.mock('@tanstack/react-start/server',()=>({getRequestHeaders:()=>new Headers(p.bearer?{Authorization:`Bearer ${p.bearer}`}:{})}))
+-vi.mock('@/lib/server/widget/native-host-token',()=>({requireBoundNativeHostSession:p.bound}))
+-vi.mock('@/lib/server/evidence/native',()=>({runAbortNativeEvidenceBinding:p.abort,runDeleteNativeEvidence:p.remove}))
+-import {nativeHostActionFn,nativeHostActionSchema} from '../native-host'
+-const invoke=nativeHostActionFn as unknown as(args:{data:unknown})=>Promise<unknown>
+-const context={contract:'iplaycafe.feedback/native-1',operationId:'00000000-0000-4000-8000-000000000002',hostOrigin:'https://app.example.test'}
+-const reportId='brp_00000000-0000-4000-8000-000000000001'
+-const request={context,action:{type:'abort-evidence',payload:{reportId}}}
+-const ctx={principal:{type:'user',id:'principal-test'},user:{id:'user-test'}}
+-beforeEach(()=>{vi.clearAllMocks();p.bearer='native-test-bearer';p.auth.mockResolvedValue(ctx);p.bound.mockResolvedValue('session-test');p.abort.mockResolvedValue({reportId,aborted:true})})
+-describe('authenticated native abort facade',()=>{
+-  it('bound private deletion passes only server-derived Ticket ownership after issuer correlation',async()=>{
+-    p.remove.mockResolvedValueOnce({deleted:true})
+-    await expect(invoke({data:{context,action:{type:'delete-evidence',payload:{ticketId:'ticket-test'}}}})).resolves.toEqual({deleted:true})
+-    expect(p.bound.mock.invocationCallOrder[0]).toBeLessThan(p.remove.mock.invocationCallOrder[0])
+-    expect(p.remove).toHaveBeenCalledWith(ctx,{ticketId:'ticket-test'})
+-    expect(nativeHostActionSchema.safeParse({type:'delete-evidence',payload:{ticketId:'ticket-test',reportId}}).success).toBe(false)
+-  })
+-  it('validates bound issuer/session before entering abort authority',async()=>{
+-    await expect(invoke({data:request})).resolves.toEqual({reportId,aborted:true})
+-    expect(p.bound).toHaveBeenCalledWith(ctx.principal.id,context,p.bearer)
+-    expect(p.abort).toHaveBeenCalledWith(ctx,{reportId})
+-    expect(p.bound.mock.invocationCallOrder[0]).toBeLessThan(p.abort.mock.invocationCallOrder[0])
+-  })
+-  it.each(['missing-bearer','wrong-binding','non-user'])('denies %s without abort effects',async(reason)=>{
+-    if(reason==='missing-bearer')p.bearer=''
+-    if(reason==='wrong-binding')p.bound.mockRejectedValueOnce(new Error('binding refused'))
+-    if(reason==='non-user')p.auth.mockResolvedValueOnce({principal:{type:'anonymous'}})
+-    await expect(invoke({data:request})).rejects.toThrow()
+-    expect(p.abort).not.toHaveBeenCalled()
+-  })
+-  it('rejects widened abort payload and propagates committed/ambiguous refusal',async()=>{
+-    expect(nativeHostActionSchema.safeParse({type:'abort-evidence',payload:{reportId,ticketId:'ticket-test'}}).success).toBe(false)
+-    p.abort.mockRejectedValueOnce(new Error('EVIDENCE_BINDING_CONFLICT'))
+-    await expect(invoke({data:request})).rejects.toThrow('EVIDENCE_BINDING_CONFLICT')
+-  })
+-})
+diff --git a/apps/web/src/lib/server/functions/widget/native-evidence.ts b/apps/web/src/lib/server/functions/widget/native-evidence.ts
+deleted file mode 100644
+index 138605b2e35b1398dcd108f37838c809b36e6085..0000000000000000000000000000000000000000
+--- a/apps/web/src/lib/server/functions/widget/native-evidence.ts
++++ /dev/null
+@@ -1,53 +0,0 @@
+-import { createServerFn } from '@tanstack/react-start'
+-import { z } from 'zod'
+-import { ticketIdSchema } from '@/lib/shared/schemas/tickets'
+-
+-const reportId = z
+-  .string()
+-  .regex(/^brp_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+-const evidenceId = z
+-  .string()
+-  .regex(/^qbe_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+-export const nativeEvidenceCapabilityFn = createServerFn({ method: 'POST' })
+-  .validator(z.object({ reportId }).strict())
+-  .handler(async ({ data }) => {
+-    const { requireWidgetAuth } = await import('../widget-auth')
+-    const { runIssueNativeEvidenceCapability } = await import('@/lib/server/evidence/native')
+-    return runIssueNativeEvidenceCapability(await requireWidgetAuth(), data)
+-  })
+-
+-export const nativeBindEvidenceFn = createServerFn({ method: 'POST' })
+-  .validator(
+-    ticketIdSchema
+-      .extend({ reportId, submissionId: z.uuid(), evidenceIds: z.array(evidenceId).min(1).max(5) })
+-      .strict()
+-  )
+-  .handler(async ({ data }) => {
+-    const { requireWidgetAuth } = await import('../widget-auth')
+-    const { runBindNativeEvidence } = await import('@/lib/server/evidence/native')
+-    return runBindNativeEvidence(await requireWidgetAuth(), data)
+-  })
+-
+-export const nativeReadEvidenceFn = createServerFn({ method: 'POST' })
+-  .validator(ticketIdSchema.strict())
+-  .handler(async ({ data }) => {
+-    const { requireWidgetAuth } = await import('../widget-auth')
+-    const { runReadNativeEvidence } = await import('@/lib/server/evidence/native')
+-    return runReadNativeEvidence(await requireWidgetAuth(), data)
+-  })
+-
+-export const nativeAbortEvidenceFn = createServerFn({ method: 'POST' })
+-  .validator(z.object({ reportId }).strict())
+-  .handler(async ({ data }) => {
+-    const { requireWidgetAuth } = await import('../widget-auth')
+-    const { runAbortNativeEvidenceBinding } = await import('@/lib/server/evidence/native')
+-    return runAbortNativeEvidenceBinding(await requireWidgetAuth(), data)
+-  })
+-
+-export const nativeDeleteEvidenceFn = createServerFn({method:'POST'})
+-  .validator(ticketIdSchema.strict())
+-  .handler(async ({data}) => {
+-    const {requireWidgetAuth} = await import('../widget-auth')
+-    const {runDeleteNativeEvidence} = await import('@/lib/server/evidence/native')
+-    return runDeleteNativeEvidence(await requireWidgetAuth(),data)
+-  })
+diff --git a/apps/web/src/lib/server/functions/widget/native-host.ts b/apps/web/src/lib/server/functions/widget/native-host.ts
+index b7883a303305a3d043cb3f93ee967f56cca29e9d..0b043406f705cd5012391f92f928e89cc5e50b04 100644
+--- a/apps/web/src/lib/server/functions/widget/native-host.ts
++++ b/apps/web/src/lib/server/functions/widget/native-host.ts
+@@ -4,8 +4,6 @@ import { createMyTicketSchema } from '@/lib/shared/schemas/tickets'
+ import { MAX_CONVERSATION_ATTACHMENTS } from '@/lib/shared/conversation/types'
+ import { nativeHostContextSchema } from '@/lib/shared/widget/native-host'
+ 
+-const reportId = z.string().regex(/^brp_[0-9a-f-]{36}$/)
+-const evidenceId = z.string().regex(/^qbe_[0-9a-f-]{36}$/)
+ // Native Tickets attach only pipeline files (upload-attachment results). The
+ // ticket service rebuilds type/size/URL from the file row and admits only the
+ // requester's own uploads; unknown keys (for example mimeType) are stripped.
+@@ -27,12 +25,6 @@ export const nativeHostActionSchema = z.discriminatedUnion('type', [
+   z.object({type: z.literal('read-ticket'), payload: z.object({ticketId: z.string().min(1)})}),
+   z.object({type: z.literal('reply-ticket'), payload: z.object({ticketId: z.string().min(1), content: z.string().min(1).max(4000)})}),
+   z.object({type: z.literal('logout'), payload: z.object({}).strict()}),
+-  z.object({type: z.literal('evidence-capability'), payload: z.object({reportId}).strict()}),
+-  z.object({type: z.literal('bind-evidence'), payload: z.object({reportId, submissionId: z.uuid(),
+-    ticketId: z.string().min(1), evidenceIds: z.array(evidenceId).min(1).max(5)}).strict()}),
+-  z.object({type: z.literal('abort-evidence'), payload: z.object({reportId}).strict()}),
+-  z.object({type: z.literal('read-evidence'), payload: z.object({ticketId: z.string().min(1)}).strict()}),
+-  z.object({type: z.literal('delete-evidence'), payload: z.object({ticketId: z.string().min(1)}).strict()}),
+ ])
+ 
+ export const nativeHostActionFn = createServerFn({method: 'POST'})
+@@ -50,26 +42,6 @@ export const nativeHostActionFn = createServerFn({method: 'POST'})
+     if (ctx.principal.type !== 'user') throw new Error('Verified widget identity required')
+     const {requireBoundNativeHostSession} = await import('@/lib/server/widget/native-host-token')
+     await requireBoundNativeHostSession(ctx.principal.id, data.context, bearer)
+-    if (data.action.type === 'evidence-capability') {
+-      const {runIssueNativeEvidenceCapability} = await import('@/lib/server/evidence/native')
+-      return runIssueNativeEvidenceCapability(ctx, data.action.payload)
+-    }
+-    if (data.action.type === 'bind-evidence') {
+-      const {runBindNativeEvidence} = await import('@/lib/server/evidence/native')
+-      return runBindNativeEvidence(ctx, data.action.payload)
+-    }
+-    if (data.action.type === 'abort-evidence') {
+-      const {runAbortNativeEvidenceBinding} = await import('@/lib/server/evidence/native')
+-      return runAbortNativeEvidenceBinding(ctx, data.action.payload)
+-    }
+-    if (data.action.type === 'read-evidence') {
+-      const {runReadNativeEvidence} = await import('@/lib/server/evidence/native')
+-      return runReadNativeEvidence(ctx, data.action.payload)
+-    }
+-    if (data.action.type === 'delete-evidence') {
+-      const {runDeleteNativeEvidence} = await import('@/lib/server/evidence/native')
+-      return runDeleteNativeEvidence(ctx,data.action.payload)
+-    }
+     const native = await import('../tickets')
+     if (data.action.type === 'create-ticket') {
+       const {nativeSubmissionDigest} = await import('@/lib/server/widget/native-submission')
+diff --git a/apps/web/src/lib/shared/widget/native-host.ts b/apps/web/src/lib/shared/widget/native-host.ts
+index 775ddf5a79a4929da4e9f066d20a448af45230c3..4e3177146f8b42c1998f4e15cf5f887c83fbc480 100644
+--- a/apps/web/src/lib/shared/widget/native-host.ts
++++ b/apps/web/src/lib/shared/widget/native-host.ts
+@@ -18,6 +18,6 @@ export type NativeHostContext = z.infer<typeof nativeHostContextSchema>
+ export const nativeHostCommandSchema = z.object({
+   contract: z.literal(NATIVE_HOST_CONTRACT),
+   operationId: z.uuid(),
+-  type: z.enum(['identify', 'logout', 'create-ticket', 'list-tickets', 'read-ticket', 'reply-ticket', 'capture-config', 'evidence-capability', 'bind-evidence', 'abort-evidence', 'read-evidence', 'delete-evidence', 'upload-attachment']),
++  type: z.enum(['identify', 'logout', 'create-ticket', 'list-tickets', 'read-ticket', 'reply-ticket', 'capture-config', 'upload-attachment']),
+   payload: z.record(z.string(), z.unknown()),
+ }).strict()
+diff --git a/apps/web/src/routes/api/widget/evidence/__tests__/private.test.ts b/apps/web/src/routes/api/widget/evidence/__tests__/private.test.ts
+deleted file mode 100644
+index 15fe073730b6266877d6baf8aee3f2324dcc2712..0000000000000000000000000000000000000000
+--- a/apps/web/src/routes/api/widget/evidence/__tests__/private.test.ts
++++ /dev/null
+@@ -1,52 +0,0 @@
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
+-const auth = vi.hoisted(() => vi.fn())
+-const open = vi.hoisted(() => vi.fn())
+-vi.mock('@/lib/server/functions/widget-auth', () => ({ requireWidgetAuth: auth }))
+-vi.mock('@/lib/server/evidence/native', () => ({ runOpenNativeEvidence: open }))
+-vi.mock('@tanstack/react-router', () => ({ createFileRoute: () => (options: unknown) => options }))
+-import { handleNativePrivateEvidence } from '../private'
+-const request = (body: unknown, headers = { 'content-type': 'application/json' }) =>
+-  new Request('https://quackback.example/api/widget/evidence/private', {
+-    method: 'POST',
+-    headers,
+-    body: JSON.stringify(body),
+-  })
+-beforeEach(() => {
+-  auth.mockReset()
+-  open.mockReset()
+-})
+-describe('native private evidence route', () => {
+-  it('authenticates through native widget auth and returns the private byte stream directly', async () => {
+-    const ctx = { principal: { id: 'principal_native' } }
+-    auth.mockResolvedValueOnce(ctx)
+-    open.mockResolvedValueOnce(
+-      new Response(new Uint8Array([1, 2, 3]), { headers: { 'cache-control': 'no-store' } })
+-    )
+-    const input = {
+-      ticketId: 'ticket_owned',
+-      evidenceId: 'qbe_11111111-1111-4111-8111-111111111111',
+-    }
+-    const result = await handleNativePrivateEvidence({ request: request(input) })
+-    expect(result.status).toBe(200)
+-    expect(open).toHaveBeenCalledWith(ctx, input, expect.any(AbortSignal))
+-    expect(new Uint8Array(await result.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]))
+-  })
+-  it.each([
+-    { ticketId: 'ticket_owned', evidenceId: 'id', publicUrl: 'https://public.example' },
+-    { ticketId: 'ticket_owned' },
+-    { ticketId: 42, evidenceId: 'id' },
+-    { ticketId: 'a'.repeat(2048), evidenceId: 'id' },
+-  ])('refuses unknown fields or overlarge/malformed request %#', async (input) => {
+-    expect((await handleNativePrivateEvidence({ request: request(input) })).status).toBe(403)
+-    expect(auth).not.toHaveBeenCalled()
+-    expect(open).not.toHaveBeenCalled()
+-  })
+-  it('does not reveal auth, storage or scan failure details', async () => {
+-    auth.mockRejectedValueOnce(new Error('private-auth-detail'))
+-    const result = await handleNativePrivateEvidence({
+-      request: request({ ticketId: 'ticket_owned', evidenceId: 'id' }),
+-    })
+-    expect(await result.json()).toEqual({ error: { code: 'EVIDENCE_UNAVAILABLE' } })
+-    expect(result.headers.get('cache-control')).toBe('no-store')
+-  })
+-})
+diff --git a/apps/web/src/routes/api/widget/evidence/capability/__tests__/introspect.test.ts b/apps/web/src/routes/api/widget/evidence/capability/__tests__/introspect.test.ts
+deleted file mode 100644
+index 5523a5a96c2d8ff99e88aaff92794482b9bfb71e..0000000000000000000000000000000000000000
+--- a/apps/web/src/routes/api/widget/evidence/capability/__tests__/introspect.test.ts
++++ /dev/null
+@@ -1,44 +0,0 @@
+-import { describe, expect, it, vi } from 'vitest'
+-const introspect = vi.hoisted(() => vi.fn())
+-vi.mock('@/lib/server/evidence/native', () => ({ introspectNativeEvidenceCapability: introspect }))
+-vi.mock('@tanstack/react-router', () => ({ createFileRoute: () => (options: unknown) => options }))
+-import { handleNativeEvidenceIntrospect, Route } from '../introspect'
+-import golden from '@/lib/server/evidence/__tests__/qbe1-golden-v1.json'
+-const request = (authorization?: string) =>
+-  new Request('https://quackback.example/api/widget/evidence/capability/introspect', {
+-    method: 'POST',
+-    headers: authorization ? { Authorization: authorization } : {},
+-  })
+-describe('fixed qbe1 introspection route', () => {
+-  it('exposes only POST and returns the exact broker claims with no-store', async () => {
+-    introspect.mockResolvedValueOnce(golden.claims)
+-    const result = await handleNativeEvidenceIntrospect({
+-      request: request(`Bearer ${golden.token}`),
+-    })
+-    expect(result.status).toBe(200)
+-    expect(result.headers.get('cache-control')).toBe('no-store')
+-    expect(await result.json()).toEqual(golden.claims)
+-    expect(
+-      Object.keys((Route as unknown as { server: { handlers: object } }).server.handlers)
+-    ).toEqual(['POST'])
+-  })
+-  it.each([undefined, 'Bearer ordinary-session', 'Basic abc', 'Bearer ' + 'a'.repeat(4100)])(
+-    'refuses non-capability authorization %#',
+-    async (authorization) => {
+-      const result = await handleNativeEvidenceIntrospect({ request: request(authorization) })
+-      expect(result.status).toBe(403)
+-    }
+-  )
+-  it('never returns failure details or an unverified claim envelope', async () => {
+-    introspect.mockResolvedValueOnce(null)
+-    expect(
+-      (await handleNativeEvidenceIntrospect({ request: request(`Bearer ${golden.token}`) })).status
+-    ).toBe(403)
+-    introspect.mockRejectedValueOnce(new Error('test-only provider diagnostic'))
+-    const result = await handleNativeEvidenceIntrospect({
+-      request: request(`Bearer ${golden.token}`),
+-    })
+-    expect(result.status).toBe(503)
+-    expect(await result.json()).toEqual({ error: { code: 'EVIDENCE_DENIED' } })
+-  })
+-})
+diff --git a/apps/web/src/routes/api/widget/evidence/capability/introspect.ts b/apps/web/src/routes/api/widget/evidence/capability/introspect.ts
+deleted file mode 100644
+index e0241c992da64cf05ae20ac98f17e4c8e2a91df8..0000000000000000000000000000000000000000
+--- a/apps/web/src/routes/api/widget/evidence/capability/introspect.ts
++++ /dev/null
+@@ -1,24 +0,0 @@
+-import { createFileRoute } from '@tanstack/react-router'
+-import { introspectNativeEvidenceCapability } from '@/lib/server/evidence/native'
+-
+-const headers = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
+-export async function handleNativeEvidenceIntrospect({ request }: { request: Request }) {
+-  const deny = (status: number) =>
+-    Response.json({ error: { code: 'EVIDENCE_DENIED' } }, { status, headers })
+-  const authorization = request.headers.get('authorization')
+-  if (
+-    !authorization ||
+-    authorization.length > 4096 ||
+-    !/^Bearer qbe1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(authorization)
+-  )
+-    return deny(403)
+-  try {
+-    const claims = await introspectNativeEvidenceCapability(authorization.slice(7))
+-    return claims ? Response.json(claims, { headers }) : deny(403)
+-  } catch {
+-    return deny(503)
+-  }
+-}
+-export const Route = createFileRoute('/api/widget/evidence/capability/introspect')({
+-  server: { handlers: { POST: handleNativeEvidenceIntrospect } },
+-})
+diff --git a/apps/web/src/routes/api/widget/evidence/private.ts b/apps/web/src/routes/api/widget/evidence/private.ts
+deleted file mode 100644
+index 9a869bb18008004424eea5add4dedd85615d1d9f..0000000000000000000000000000000000000000
+--- a/apps/web/src/routes/api/widget/evidence/private.ts
++++ /dev/null
+@@ -1,54 +0,0 @@
+-import { createFileRoute } from '@tanstack/react-router'
+-import { requireWidgetAuth } from '@/lib/server/functions/widget-auth'
+-import { runOpenNativeEvidence } from '@/lib/server/evidence/native'
+-
+-export async function handleNativePrivateEvidence({ request }: { request: Request }) {
+-  try {
+-    if (
+-      request.headers.get('content-type')?.split(';', 1)[0] !== 'application/json' ||
+-      !request.body
+-    )
+-      throw new Error('EVIDENCE_DENIED')
+-    const reader = request.body.getReader()
+-    const chunks: Uint8Array[] = []
+-    let bytes = 0
+-    try {
+-      for (;;) {
+-        const next = await reader.read()
+-        if (next.done) break
+-        bytes += next.value.length
+-        if (bytes > 1024) {
+-          void reader.cancel().catch(() => {})
+-          throw new Error('EVIDENCE_DENIED')
+-        }
+-        chunks.push(next.value)
+-      }
+-    } finally {
+-      reader.releaseLock()
+-    }
+-    const input = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+-    if (
+-      !input ||
+-      Array.isArray(input) ||
+-      Object.keys(input).sort().join(',') !== 'evidenceId,ticketId' ||
+-      typeof input.ticketId !== 'string' ||
+-      typeof input.evidenceId !== 'string'
+-    )
+-      throw new Error('EVIDENCE_DENIED')
+-    return await runOpenNativeEvidence(await requireWidgetAuth(), input, request.signal)
+-  } catch {
+-    return Response.json(
+-      { error: { code: 'EVIDENCE_UNAVAILABLE' } },
+-      {
+-        status: 403,
+-        headers: {
+-          'Cache-Control': 'no-store',
+-          'X-Content-Type-Options': 'nosniff',
+-        },
+-      }
+-    )
+-  }
+-}
+-export const Route = createFileRoute('/api/widget/evidence/private')({
+-  server: { handlers: { POST: handleNativePrivateEvidence } },
+-})

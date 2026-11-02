@@ -1,0 +1,340 @@
+diff --git a/apps/web/src/lib/client/__tests__/native-host-controller-submission-conflict.test.ts b/apps/web/src/lib/client/__tests__/native-host-controller-submission-conflict.test.ts
+new file mode 100644
+index 0000000..11bc328
+--- /dev/null
++++ b/apps/web/src/lib/client/__tests__/native-host-controller-submission-conflict.test.ts
+@@ -0,0 +1,60 @@
++import { describe, it, expect, vi } from 'vitest'
++import { createNativeHostController } from '../native-host-controller'
++import type { NativeHostContext } from '@/lib/shared/widget/native-host'
++const origin = 'https://app.example.test'
++const audience = 'https://feedback.example.test'
++function command(type: string, payload: Record<string, unknown> = {}) {
++  return { contract: 'iplaycafe.feedback/native-1', operationId: crypto.randomUUID(), type, payload }
++}
++function ports() {
++  return {
++    audience,
++    clearIdentity: vi.fn(() => 'previous'),
++    applyIdentity: vi.fn(),
++    identify: vi.fn(
++      async (
++        _payload: Record<string, unknown>,
++        context: NativeHostContext
++      ): Promise<Record<string, unknown>> => ({
++        sessionToken: 'native-session',
++        user: { id: 'u' },
++        nativeAck: { ...context, audience, jti: crypto.randomUUID() },
++      })
++    ),
++    action: vi.fn(async (..._args: unknown[]): Promise<unknown> => ({ id: 'ticket_x' })),
++    respond: vi.fn(),
++    configureCapture: vi.fn(),
++  }
++}
++const replyFor = (p: ReturnType<typeof ports>, op: { operationId: string }) =>
++  p.respond.mock.calls
++    .map(([, , value]) => value)
++    .filter((value) => value.operationId === op.operationId)
++
++describe('native create-ticket SUBMISSION_CONFLICT reply', () => {
++  it('relays the closed code the facade throws', async () => {
++    const p = ports()
++    const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.action.mockRejectedValueOnce(new Error('SUBMISSION_CONFLICT'))
++    const op = command('create-ticket', {
++      submissionId: crypto.randomUUID(),
++      ticket: { title: 'Broken save', attachments: [{ fileId: 'file_1' }] },
++    })
++    await bridge.receive(op, origin)
++    expect(replyFor(p, op)).toEqual([
++      expect.objectContaining({ success: false, error: 'SUBMISSION_CONFLICT' }),
++    ])
++  })
++  it('would hide the unmapped prose, which is why the facade maps it', async () => {
++    const p = ports()
++    const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.action.mockRejectedValueOnce(new Error('Submission ID already has a different report'))
++    const op = command('create-ticket', { submissionId: crypto.randomUUID(), ticket: { title: 'x' } })
++    await bridge.receive(op, origin)
++    expect(replyFor(p, op)).toEqual([
++      expect.objectContaining({ success: false, error: 'NATIVE_OPERATION_FAILED' }),
++    ])
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-attachments.test.ts b/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-attachments.test.ts
+index 8845acb..15f26b4 100644
+--- a/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-attachments.test.ts
++++ b/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-attachments.test.ts
+@@ -224,4 +224,71 @@ describe.skipIf(!fixture.available)('native Ticket attachments (real DB, rolled
+     expect(untouched.messageId).toBeNull()
+     expect(untouched.attachedAt).toBeNull()
+   })
++
++  it('rebuilds a {fileId}-only reference from its row and links it', async () => {
++    await seedDefaultStatus()
++    const me = await seedPrincipal()
++    const row = await upload(me)
++    const ticket = { title: 'Broken save', attachments: [{ fileId: row.id }] }
++    const created = await createTicketCore(
++      {
++        type: 'customer' as const,
++        ...ticket,
++        attachments: ticket.attachments as never,
++        requesterPrincipalId: me,
++        withBackingConversation: true,
++        nativeSubmission: { submissionId: crypto.randomUUID(), digest: nativeSubmissionDigest(ticket) },
++      },
++      requesterActor(me)
++    )
++    const [pair] = await testDb
++      .select()
++      .from(ticketConversations)
++      .where(eq(ticketConversations.ticketId, created.id as TicketId))
++    const [message] = await testDb
++      .select()
++      .from(conversationMessages)
++      .where(eq(conversationMessages.conversationId, pair!.conversationId))
++    expect(message.attachments).toEqual([
++      expect.objectContaining({
++        fileId: row.id,
++        name: 'report.pdf',
++        contentType: 'application/pdf',
++        size: row.size,
++        url: expect.stringContaining('/api/storage/'),
++      }),
++    ])
++    const [linked] = await testDb.select().from(files).where(eq(files.id, row.id))
++    expect(linked.messageId).toBe(message.id)
++  })
++
++  it('refuses a reused submissionId with different attachments as SUBMISSION_CONFLICT', async () => {
++    await seedDefaultStatus()
++    const me = await seedPrincipal()
++    const first = await upload(me)
++    const second = await upload(me)
++    const input = nativeInput(me, first.id)
++    const created = await createTicketCore(input, requesterActor(me))
++    const changed = { title: input.title, description: input.description, attachments: [{ fileId: second.id }] }
++    await expect(
++      createTicketCore(
++        {
++          ...input,
++          attachments: changed.attachments as never,
++          nativeSubmission: {
++            submissionId: input.nativeSubmission.submissionId,
++            digest: nativeSubmissionDigest(changed),
++          },
++        },
++        requesterActor(me)
++      )
++    ).rejects.toMatchObject({ code: 'SUBMISSION_CONFLICT' })
++    expect(
++      await testDb.select().from(tickets).where(eq(tickets.requesterPrincipalId, me))
++    ).toHaveLength(1)
++    const [untouched] = await testDb.select().from(files).where(eq(files.id, second.id))
++    expect(untouched.messageId).toBeNull()
++    expect(untouched.attachedAt).toBeNull()
++    expect(created.id).toBeTruthy()
++  })
+ })
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-facade.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-facade.test.ts
+index c96036f..9e1e654 100644
+--- a/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-facade.test.ts
++++ b/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-facade.test.ts
+@@ -105,7 +105,6 @@ describe('native create-ticket attachments', () => {
+     ['a reference without fileId', { url: '/api/storage/files/1.png', size: 1 }],
+     ['an empty fileId', { fileId: '', url: '/api/storage/files/1.png', size: 1 }],
+     ['a negative size', { fileId: 'file_1', url: '/api/storage/files/1.png', size: -1 }],
+-    ['a missing url', { fileId: 'file_1', size: 1 }],
+   ])('refuses %s', async (_label, value) => {
+     await expect(invoke({ data: { context, action: create([value]) } })).rejects.toThrow()
+     expect(ports.create).not.toHaveBeenCalled()
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-review.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-review.test.ts
+new file mode 100644
+index 0000000..90a0ba2
+--- /dev/null
++++ b/apps/web/src/lib/server/functions/widget/__tests__/native-host-attachments-review.test.ts
+@@ -0,0 +1,138 @@
++/**
++ * Review follow-up for native upload-attachment intake: a `{fileId}` reference
++ * is complete (url/size are optional echoes the core never trusts), and a
++ * reused submissionId with a different report surfaces as the closed native
++ * code SUBMISSION_CONFLICT instead of opaque prose.
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++vi.mock('@tanstack/react-start', () => ({
++  createServerFn: () => {
++    let schema: { parse(value: unknown): unknown },
++      handler: (value: { data: unknown }) => Promise<unknown>
++    const fn = async (value: { data: unknown }) => handler({ data: schema.parse(value.data) })
++    fn.validator = (value: typeof schema) => {
++      schema = value
++      return fn
++    }
++    fn.handler = (value: typeof handler) => {
++      handler = value
++      return fn
++    }
++    return fn
++  },
++}))
++const ports = vi.hoisted(() => ({
++  auth: vi.fn(),
++  bound: vi.fn(),
++  create: vi.fn(),
++  bearer: 'synthetic-native-bearer',
++}))
++vi.mock('@/lib/server/functions/widget-auth', () => ({ requireWidgetAuth: ports.auth }))
++vi.mock('@/lib/server/widget/native-host-token', () => ({
++  requireBoundNativeHostSession: ports.bound,
++  retireNativeHostSession: vi.fn(),
++}))
++vi.mock('@tanstack/react-start/server', () => ({
++  getRequestHeaders: () => new Headers({ authorization: `Bearer ${ports.bearer}` }),
++}))
++vi.mock('@/lib/server/functions/tickets', () => ({ runCreateMyTicket: ports.create }))
++vi.mock('@/lib/server/db', () => ({ sql: vi.fn() }))
++import { nativeHostActionFn, nativeHostActionSchema } from '../native-host'
++import { nativeSubmissionDigest } from '@/lib/server/widget/native-submission'
++import { ValidationError } from '@/lib/shared/errors'
++const invoke = nativeHostActionFn as unknown as (args: { data: unknown }) => Promise<unknown>
++const context = {
++  contract: 'iplaycafe.feedback/native-1',
++  operationId: '00000000-0000-4000-8000-000000000005',
++  hostOrigin: 'https://app.example.test',
++}
++const ctx = {
++  principal: { type: 'user', id: 'synthetic-principal', role: 'user' },
++  user: { id: 'synthetic-user' },
++  scope: 'widget',
++}
++const submissionId = '00000000-0000-4000-8000-000000000006'
++const create = (attachments: unknown) => ({
++  type: 'create-ticket',
++  payload: { submissionId, ticket: { title: 'Broken save', attachments } },
++})
++beforeEach(() => {
++  vi.resetAllMocks()
++  ports.auth.mockResolvedValue(ctx)
++  ports.bound.mockResolvedValue('session')
++  ports.create.mockResolvedValue({ id: 'ticket_x' })
++})
++
++describe('native create-ticket {fileId}-only attachments', () => {
++  it('accepts a bare fileId reference and binds the digest to exactly what the host sent', async () => {
++    const attachments = [{ fileId: 'file_1' }, { fileId: 'file_2', size: 12 }]
++    await expect(invoke({ data: { context, action: create(attachments) } })).resolves.toEqual({
++      id: 'ticket_x',
++    })
++    const ticket = { title: 'Broken save', attachments }
++    expect(ports.create).toHaveBeenCalledWith(ctx, ticket, {
++      submissionId,
++      digest: nativeSubmissionDigest(ticket),
++    })
++    // A host echoing url later is a different report body, not a silent match.
++    expect(nativeSubmissionDigest(ticket)).not.toBe(
++      nativeSubmissionDigest({
++        ...ticket,
++        attachments: [{ fileId: 'file_1', url: '/api/storage/files/1.png' }, attachments[1]],
++      })
++    )
++    expect(ports.bound.mock.invocationCallOrder[0]).toBeLessThan(
++      ports.create.mock.invocationCallOrder[0]
++    )
++  })
++  it('keeps url and size optional but still type-checked when present', () => {
++    for (const ok of [{ fileId: 'f' }, { fileId: 'f', url: '/u' }, { fileId: 'f', size: 0 }]) {
++      expect(nativeHostActionSchema.safeParse(create([ok])).success).toBe(true)
++    }
++    for (const bad of [
++      {},
++      { fileId: '' },
++      { fileId: 'f', url: '' },
++      { fileId: 'f', size: -1 },
++      { fileId: 'f', size: 1.5 },
++      { fileId: 'f', size: '1' },
++      { url: '/u', size: 1 },
++    ]) {
++      expect(nativeHostActionSchema.safeParse(create([bad])).success).toBe(false)
++    }
++  })
++})
++
++describe('native create-ticket SUBMISSION_CONFLICT', () => {
++  it('maps the core conflict ValidationError to the closed native code', async () => {
++    ports.create.mockRejectedValueOnce(
++      new ValidationError('SUBMISSION_CONFLICT', 'Submission ID already has a different report')
++    )
++    await expect(
++      invoke({ data: { context, action: create([{ fileId: 'file_1' }]) } })
++    ).rejects.toThrow(/^SUBMISSION_CONFLICT$/)
++  })
++  it('maps a conflict for a text-only report too', async () => {
++    ports.create.mockRejectedValueOnce(
++      Object.assign(new Error('Submission ID already has a different report'), {
++        code: 'SUBMISSION_CONFLICT',
++      })
++    )
++    const action = { type: 'create-ticket', payload: { submissionId, ticket: { title: 'Text' } } }
++    await expect(invoke({ data: { context, action } })).rejects.toThrow(/^SUBMISSION_CONFLICT$/)
++  })
++  it('leaves other ticket refusals and the expiry mapping unchanged', async () => {
++    ports.create.mockRejectedValueOnce(
++      new ValidationError('VALIDATION_ERROR', 'Invalid attachment')
++    )
++    await expect(
++      invoke({ data: { context, action: create([{ fileId: 'file_1' }]) } })
++    ).rejects.toThrow('Invalid attachment')
++    ports.create.mockRejectedValueOnce(
++      Object.assign(new Error('gone'), { code: 'FILE_EXPIRED' })
++    )
++    await expect(
++      invoke({ data: { context, action: create([{ fileId: 'file_1' }]) } })
++    ).rejects.toThrow(/^ATTACHMENT_EXPIRED$/)
++  })
++})
+diff --git a/apps/web/src/lib/server/functions/widget/native-host.ts b/apps/web/src/lib/server/functions/widget/native-host.ts
+index bd331c1..b7883a3 100644
+--- a/apps/web/src/lib/server/functions/widget/native-host.ts
++++ b/apps/web/src/lib/server/functions/widget/native-host.ts
+@@ -9,10 +9,12 @@ const evidenceId = z.string().regex(/^qbe_[0-9a-f-]{36}$/)
+ // Native Tickets attach only pipeline files (upload-attachment results). The
+ // ticket service rebuilds type/size/URL from the file row and admits only the
+ // requester's own uploads; unknown keys (for example mimeType) are stripped.
++// A `{fileId}` reference is complete: url/size are optional echoes of the
++// upload result and never override the row.
+ const nativeTicketAttachment = z.object({
+   fileId: z.string().min(1).max(64),
+-  url: z.string().min(1),
+-  size: z.number().int().nonnegative(),
++  url: z.string().min(1).optional(),
++  size: z.number().int().nonnegative().optional(),
+   name: z.string().optional(),
+   contentType: z.string().optional(),
+ })
+@@ -71,14 +73,20 @@ export const nativeHostActionFn = createServerFn({method: 'POST'})
+     const native = await import('../tickets')
+     if (data.action.type === 'create-ticket') {
+       const {nativeSubmissionDigest} = await import('@/lib/server/widget/native-submission')
++      // Every native entry carries a fileId, so the core rebuilds it from its
++      // row (resolveAttachments); the legacy url/size path is never reached.
++      const ticket = data.action.payload.ticket as unknown as import('@/lib/shared/schemas/tickets').CreateMyTicketInput
+       try {
+-        return await native.runCreateMyTicket(ctx, data.action.payload.ticket, {
++        return await native.runCreateMyTicket(ctx, ticket, {
+           submissionId: data.action.payload.submissionId,
+           digest: nativeSubmissionDigest(data.action.payload.ticket),
+         })
+       } catch (error) {
++        const code = (error as {code?: unknown} | null)?.code
+         // Retention removed an unsent upload: the host must upload it again.
+-        if ((error as {code?: unknown} | null)?.code === 'FILE_EXPIRED') throw new Error('ATTACHMENT_EXPIRED')
++        if (code === 'FILE_EXPIRED') throw new Error('ATTACHMENT_EXPIRED')
++        // The submissionId already names a different report: a closed code, not prose.
++        if (code === 'SUBMISSION_CONFLICT') throw new Error('SUBMISSION_CONFLICT')
+         throw error
+       }
+     }

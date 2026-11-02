@@ -1,0 +1,84 @@
+diff --git a/apps/web/src/routes/api/storage/$.ts b/apps/web/src/routes/api/storage/$.ts
+index 1c1faa4..2ddfe1c 100644
+--- a/apps/web/src/routes/api/storage/$.ts
++++ b/apps/web/src/routes/api/storage/$.ts
+@@ -381,7 +381,10 @@ async function serveStorageGet(request: Request): Promise<Response> {
+   // Force proxy for email embeds (?email=1), since email clients don't follow
+   // redirects, and for the file viewer's fetch (?proxy=1), since a script
+   // cannot read a cross-origin redirect target the bucket has no CORS grant for.
+-  const forceProxy = url.searchParams.has('email') || url.searchParams.has('proxy')
++  // Explicit downloads also stay on this origin: an embedding host's frame-src
++  // policy can block a bucket redirect before its attachment header is read.
++  const forceProxy =
++    downloadName !== null || url.searchParams.has('email') || url.searchParams.has('proxy')
+   const requestedRange = request.headers.get('range')
+   if (requestedRange && !isSingleByteRange(requestedRange)) {
+     return new Response(null, { status: 416, headers: { 'Accept-Ranges': 'bytes' } })
+diff --git a/apps/web/src/routes/api/storage/__tests__/storage-download.test.ts b/apps/web/src/routes/api/storage/__tests__/storage-download.test.ts
+index f8f91fc..efa5192 100644
+--- a/apps/web/src/routes/api/storage/__tests__/storage-download.test.ts
++++ b/apps/web/src/routes/api/storage/__tests__/storage-download.test.ts
+@@ -1,7 +1,7 @@
+ /**
+  * Download mode: `?download=1[&filename=…]` on a read link always answers as
+  * an attachment, under the name asked for (made safe for a header) or the
+- * key's own, on the proxy path and through the presigned redirect. It never
++ * key's own, through the same-origin proxy even when redirects are enabled. It never
+  * stands in for the read capability.
+  */
+ import { beforeEach, describe, expect, it, vi } from 'vitest'
+@@ -108,34 +108,38 @@ describe('download mode on the proxy path', () => {
+   })
+ })
+ 
+-describe('download mode on the redirect path', () => {
+-  it('presigns the attachment with the name asked for', async () => {
++describe('download mode when storage normally redirects', () => {
++  it('serves the attachment on this origin so an embedded download survives frame-src CSP', async () => {
+     const res = await get(
+       `/api/storage/${KEY}?read=ok&download=1&filename=${encodeURIComponent('Q3 Réport.pdf')}`
+     )
+-    expect(res.status).toBe(302)
+-    expect(generatePresignedGetUrl).toHaveBeenCalledWith(
+-      KEY,
+-      172_800,
+-      'Q3 Réport.pdf',
+-      'application/pdf'
++    expect(res.status).toBe(200)
++    expect(res.headers.get('location')).toBeNull()
++    expect(res.headers.get('content-disposition')).toBe(
++      `attachment; filename="Q3 R_port.pdf"; filename*=UTF-8''Q3%20R%C3%A9port.pdf`
+     )
++    expect([...new Uint8Array(await res.arrayBuffer())]).toEqual([0x25, 0x50, 0x44, 0x46])
++    expect(generatePresignedGetUrl).not.toHaveBeenCalled()
+   })
+ 
+-  it('presigns under the key name without one', async () => {
+-    await get(`/api/storage/${KEY}?read=ok&download=1`)
+-    expect(generatePresignedGetUrl).toHaveBeenCalledWith(
+-      KEY,
+-      172_800,
+-      'report.pdf',
+-      'application/pdf'
++  it('serves under the key name without a requested filename', async () => {
++    const res = await get(`/api/storage/${KEY}?read=ok&download=1`)
++    expect(res.status).toBe(200)
++    expect(res.headers.get('content-disposition')).toBe(
++      `attachment; filename="report.pdf"; filename*=UTF-8''report.pdf`
+     )
+   })
++
++  it('keeps the normal read redirect without explicit download mode', async () => {
++    const res = await get(`/api/storage/${KEY}?read=ok`)
++    expect(res.status).toBe(302)
++    expect(res.headers.get('location')).toBe('https://s3.example.com/presigned')
++  })
+ })
+ 
+ describe('download mode needs the read capability', () => {
+   it('refuses a private key without a valid capability, download or not', async () => {
+-    const res = await get(`/api/storage/${KEY}?read=bad&proxy=1&download=1&filename=x.pdf`)
++    const res = await get(`/api/storage/${KEY}?read=bad&download=1&filename=x.pdf`)
+     expect(res.status).toBe(403)
+     expect(getS3Object).not.toHaveBeenCalled()
+   })

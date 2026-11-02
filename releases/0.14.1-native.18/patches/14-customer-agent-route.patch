@@ -1,0 +1,676 @@
+diff --git a/apps/web/src/lib/server/config.ts b/apps/web/src/lib/server/config.ts
+--- a/apps/web/src/lib/server/config.ts
++++ b/apps/web/src/lib/server/config.ts
+@@ -259,6 +259,11 @@
+     openaiApiKey: z.string().optional(),
+     openaiBaseUrl: z.string().optional(),
+     openaiDefaultHeaders: z.string().optional(),
++    aiCustomerAgentBaseUrl: z.string().optional(),
++    aiCustomerAgentApiKey: z.string().optional(),
++    aiCustomerAgentDefaultHeaders: z.string().optional(),
++    aiCustomerAgentModel: z.string().optional(),
++    aiCustomerAgentReasoningEffort: z.string().optional(),
+     aiChatModel: z.string().optional(),
+     aiEmbeddingModel: z.string().optional(),
+     aiSummaryModel: z.string().optional(),
+@@ -419,6 +424,11 @@
+     openaiApiKey: env('OPENAI_API_KEY'),
+     openaiBaseUrl: env('OPENAI_BASE_URL'),
+     openaiDefaultHeaders: env('OPENAI_DEFAULT_HEADERS'),
++    aiCustomerAgentBaseUrl: env('AI_CUSTOMER_AGENT_BASE_URL'),
++    aiCustomerAgentApiKey: env('AI_CUSTOMER_AGENT_API_KEY'),
++    aiCustomerAgentDefaultHeaders: env('AI_CUSTOMER_AGENT_DEFAULT_HEADERS'),
++    aiCustomerAgentModel: env('AI_CUSTOMER_AGENT_MODEL'),
++    aiCustomerAgentReasoningEffort: env('AI_CUSTOMER_AGENT_REASONING_EFFORT'),
+     aiChatModel: env('AI_CHAT_MODEL'),
+     aiEmbeddingModel: env('AI_EMBEDDING_MODEL'),
+     aiSummaryModel: env('AI_SUMMARY_MODEL'),
+@@ -686,6 +696,21 @@
+   },
+   get openaiBaseUrl() {
+     return loadConfig().openaiBaseUrl
++  },
++  get aiCustomerAgentBaseUrl() {
++    return loadConfig().aiCustomerAgentBaseUrl
++  },
++  get aiCustomerAgentApiKey() {
++    return loadConfig().aiCustomerAgentApiKey
++  },
++  get aiCustomerAgentDefaultHeaders() {
++    return loadConfig().aiCustomerAgentDefaultHeaders
++  },
++  get aiCustomerAgentModel() {
++    return loadConfig().aiCustomerAgentModel
++  },
++  get aiCustomerAgentReasoningEffort() {
++    return loadConfig().aiCustomerAgentReasoningEffort
+   },
+   get aiChatModel() {
+     return loadConfig().aiChatModel
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/cloudflare-reasoning-wire.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/cloudflare-reasoning-wire.test.ts
+--- a/apps/web/src/lib/server/domains/ai/__tests__/cloudflare-reasoning-wire.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/cloudflare-reasoning-wire.test.ts
+@@ -8,6 +8,13 @@
+   openaiBaseUrl: 'https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/workers-ai/v1',
+   aiReasoningEffort: 'low' as string | undefined,
+   aiRequireParameters: undefined as boolean | undefined,
++  openaiDefaultHeaders: '{"cf-aig-authorization":"Bearer synthetic-global-gateway"}',
++  aiCustomerAgentBaseUrl:
++    'https://api.cloudflare.com/client/v4/accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ai/v1',
++  aiCustomerAgentApiKey: 'synthetic-customer-workers-key',
++  aiCustomerAgentDefaultHeaders: '{"cf-aig-gateway-id":"customer"}',
++  aiCustomerAgentModel: 'synthetic-customer-model' as string | undefined,
++  aiCustomerAgentReasoningEffort: 'low',
+ }))
+ vi.mock('@/lib/server/config', () => ({ config: settings }))
+ vi.mock('@/lib/server/logger', () => ({
+@@ -103,6 +110,7 @@
+     settings.openaiBaseUrl =
+       'https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/workers-ai/v1'
+     settings.aiReasoningEffort = 'low'
++    settings.aiCustomerAgentModel = 'synthetic-customer-model'
+     resetStructuredFallbackMemory()
+   })
+   afterEach(() => {
+@@ -116,6 +124,111 @@
+     expect(bodies[0].response_format).toMatchObject({ type: 'json_schema' })
+     expect(bodies[0]).not.toHaveProperty('reasoning')
+     expect(bodies[0]).not.toHaveProperty('provider')
++  })
++
++  it.each([false, true])(
++    'isolates customer credentials and low effort through the real SDK (tools=%s)',
++    async (tools) => {
++      // Synthetic transport captures the installed SDK serialization. This is
++      // deliberately not evidence of Workers AI model or schema acceptance.
++      settings.openaiBaseUrl = 'https://openrouter.ai/api/v1'
++      settings.aiReasoningEffort = 'high'
++      const bodies: WireBody[] = []
++      vi.stubGlobal(
++        'fetch',
++        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
++          const request = new Request(input, init)
++          expect(request.url).toBe(settings.aiCustomerAgentBaseUrl + '/chat/completions')
++          expect(request.redirect).toBe('error')
++          expect(request.headers.get('authorization')).toBe('Bearer synthetic-customer-workers-key')
++          expect(request.headers.get('cf-aig-gateway-id')).toBe('customer')
++          expect(request.headers.has('cf-aig-authorization')).toBe(false)
++          const body = JSON.parse(await request.text())
++          bodies.push(body)
++          expect(bodies.length).toBeLessThanOrEqual(tools ? 2 : 1)
++          return completion(body.stream)
++        })
++      )
++      const outcome = await runSynthesis({
++        customerAgentRoute: true,
++        model: 'synthetic-customer-model',
++        systemPrompts: ['Return synthetic JSON.'],
++        messages: [{ role: 'user', content: 'Synthetic fixture.' }],
++        outputSchema: z.object({ ok: z.boolean() }),
++        deltaField: 'ok',
++        salvageMode: 'strict',
++        salvage: () => null,
++        onFailure: 'throw',
++        retries: 0,
++        transportRetries: 0,
++        maxOutputTokens: 128,
++        ...(tools
++          ? {
++              tools: {
++                specs: [
++                  toolDefinition({
++                    name: 'synthetic_read',
++                    description: 'Unused synthetic read.',
++                    inputSchema: z.object({}),
++                  }).server(async () => {
++                    throw new Error('UNEXPECTED_TOOL_EXECUTION')
++                  }),
++                ],
++                context: {},
++                names: new Set(['synthetic_read']),
++                agentLoopStrategy: maxIterations(1),
++              },
++            }
++          : {}),
++        usageLogParams: {
++          pipelineStep: 'synthetic-customer-wire',
++          callType: 'chat_completion',
++          model: 'synthetic-customer-model',
++        },
++        deriveAnswerKind: () => 'answered',
++      })
++      expect(outcome).toMatchObject({ outcome: 'success', final: { ok: true } })
++      expect(bodies).toHaveLength(tools ? 2 : 1)
++      for (const body of bodies) {
++        expect(body).toMatchObject({
++          model: 'synthetic-customer-model',
++          reasoning_effort: 'low',
++          max_tokens: 128,
++        })
++        expect(body).not.toHaveProperty('reasoning')
++        expect(body).not.toHaveProperty('provider')
++      }
++    }
++  )
++
++  it('never dials the global client for an incomplete customer route', async () => {
++    settings.aiCustomerAgentModel = undefined
++    const fetchSpy = vi.fn(() => {
++      throw new Error('UNEXPECTED_NETWORK')
++    })
++    vi.stubGlobal('fetch', fetchSpy)
++    await expect(
++      runSynthesis({
++        customerAgentRoute: true,
++        model: 'global-model',
++        systemPrompts: [],
++        messages: [],
++        outputSchema: z.object({ ok: z.boolean() }),
++        deltaField: 'ok',
++        salvageMode: 'strict',
++        salvage: () => null,
++        onFailure: 'throw',
++        retries: 0,
++        transportRetries: 0,
++        usageLogParams: {
++          pipelineStep: 'synthetic-customer-off',
++          callType: 'chat_completion',
++          model: 'global-model',
++        },
++        deriveAnswerKind: () => 'answered',
++      })
++    ).rejects.toThrow('Customer agent is not configured')
++    expect(fetchSpy).not.toHaveBeenCalled()
+   })
+ 
+   it('retains low on the json_object fallback without adding requests', async () => {
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/customer-agent-route.regression.node.ts b/apps/web/src/lib/server/domains/ai/__tests__/customer-agent-route.regression.node.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/__tests__/customer-agent-route.regression.node.ts
+@@ -0,0 +1,122 @@
++import { test } from 'node:test'
++import assert from 'node:assert/strict'
++// @ts-expect-error Node strip-types execution requires explicit source extensions.
++import * as routeModule from '../customer-agent-route.ts'
++
++const complete = {
++  aiCustomerAgentBaseUrl:
++    'https://gateway.ai.cloudflare.com/v1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/customer/workers-ai/v1',
++  aiCustomerAgentApiKey: 'synthetic-workers-read-only',
++  aiCustomerAgentDefaultHeaders: '{"cf-aig-authorization":"Bearer synthetic-customer-gateway"}',
++  aiCustomerAgentModel: 'synthetic-customer-model',
++  aiCustomerAgentReasoningEffort: 'low',
++}
++
++test('customer route must exist independently of the global AI client', () => {
++  assert.equal(typeof routeModule.resolveCustomerAgentRoute, 'function')
++  const route = routeModule.resolveCustomerAgentRoute(complete)
++  assert.equal(route?.model, complete.aiCustomerAgentModel)
++  assert.equal(route?.openaiApiKey, complete.aiCustomerAgentApiKey)
++  assert.equal(route?.reasoningEffort, 'low')
++  for (const key of Object.keys(complete)) {
++    assert.equal(routeModule.resolveCustomerAgentRoute({ ...complete, [key]: undefined }), null)
++    assert.equal(routeModule.resolveCustomerAgentRoute({ ...complete, [key]: ' ' }), null)
++  }
++  assert.equal(routeModule.resolveCustomerAgentRoute({}), null)
++})
++
++test('invalid endpoint, headers, model or reasoning leaves the customer route off', () => {
++  for (const url of [
++    'https://api.openai.com/v1',
++    complete.aiCustomerAgentBaseUrl.replace('/workers-ai/v1', '/openai'),
++    complete.aiCustomerAgentBaseUrl.replace('cloudflare.com/', 'cloudflare.com.evil.invalid/'),
++    complete.aiCustomerAgentBaseUrl + '?secret=synthetic',
++    complete.aiCustomerAgentBaseUrl + '#fragment',
++  ])
++    assert.equal(
++      routeModule.resolveCustomerAgentRoute({ ...complete, aiCustomerAgentBaseUrl: url }),
++      null
++    )
++  for (const value of ['none', 'minimal', 'medium', 'xhigh'])
++    assert.equal(
++      routeModule.resolveCustomerAgentRoute({ ...complete, aiCustomerAgentReasoningEffort: value }),
++      null
++    )
++  for (const value of ['off', 'none', 'false'])
++    assert.equal(
++      routeModule.resolveCustomerAgentRoute({ ...complete, aiCustomerAgentModel: value }),
++      null
++    )
++  for (const value of [
++    'null',
++    '[]',
++    '{"Authorization":null}',
++    '{"authorization":"Bearer other"}',
++    '{"x-extra":"synthetic"}',
++  ])
++    assert.equal(
++      routeModule.resolveCustomerAgentRoute({ ...complete, aiCustomerAgentDefaultHeaders: value }),
++      null
++    )
++})
++
++test('direct Workers AI requires an explicit Gateway budget binding', () => {
++  const direct = {
++    ...complete,
++    aiCustomerAgentBaseUrl:
++      'https://api.cloudflare.com/client/v4/accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ai/v1',
++  }
++  assert.equal(routeModule.resolveCustomerAgentRoute(direct), null)
++  assert.equal(
++    routeModule.resolveCustomerAgentRoute({
++      ...direct,
++      aiCustomerAgentDefaultHeaders: '{"cf-aig-gateway-id":"customer"}',
++    })?.model,
++    complete.aiCustomerAgentModel
++  )
++  for (const value of [null, '', '../other', 42]) {
++    assert.equal(
++      routeModule.resolveCustomerAgentRoute({
++        ...direct,
++        aiCustomerAgentDefaultHeaders: JSON.stringify({ 'cf-aig-gateway-id': value }),
++      }),
++      null
++    )
++  }
++  assert.equal(
++    routeModule.resolveCustomerAgentRoute({
++      ...complete,
++      aiCustomerAgentDefaultHeaders: '{"cf-aig-gateway-id":"different-gateway"}',
++    }),
++    null
++  )
++})
++
++test('customer transport refuses another endpoint or model before forwarding and blocks redirects', async () => {
++  const route = routeModule.resolveCustomerAgentRoute(complete)!
++  const seen: Request[] = []
++  const transport = routeModule.customerAgentFetch(route, async (request: Request) => {
++    seen.push(request)
++    return Response.json({ synthetic: true })
++  })
++  const init = { method: 'POST', body: JSON.stringify({ model: complete.aiCustomerAgentModel }) }
++  for (const url of [
++    'https://api.openai.com/v1/chat/completions',
++    route.openaiBaseUrl + '/embeddings',
++  ])
++    await assert.rejects(() => transport(url, init), {
++      message: 'Customer agent transport refused',
++    })
++  await assert.rejects(
++    () =>
++      transport(route.openaiBaseUrl + '/chat/completions', {
++        ...init,
++        body: JSON.stringify({ model: 'global-model' }),
++      }),
++    { message: 'Customer agent transport refused' }
++  )
++  assert.equal(seen.length, 0)
++  await transport(route.openaiBaseUrl + '/chat/completions', init)
++  assert.equal(seen.length, 1)
++  assert.equal(seen[0].redirect, 'error')
++})
+diff --git a/apps/web/src/lib/server/domains/ai/customer-agent-route.ts b/apps/web/src/lib/server/domains/ai/customer-agent-route.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/customer-agent-route.ts
+@@ -0,0 +1,90 @@
++/** Customer support has no implicit provider, credential, model or global fallback. */
++export interface CustomerAgentConfig {
++  aiCustomerAgentBaseUrl?: string
++  aiCustomerAgentApiKey?: string
++  aiCustomerAgentDefaultHeaders?: string
++  aiCustomerAgentModel?: string
++  aiCustomerAgentReasoningEffort?: string
++}
++
++export interface CustomerAgentRoute {
++  openaiBaseUrl: string
++  openaiApiKey: string
++  openaiDefaultHeaders: string
++  model: string
++  reasoningEffort: 'low' | 'high' | 'max'
++}
++
++export function resolveCustomerAgentRoute(config: CustomerAgentConfig): CustomerAgentRoute | null {
++  const baseURL = config.aiCustomerAgentBaseUrl?.trim()
++  const apiKey = config.aiCustomerAgentApiKey?.trim()
++  const rawHeaders = config.aiCustomerAgentDefaultHeaders?.trim()
++  const model = config.aiCustomerAgentModel?.trim()
++  const effort = config.aiCustomerAgentReasoningEffort?.trim().toLowerCase()
++  if (!baseURL || !apiKey || !rawHeaders || !model || !effort) return null
++  if (['off', 'none', 'false'].includes(model.toLowerCase())) return null
++  if (effort !== 'low' && effort !== 'high' && effort !== 'max') return null
++  try {
++    const url = new URL(baseURL)
++    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash)
++      return null
++    if (!(
++      (url.origin === 'https://gateway.ai.cloudflare.com' &&
++        /^\/v1\/[a-f0-9]{32}\/[A-Za-z0-9_-]+\/workers-ai\/v1\/?$/.test(url.pathname)) ||
++      (url.origin === 'https://api.cloudflare.com' &&
++        /^\/client\/v4\/accounts\/[a-f0-9]{32}\/ai\/v1\/?$/.test(url.pathname))
++    ))
++      return null
++    // Dedicated API key supplies Workers AI authorization. Never permit headers
++    // to replace/remove it or inherit global gateway credentials.
++    const headers: unknown = JSON.parse(rawHeaders)
++    if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return null
++    const seen = new Set<string>()
++    let gatewayId: unknown
++    for (const [name, value] of Object.entries(headers)) {
++      const key = name.toLowerCase()
++      if (
++        seen.has(key) ||
++        !['cf-aig-authorization', 'cf-aig-gateway-id', 'x-stainless-lang'].includes(key)
++      )
++        return null
++      if (value !== null && typeof value !== 'string') return null
++      if (value !== null) new Headers([[key, value]])
++      if (key === 'cf-aig-gateway-id') gatewayId = value
++      seen.add(key)
++    }
++    if (url.origin === 'https://api.cloudflare.com') {
++      if (typeof gatewayId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(gatewayId)) return null
++    } else if (gatewayId !== undefined && gatewayId !== url.pathname.split('/')[3]) return null
++    return {
++      openaiBaseUrl: baseURL.replace(/\/$/, ''),
++      openaiApiKey: apiKey,
++      openaiDefaultHeaders: rawHeaders,
++      model,
++      reasoningEffort: effort,
++    }
++  } catch {
++    return null
++  }
++}
++
++/** Only chat completions for the admitted customer model may carry this credential. */
++export function customerAgentFetch(
++  route: CustomerAgentRoute,
++  transport: (input: Request) => Promise<Response>
++) {
++  return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
++    const request = new Request(input, init)
++    if (request.method !== 'POST' || request.url !== route.openaiBaseUrl + '/chat/completions')
++      throw new Error('Customer agent transport refused')
++    let body: unknown
++    try {
++      body = await request.clone().json()
++    } catch {
++      throw new Error('Customer agent transport refused')
++    }
++    if (!body || typeof body !== 'object' || (body as { model?: unknown }).model !== route.model)
++      throw new Error('Customer agent transport refused')
++    return transport(new Request(request, { redirect: 'error' }))
++  }
++}
+diff --git a/apps/web/src/lib/server/domains/assistant/__tests__/assistant.runtime.test.ts b/apps/web/src/lib/server/domains/assistant/__tests__/assistant.runtime.test.ts
+--- a/apps/web/src/lib/server/domains/assistant/__tests__/assistant.runtime.test.ts
++++ b/apps/web/src/lib/server/domains/assistant/__tests__/assistant.runtime.test.ts
+@@ -5,6 +5,12 @@
+ const mockConfig = vi.hoisted(() => ({
+   openaiApiKey: 'test-key' as string | undefined,
+   openaiBaseUrl: 'http://localhost:9999/v1' as string | undefined,
++  aiCustomerAgentBaseUrl:
++    'https://api.cloudflare.com/client/v4/accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ai/v1',
++  aiCustomerAgentApiKey: 'synthetic-customer-key',
++  aiCustomerAgentDefaultHeaders: '{"cf-aig-gateway-id":"customer"}',
++  aiCustomerAgentModel: 'test-model' as string | undefined,
++  aiCustomerAgentReasoningEffort: 'low',
+   aiChatModel: 'test-model' as string | undefined,
+   aiSummaryModel: undefined,
+   aiSentimentModel: undefined,
+@@ -325,6 +331,7 @@
+   mockConfig.openaiApiKey = 'test-key'
+   mockConfig.openaiBaseUrl = 'http://localhost:9999/v1'
+   mockConfig.aiChatModel = 'test-model'
++  mockConfig.aiCustomerAgentModel = 'test-model'
+   mockConfig.aiHelpCenterModel = undefined
+   mockConversationLookupLimit.mockResolvedValue([])
+   mockListMessages.mockResolvedValue({ messages: [], hasMore: false, nextCursor: null })
+@@ -587,6 +594,19 @@
+ })
+ 
+ describe('isAssistantConfigured', () => {
++  it('customer support requires its dedicated route while Copilot retains the global route', () => {
++    expect(isAssistantConfigured('customer_support')).toBe(true)
++    mockConfig.aiCustomerAgentModel = undefined
++    expect(isAssistantConfigured('customer_support')).toBe(false)
++    expect(isAssistantConfigured('copilot_qa')).toBe(true)
++    expect(isAssistantConfigured('workspace_assistant')).toBe(true)
++  })
++  it('customer support does not depend on global chat credentials', () => {
++    mockConfig.openaiBaseUrl = undefined
++    mockConfig.aiChatModel = undefined
++    expect(isAssistantConfigured('customer_support')).toBe(true)
++    expect(isAssistantConfigured('copilot_qa')).toBe(false)
++  })
+   it('is true with a client and chat model', () => {
+     expect(isAssistantConfigured()).toBe(true)
+   })
+@@ -602,7 +622,7 @@
+ 
+ describe('runAssistantTurn', () => {
+   it('throws when not configured', async () => {
+-    mockConfig.aiChatModel = undefined
++    mockConfig.aiCustomerAgentModel = undefined
+     await expect(
+       runAssistantTurn({ ...baseInput, messages: customerAsks('hi') })
+     ).rejects.toBeInstanceOf(AssistantNotConfiguredError)
+@@ -2642,7 +2662,7 @@
+   })
+ 
+   it('terminates with a coded RUN_ERROR (and no RUN_FINISHED) when the turn fails', async () => {
+-    mockConfig.aiChatModel = undefined
++    mockConfig.aiCustomerAgentModel = undefined
+ 
+     const chunks = await collect({
+       input: { ...baseInput, messages: customerAsks('hi') },
+diff --git a/apps/web/src/lib/server/domains/assistant/assistant.orchestrator.ts b/apps/web/src/lib/server/domains/assistant/assistant.orchestrator.ts
+--- a/apps/web/src/lib/server/domains/assistant/assistant.orchestrator.ts
++++ b/apps/web/src/lib/server/domains/assistant/assistant.orchestrator.ts
+@@ -131,7 +131,7 @@
+   conversationId: ConversationId,
+   opts?: { surface?: 'widget' | 'workflow_step' }
+ ): Promise<AssistantTurnEligibility> {
+-  if (!isAssistantConfigured()) return 'declined'
++  if (!isAssistantConfigured('customer_support')) return 'declined'
+   try {
+     const { requireEntitlement } = await import('@/lib/server/domains/settings/cloud/entitlements')
+     await requireEntitlement('aiAssistant')
+@@ -171,7 +171,7 @@
+     stepInstructions?: string | null
+   }
+ ): Promise<void> {
+-  if (!isAssistantConfigured()) return
++  if (!isAssistantConfigured('customer_support')) return
+ 
+   try {
+     const { requireEntitlement } = await import('@/lib/server/domains/settings/cloud/entitlements')
+diff --git a/apps/web/src/lib/server/domains/assistant/assistant.runtime.ts b/apps/web/src/lib/server/domains/assistant/assistant.runtime.ts
+--- a/apps/web/src/lib/server/domains/assistant/assistant.runtime.ts
++++ b/apps/web/src/lib/server/domains/assistant/assistant.runtime.ts
+@@ -19,6 +19,7 @@
+ import { db, conversations, principal, eq } from '@/lib/server/db'
+ import type { Executor } from '@/lib/server/domains/principals/principal.factory'
+ import { isAiClientConfigured, stripCodeFences } from '@/lib/server/domains/ai/config'
++import { resolveCustomerAgentRoute } from '@/lib/server/domains/ai/customer-agent-route'
+ import { getChatModel, isVisionCapableModel } from '@/lib/server/domains/ai/models'
+ import { createAssistantTracingMiddleware } from '@/lib/server/domains/ai/tracing-middleware'
+ import type { AiAnswerKind } from '@/lib/server/domains/ai/usage-log'
+@@ -331,7 +332,8 @@
+ }
+ 
+ /** Whether Quinn can run: AI client plus an effective chat model. */
+-export function isAssistantConfigured(): boolean {
++export function isAssistantConfigured(role?: AssistantRole): boolean {
++  if (role === 'customer_support') return resolveCustomerAgentRoute(config) !== null
+   return (
+     isAiClientConfigured(config.openaiApiKey, config.openaiBaseUrl) &&
+     getChatModel('assistant') !== null
+@@ -840,11 +842,14 @@
+     return { status: 'suppressed', reason: 'silence' }
+   }
+ 
+-  if (!isAssistantConfigured()) {
++  if (!isAssistantConfigured(role)) {
+     throw new AssistantNotConfiguredError()
+   }
+   // isAssistantConfigured() guarantees an effective chat model above.
+-  const model = getChatModel('assistant')!
++  const model =
++    role === 'customer_support'
++      ? resolveCustomerAgentRoute(config)!.model
++      : getChatModel('assistant')!
+ 
+   const audience = resolveContentAudience(surface)
+   if (audience !== rolePolicy.contentAudience) {
+@@ -1260,6 +1265,7 @@
+ 
+     const outcome = await runSynthesis<never, AssistantToolContext>({
+       model,
++      ...(role === 'customer_support' ? { customerAgentRoute: true as const } : {}),
+       systemPrompts,
+       messages: modelMessages,
+       outputSchema: assistantOutputSchema,
+diff --git a/apps/web/src/lib/server/domains/assistant/synthesis-core.ts b/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
+--- a/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
++++ b/apps/web/src/lib/server/domains/assistant/synthesis-core.ts
+@@ -32,6 +32,10 @@
+ import type { z } from 'zod'
+ import { config } from '@/lib/server/config'
+ import {
++  customerAgentFetch,
++  resolveCustomerAgentRoute,
++} from '@/lib/server/domains/ai/customer-agent-route'
++import {
+   stripCodeFences,
+   structuredOutputProviderOptions,
+   reasoningExcludeProviderOptions,
+@@ -103,6 +107,8 @@
+ 
+ interface RunAttemptOptions<TContext> {
+   model: string
++  /** Customer support opts into its isolated route; other callers retain global transport. */
++  customerAgentRoute?: true
+   systemPrompts: string[]
+   messages: SynthesisMessage[]
+   outputSchema: z.ZodTypeAny
+@@ -240,7 +246,16 @@
+   opts: RunAttemptOptions<TContext>,
+   controller: AbortController
+ ): Promise<AttemptOutcome> {
+-  const adapter = openaiCompatibleText(opts.model, getOpenAIClientOptions(config))
++  const customerRoute = opts.customerAgentRoute ? resolveCustomerAgentRoute(config) : null
++  if (opts.customerAgentRoute && (!customerRoute || customerRoute.model !== opts.model))
++    throw new Error('Customer agent is not configured')
++  const clientOptions = getOpenAIClientOptions(customerRoute ?? config)
++  const adapter = openaiCompatibleText(
++    opts.model,
++    customerRoute
++      ? { ...clientOptions, fetch: customerAgentFetch(customerRoute, clientOptions.fetch) }
++      : clientOptions
++  )
+   // TOOLS AND response_format MUST NOT SHARE A REQUEST. The compatible
+   // adapter reports combined tools+schema support (the API accepts it), but
+   // under constrained decoding models stop CALLING tools: generation is
+@@ -264,7 +279,7 @@
+     // request (require_parameters), so a param many providers don't
+     // advertise silently shrinks the pool to none and the turn dies with no
+     // output.
+-    ...structuredOutputProviderOptions(),
++    ...(customerRoute ? {} : structuredOutputProviderOptions()),
+     // Tool-less only: Quinn's tool loop still needs reasoning_details on the
+     // wire. AI_REASONING_EXCLUDE is opt-in because require_parameters 404s
+     // models whose providers do not advertise `reasoning`.
+@@ -272,6 +287,7 @@
+     // strip reasoning_details. GLM-5.3-Flash cannot disable thinking and
+     // defaults to `max` (~30s Slack turns) unless AI_REASONING_EFFORT is set.
+     ...(() => {
++      if (customerRoute) return { reasoning_effort: customerRoute.reasoningEffort }
+       const { reasoning: effort, ...providerEffort } = reasoningEffortProviderOptions()
+       const exclude = opts.tools ? undefined : reasoningExcludeProviderOptions().reasoning
+       return {
+diff --git a/apps/web/src/lib/server/domains/platform-credentials/platform-schema.ts b/apps/web/src/lib/server/domains/platform-credentials/platform-schema.ts
+--- a/apps/web/src/lib/server/domains/platform-credentials/platform-schema.ts
++++ b/apps/web/src/lib/server/domains/platform-credentials/platform-schema.ts
+@@ -196,7 +196,8 @@
+   // states to choose from and never free text.
+   if (zodType === 'envBoolean') return { kind: 'tristate', group: 'advanced' }
+   if (envKey.endsWith('_MODEL')) return { kind: 'model', group: 'models' }
+-  if (envKey === 'OPENAI_DEFAULT_HEADERS') return { kind: 'secret', group: 'connection' }
++  if (envKey === 'OPENAI_DEFAULT_HEADERS' || envKey === 'AI_CUSTOMER_AGENT_DEFAULT_HEADERS')
++    return { kind: 'secret', group: 'connection' }
+   if (envKey.endsWith('_API_KEY')) return { kind: 'secret', group: 'connection' }
+   if (envKey.endsWith('_URL')) return { kind: 'url', group: 'connection' }
+   return { kind: 'text', group: 'connection' }
+diff --git a/apps/web/src/lib/shared/__tests__/platform-schema.generated.test.ts b/apps/web/src/lib/shared/__tests__/platform-schema.generated.test.ts
+--- a/apps/web/src/lib/shared/__tests__/platform-schema.generated.test.ts
++++ b/apps/web/src/lib/shared/__tests__/platform-schema.generated.test.ts
+@@ -86,9 +86,23 @@
+ })
+ 
+ describe('gateway header metadata', () => {
++  it('masks independent customer credentials and headers in the derived schema', () => {
++    const keys = derivePlatformSchema().ai.keys
++    for (const key of ['AI_CUSTOMER_AGENT_API_KEY', 'AI_CUSTOMER_AGENT_DEFAULT_HEADERS']) {
++      expect(keys.find((entry) => entry.key === key)).toEqual({
++        key,
++        kind: 'secret',
++        group: 'connection',
++        sensitive: true,
++      })
++    }
++  })
+   it('masks configured gateway headers because they can carry credentials', () => {
+     expect(committed.ai.keys.find((key) => key.key === 'OPENAI_DEFAULT_HEADERS')).toEqual({
+-      key: 'OPENAI_DEFAULT_HEADERS', kind: 'secret', group: 'connection', sensitive: true,
++      key: 'OPENAI_DEFAULT_HEADERS',
++      kind: 'secret',
++      group: 'connection',
++      sensitive: true,
+     })
+   })
+ })
+diff --git a/apps/web/src/lib/shared/platform-schema.generated.json b/apps/web/src/lib/shared/platform-schema.generated.json
+--- a/apps/web/src/lib/shared/platform-schema.generated.json
++++ b/apps/web/src/lib/shared/platform-schema.generated.json
+@@ -19,6 +19,36 @@
+         "kind": "secret",
+         "group": "connection",
+         "sensitive": true
++      },
++      {
++        "key": "AI_CUSTOMER_AGENT_BASE_URL",
++        "kind": "url",
++        "group": "connection",
++        "sensitive": false
++      },
++      {
++        "key": "AI_CUSTOMER_AGENT_API_KEY",
++        "kind": "secret",
++        "group": "connection",
++        "sensitive": true
++      },
++      {
++        "key": "AI_CUSTOMER_AGENT_DEFAULT_HEADERS",
++        "kind": "secret",
++        "group": "connection",
++        "sensitive": true
++      },
++      {
++        "key": "AI_CUSTOMER_AGENT_MODEL",
++        "kind": "model",
++        "group": "models",
++        "sensitive": false
++      },
++      {
++        "key": "AI_CUSTOMER_AGENT_REASONING_EFFORT",
++        "kind": "text",
++        "group": "connection",
++        "sensitive": false
+       },
+       {
+         "key": "AI_CHAT_MODEL",

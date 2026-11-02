@@ -1,0 +1,98 @@
+diff --git a/packages/db/src/migrate-runtime.ts b/packages/db/src/migrate-runtime.ts
+index 685feef..285ffef 100644
+--- a/packages/db/src/migrate-runtime.ts
++++ b/packages/db/src/migrate-runtime.ts
+@@ -82,6 +82,7 @@ import {
+   type PostconditionReport,
+ } from './schema-ops'
+ import { MIGRATIONS_DIR } from './schema-version'
++import { assertNativeLedgerPrefix } from './native-ledger-policy'
+ 
+ export { MigrationPreflightError } from './schema-ops'
+ 
+@@ -371,11 +372,21 @@ export async function planMigrations(
+     `SELECT to_regclass('drizzle.__drizzle_migrations')::text AS ledger`
+   )
+   let lastApplied: number | null = null
+-  if (ledger?.ledger) {
+-    const [row] = await sql.unsafe<{ created_at: string | null }[]>(
+-      `SELECT created_at FROM drizzle.__drizzle_migrations ORDER BY created_at DESC LIMIT 1`
++  const rows = ledger?.ledger
++    ? await sql.unsafe<{ id: number; hash: string; created_at: string }[]>(
++        `SELECT id, hash, created_at FROM drizzle.__drizzle_migrations ORDER BY created_at, id`
++      )
++    : []
++  assertNativeLedgerPrefix(rows, migrations.map((m) => ({ hash: m.hash, when: m.folderMillis })))
++  if (rows.length === 0) {
++    const [existing] = await sql.unsafe<{ count: string }[]>(
++      `SELECT count(*)::text AS count FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
++       WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')`
+     )
+-    if (row?.created_at != null) lastApplied = Number(row.created_at)
++    if (Number(existing?.count ?? 0) !== 0)
++      throw new Error('Unledgered nonempty schema: refusing native migration startup')
++  } else {
++    lastApplied = Math.max(...rows.map((row) => Number(row.created_at)))
+   }
+   const isPending = (m: MigrationMeta) => lastApplied === null || lastApplied < m.folderMillis
+   const tagOf = (m: MigrationMeta) => tagByMillis.get(m.folderMillis) ?? String(m.folderMillis)
+diff --git a/packages/db/src/native-ledger-policy.ts b/packages/db/src/native-ledger-policy.ts
+new file mode 100644
+index 0000000..64e64a6
+--- /dev/null
++++ b/packages/db/src/native-ledger-policy.ts
+@@ -0,0 +1,54 @@
++/** Pure fail-closed lineage policy, shared by startup guard and rehearsal tool. */
++export interface MigrationSeal { hash: string; when: number; tag?: string }
++export interface LedgerRow { id: number; hash: string; created_at: string | number }
++export interface LegacyContract { commonPrefix: MigrationSeal[]; custom: MigrationSeal[] }
++
++function ordered(rows: LedgerRow[]): LedgerRow[] {
++  if (new Set(rows.map(r => r.id)).size !== rows.length || rows.some(r => !Number.isSafeInteger(r.id) || r.id < 1))
++    throw new Error('Migration lineage has invalid or duplicate row IDs')
++  if (rows.some(r => !Number.isSafeInteger(Number(r.created_at)) || Number(r.created_at) < 0))
++    throw new Error('Migration timestamp is invalid')
++  // Native 0052 has an earlier timestamp than 0051. Serial insertion IDs,
++  // rather than timestamps, preserve the journal's actual execution order.
++  return [...rows].sort((a, b) => a.id - b.id)
++}
++
++function prefix(rows: LedgerRow[], seals: MigrationSeal[]): boolean {
++  return rows.length <= seals.length && rows.every((r, i) =>
++    r.hash === seals[i].hash && Number(r.created_at) === seals[i].when)
++}
++
++/** Validate every row, rather than trusting Drizzle's newest timestamp. */
++export function assertNativeLedgerPrefix(rows: LedgerRow[], native: MigrationSeal[]): void {
++  const sorted = ordered(rows)
++  if (!prefix(sorted, native))
++    throw new Error('Migration lineage is not an exact native prefix; explicit disposable reconciliation required')
++  const highWater=sorted.length ? Math.max(...sorted.map(r=>Number(r.created_at))) : -1
++  if(native.slice(sorted.length).some(s=>s.when<=highWater))
++    throw new Error('Native migration lineage timestamp would skip unapplied SQL; refusing startup')
++}
++
++export function classifyLedger(rows: LedgerRow[], native: MigrationSeal[], legacy: LegacyContract):
++  { kind: 'fresh' | 'native' | 'legacy'; customRows: LedgerRow[] } {
++  const sorted = ordered(rows)
++  if (prefix(sorted, native)) {
++    assertNativeLedgerPrefix(sorted,native)
++    return { kind: sorted.length ? 'native' : 'fresh', customRows: [] }
++  }
++  const old = [...legacy.commonPrefix, ...legacy.custom]
++  if (sorted.length <= legacy.commonPrefix.length || !prefix(sorted, old))
++    throw new Error('Unknown, incomplete or mixed migration lineage')
++  if (!legacy.commonPrefix.every((s, i) => s.hash === native[i]?.hash && s.when === native[i]?.when))
++    throw new Error('Native/common-prefix migration lineage seal changed')
++  return { kind: 'legacy', customRows: sorted.slice(legacy.commonPrefix.length) }
++}
++
++/** This tool deliberately has no production/provider target override. */
++export function assertDisposableTarget(dsn: string, database: string, confirmed: boolean): void {
++  let url: URL
++  try { url = new URL(dsn) } catch { throw new Error('Invalid disposable database target') }
++  if (!confirmed || url.search || url.hash || !['postgres:', 'postgresql:'].includes(url.protocol) ||
++    !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ||
++    !/^[a-z][a-z0-9_]*_test$/.test(database) || url.pathname !== `/${database}`)
++    throw new Error('Requires an explicitly confirmed matching loopback *_test disposable database')
++}

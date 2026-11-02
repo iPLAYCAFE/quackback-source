@@ -1,0 +1,437 @@
+# Patch 22: QuackbackIO/quackback#812 — expose and accept featuredImageUrl across
+# Changelog REST/MCP and preserve existing publishedAt when updating an already-published entry.
+# Upstream commit: ef1b8a5836929858ddcf4f2139bb7b0d00180df3 (branch feat/changelog-api-featured-image-and-preserve-published-at)
+diff --git a/apps/web/src/lib/server/domains/api/__tests__/changelog-contract.test.ts b/apps/web/src/lib/server/domains/api/__tests__/changelog-contract.test.ts
+index e665564..9c5f06c 100644
+--- a/apps/web/src/lib/server/domains/api/__tests__/changelog-contract.test.ts
++++ b/apps/web/src/lib/server/domains/api/__tests__/changelog-contract.test.ts
+@@ -13,23 +13,29 @@ describe('changelog OpenAPI contract', () => {
+     patch?: { requestBody?: unknown; responses?: unknown }
+   }
+ 
+-  it('documents linkedPostIds on create and update bodies', () => {
++  it('documents linkedPostIds and featuredImageUrl on create and update bodies', () => {
+     const createBody = JSON.stringify(collection.post?.requestBody)
+     const updateBody = JSON.stringify(detail.patch?.requestBody)
+ 
+     expect(createBody).toContain('linkedPostIds')
++    expect(createBody).toContain('featuredImageUrl')
+     expect(updateBody).toContain('linkedPostIds')
++    expect(updateBody).toContain('featuredImageUrl')
+   })
+ 
+-  it('documents linkedPosts on list, get, create, and update responses', () => {
++  it('documents linkedPosts and featuredImageUrl on list, get, create, and update responses', () => {
+     const listResponse = JSON.stringify(collection.get)
+     const createResponse = JSON.stringify(collection.post?.responses)
+     const getResponse = JSON.stringify(detail.get?.responses)
+     const patchResponse = JSON.stringify(detail.patch?.responses)
+ 
+     expect(listResponse).toContain('linkedPosts')
++    expect(listResponse).toContain('featuredImageUrl')
+     expect(createResponse).toContain('linkedPosts')
++    expect(createResponse).toContain('featuredImageUrl')
+     expect(getResponse).toContain('linkedPosts')
++    expect(getResponse).toContain('featuredImageUrl')
+     expect(patchResponse).toContain('linkedPosts')
++    expect(patchResponse).toContain('featuredImageUrl')
+   })
+ })
+diff --git a/apps/web/src/lib/server/domains/api/schemas/changelog.ts b/apps/web/src/lib/server/domains/api/schemas/changelog.ts
+index b36c84a..55da80d 100644
+--- a/apps/web/src/lib/server/domains/api/schemas/changelog.ts
++++ b/apps/web/src/lib/server/domains/api/schemas/changelog.ts
+@@ -46,6 +46,10 @@ const ChangelogEntrySchema = z.object({
+   displayDate: NullableTimestampSchema.meta({
+     description: 'Optional portal display override (null uses publishedAt for display)',
+   }),
++  featuredImageUrl: z.string().nullable().meta({
++    description: 'Hero image URL shown atop the public entry detail page (null if none)',
++    example: '/api/storage/changelog-images/2026/10/hero.png',
++  }),
+   createdAt: TimestampSchema,
+   updatedAt: TimestampSchema,
+   linkedPosts: z.array(LinkedPostSchema).meta({
+@@ -67,6 +71,13 @@ const CreateChangelogEntrySchema = z
+       .datetime()
+       .optional()
+       .meta({ description: 'Publish date (omit to save as draft)' }),
++    displayDate: z.string().datetime().nullable().optional().meta({
++      description:
++        'Portal display override for published entries. Null clears override. Must not be in the future.',
++    }),
++    featuredImageUrl: z.string().max(2048).nullable().optional().meta({
++      description: 'Hero image URL shown atop the public entry detail page (null clears it)',
++    }),
+     linkedPostIds: LinkedPostIdsSchema,
+   })
+   .meta({ description: 'Create changelog entry request body' })
+@@ -85,6 +96,9 @@ const UpdateChangelogEntrySchema = z
+       description:
+         'Portal display override for published entries. Null clears override. Must not be in the future.',
+     }),
++    featuredImageUrl: z.string().max(2048).nullable().optional().meta({
++      description: 'Hero image URL shown atop the public entry detail page (null clears it)',
++    }),
+     linkedPostIds: LinkedPostIdsSchema,
+   })
+   .meta({ description: 'Update changelog entry request body' })
+diff --git a/apps/web/src/lib/server/domains/changelog/__tests__/changelog-display-date.test.ts b/apps/web/src/lib/server/domains/changelog/__tests__/changelog-display-date.test.ts
+index d829927..27702f7 100644
+--- a/apps/web/src/lib/server/domains/changelog/__tests__/changelog-display-date.test.ts
++++ b/apps/web/src/lib/server/domains/changelog/__tests__/changelog-display-date.test.ts
+@@ -44,8 +44,8 @@ vi.mock('@/lib/server/events/dispatch', () => ({
+   dispatchChangelogPublished: vi.fn().mockResolvedValue(undefined),
+ }))
+ vi.mock('@/lib/server/events/scheduler', () => ({
+-  scheduleDispatch: vi.fn(),
+-  cancelScheduledDispatch: vi.fn(),
++  scheduleDispatch: vi.fn().mockResolvedValue(undefined),
++  cancelScheduledDispatch: vi.fn().mockResolvedValue(undefined),
+ }))
+ 
+ const ENTRY_ID = 'changelog_01test' as ChangelogId
+@@ -111,4 +111,19 @@ describe('displayDate', () => {
+ 
+     expect(mockUpdateSet).toHaveBeenCalledWith(expect.objectContaining({ displayDate: null }))
+   })
++
++  it('preserves existing publishedAt when publishState is published without an explicit publishAt', async () => {
++    const { resolveUpdatedPublishedAt } = await import('../changelog.service')
++
++    expect(resolveUpdatedPublishedAt({ type: 'published' }, PUBLISHED_AT)).toEqual(PUBLISHED_AT)
++
++    const explicitOverride = new Date('2025-07-01T12:00:00Z')
++    expect(
++      resolveUpdatedPublishedAt({ type: 'published', publishAt: explicitOverride }, PUBLISHED_AT)
++    ).toEqual(explicitOverride)
++
++    const fromDraft = resolveUpdatedPublishedAt({ type: 'published' }, null)
++    expect(fromDraft).toBeInstanceOf(Date)
++    expect(fromDraft!.getTime()).toBeGreaterThan(PUBLISHED_AT.getTime())
++  })
+ })
+diff --git a/apps/web/src/lib/server/domains/changelog/changelog.service.ts b/apps/web/src/lib/server/domains/changelog/changelog.service.ts
+index a1b26b5..061e7f0 100644
+--- a/apps/web/src/lib/server/domains/changelog/changelog.service.ts
++++ b/apps/web/src/lib/server/domains/changelog/changelog.service.ts
+@@ -221,15 +221,16 @@ export async function updateChangelog(
+   if (input.displayDate !== undefined) {
+     const publishedAtRef =
+       input.publishState !== undefined
+-        ? getPublishedAtFromState(input.publishState)
++        ? resolveUpdatedPublishedAt(input.publishState, existing.publishedAt)
+         : existing.publishedAt
+     validateDisplayDate(publishedAtRef, input.displayDate)
+     updateData.displayDate = normalizeDisplayDate(input.displayDate, publishedAtRef)
+   }
+ 
+-  // Handle publish state change
++  // Handle publish state change (preserving existing publishedAt when an already-published
++  // entry receives `{ type: 'published' }` without an explicit `publishAt` override).
+   if (input.publishState !== undefined) {
+-    updateData.publishedAt = getPublishedAtFromState(input.publishState)
++    updateData.publishedAt = resolveUpdatedPublishedAt(input.publishState, existing.publishedAt)
+   }
+ 
+   // featuredImageUrl: undefined leaves it, null clears it, a string replaces it.
+@@ -600,6 +601,27 @@ function getPublishedAtFromState(state: PublishState): Date | null {
+   }
+ }
+ 
++/**
++ * Resolve the updated `publishedAt` timestamp on an existing entry.
++ * If the entry is already published (`existingPublishedAt <= now`) and the caller
++ * passes `{ type: 'published' }` without an explicit `publishAt`, preserve the
++ * original `existingPublishedAt` instead of overwriting it with `new Date()`.
++ */
++export function resolveUpdatedPublishedAt(
++  state: PublishState,
++  existingPublishedAt: Date | null
++): Date | null {
++  if (
++    state.type === 'published' &&
++    state.publishAt === undefined &&
++    existingPublishedAt != null &&
++    existingPublishedAt <= new Date()
++  ) {
++    return existingPublishedAt
++  }
++  return getPublishedAtFromState(state)
++}
++
+ /**
+  * Compute status from publishedAt timestamp
+  */
+diff --git a/apps/web/src/lib/server/mcp/tools/changelog.ts b/apps/web/src/lib/server/mcp/tools/changelog.ts
+index 78dbc6e..5c48fc7 100644
+--- a/apps/web/src/lib/server/mcp/tools/changelog.ts
++++ b/apps/web/src/lib/server/mcp/tools/changelog.ts
+@@ -42,6 +42,25 @@ const createChangelogSchema = {
+     .describe(
+       'ISO 8601 datetime to publish at (e.g. "2025-03-15T12:00:00Z"). Overrides publish flag. Past dates backdate the entry, future dates schedule it.'
+     ),
++  displayDate: z
++    .string()
++    .nullable()
++    .optional()
++    .describe(
++      'ISO 8601 portal display override for published entries. Null clears the override. Must not be in the future.'
++    ),
++  featuredImageUrl: z
++    .string()
++    .max(2048)
++    .nullable()
++    .optional()
++    .describe(
++      'Hero image URL rendered at the top of the public entry detail page (null clears it)'
++    ),
++  linkedPostIds: z
++    .array(z.string())
++    .optional()
++    .describe('Post TypeIDs to link to this changelog entry'),
+ }
+ 
+ const updateChangelogSchema = {
+@@ -66,6 +85,14 @@ const updateChangelogSchema = {
+     .describe(
+       'ISO 8601 portal display override for published entries. Null clears the override. Must not be in the future.'
+     ),
++  featuredImageUrl: z
++    .string()
++    .max(2048)
++    .nullable()
++    .optional()
++    .describe(
++      'Hero image URL rendered at the top of the public entry detail page (null clears it)'
++    ),
+   linkedPostIds: z
+     .array(z.string())
+     .optional()
+@@ -87,6 +114,9 @@ type CreateChangelogArgs = {
+   content: string
+   publish: boolean
+   publishedAt?: string
++  displayDate?: string | null
++  featuredImageUrl?: string | null
++  linkedPostIds?: string[]
+ }
+ 
+ type UpdateChangelogArgs = {
+@@ -96,6 +126,7 @@ type UpdateChangelogArgs = {
+   publish?: boolean
+   publishedAt?: string
+   displayDate?: string | null
++  featuredImageUrl?: string | null
+   linkedPostIds?: string[]
+ }
+ 
+@@ -127,6 +158,13 @@ Examples:
+           title: args.title,
+           content: args.content,
+           publishState,
++          ...(args.displayDate !== undefined && {
++            displayDate: args.displayDate === null ? null : new Date(args.displayDate),
++          }),
++          ...(args.featuredImageUrl !== undefined && {
++            featuredImageUrl: args.featuredImageUrl,
++          }),
++          linkedPostIds: args.linkedPostIds as PostId[] | undefined,
+         },
+         { principalId: auth.principalId, name: auth.name }
+       )
+@@ -136,6 +174,9 @@ Examples:
+         title: result.title,
+         status: result.status,
+         publishedAt: result.publishedAt,
++        displayDate: result.displayDate,
++        featuredImageUrl: result.featuredImageUrl,
++        linkedPosts: result.linkedPosts,
+         createdAt: result.createdAt,
+       })
+     },
+@@ -143,13 +184,14 @@ Examples:
+ 
+   registerTool<UpdateChangelogArgs>(server, auth, {
+     name: 'update_changelog',
+-    description: `Update title, content, publish state, and/or linked posts on an existing changelog entry.
++    description: `Update title, content, publish state, featured image, and/or linked posts on an existing changelog entry.
+ 
+ Examples:
+ - Update title: update_changelog({ changelogId: "changelog_01abc...", title: "v2.0 Release" })
+ - Publish: update_changelog({ changelogId: "changelog_01abc...", publish: true })
+ - Backdate display: update_changelog({ changelogId: "changelog_01abc...", displayDate: "2025-03-15T12:00:00Z" })
+ - Clear display override: update_changelog({ changelogId: "changelog_01abc...", displayDate: null })
++- Set hero image: update_changelog({ changelogId: "changelog_01abc...", featuredImageUrl: "/api/storage/changelog-images/..." })
+ - Link posts: update_changelog({ changelogId: "changelog_01abc...", linkedPostIds: ["post_01a...", "post_01b..."] })${CONTENT_FORMAT_BLOCK}`,
+     schema: updateChangelogSchema,
+     annotations: WRITE,
+@@ -173,6 +215,9 @@ Examples:
+         ...(args.displayDate !== undefined && {
+           displayDate: args.displayDate === null ? null : new Date(args.displayDate),
+         }),
++        ...(args.featuredImageUrl !== undefined && {
++          featuredImageUrl: args.featuredImageUrl,
++        }),
+       })
+ 
+       return jsonResult({
+@@ -181,6 +226,8 @@ Examples:
+         status: result.status,
+         publishedAt: result.publishedAt,
+         displayDate: result.displayDate,
++        featuredImageUrl: result.featuredImageUrl,
++        linkedPosts: result.linkedPosts,
+         updatedAt: result.updatedAt,
+       })
+     },
+diff --git a/apps/web/src/routes/api/v1/changelog/$entryId.ts b/apps/web/src/routes/api/v1/changelog/$entryId.ts
+index fcccf0b..603fa83 100644
+--- a/apps/web/src/routes/api/v1/changelog/$entryId.ts
++++ b/apps/web/src/routes/api/v1/changelog/$entryId.ts
+@@ -24,6 +24,7 @@ const updateChangelogSchema = z.object({
+   content: z.string().min(1).optional(),
+   publishedAt: z.string().datetime().nullable().optional(),
+   displayDate: z.string().datetime().nullable().optional(),
++  featuredImageUrl: z.string().max(2048).nullable().optional(),
+   linkedPostIds: z.array(z.string()).optional(),
+ })
+ 
+@@ -102,6 +103,9 @@ export const Route = createFileRoute('/api/v1/changelog/$entryId')({
+               displayDate:
+                 parsed.data.displayDate === null ? null : new Date(parsed.data.displayDate),
+             }),
++            ...(parsed.data.featuredImageUrl !== undefined && {
++              featuredImageUrl: parsed.data.featuredImageUrl,
++            }),
+             ...(linkedPostIds !== undefined && { linkedPostIds }),
+           })
+ 
+diff --git a/apps/web/src/routes/api/v1/changelog/-serialize.ts b/apps/web/src/routes/api/v1/changelog/-serialize.ts
+index cc85f50..18d81a1 100644
+--- a/apps/web/src/routes/api/v1/changelog/-serialize.ts
++++ b/apps/web/src/routes/api/v1/changelog/-serialize.ts
+@@ -10,6 +10,7 @@ export function formatChangelogResponse(entry: {
+   contentJson: TiptapContent | null
+   publishedAt: Date | null
+   displayDate: Date | null
++  featuredImageUrl?: string | null
+   createdAt: Date
+   updatedAt: Date
+   linkedPosts?: ChangelogLinkedPost[]
+@@ -20,6 +21,7 @@ export function formatChangelogResponse(entry: {
+     content: contentJsonToMarkdown(entry.contentJson, entry.content),
+     publishedAt: entry.publishedAt?.toISOString() || null,
+     displayDate: entry.displayDate?.toISOString() || null,
++    featuredImageUrl: entry.featuredImageUrl ?? null,
+     createdAt: entry.createdAt.toISOString(),
+     updatedAt: entry.updatedAt.toISOString(),
+     linkedPosts: (entry.linkedPosts ?? []).map((post) => ({
+diff --git a/apps/web/src/routes/api/v1/changelog/__tests__/$entryId.test.ts b/apps/web/src/routes/api/v1/changelog/__tests__/$entryId.test.ts
+index d8f26b4..bbe6107 100644
+--- a/apps/web/src/routes/api/v1/changelog/__tests__/$entryId.test.ts
++++ b/apps/web/src/routes/api/v1/changelog/__tests__/$entryId.test.ts
+@@ -156,7 +156,7 @@ describe('PATCH /api/v1/changelog/:entryId — linkedPostIds', () => {
+     expect(mockUpdateChangelog.mock.calls[0][1]).toMatchObject({ linkedPostIds: [] })
+   })
+ 
+-  it('does not send linkedPostIds when the field is omitted', async () => {
++  it('does not send linkedPostIds or featuredImageUrl when the fields are omitted', async () => {
+     const res = await PATCH({
+       request: patchRequest({ title: 'Renamed' }),
+       params: { entryId: ENTRY_ID },
+@@ -165,6 +165,29 @@ describe('PATCH /api/v1/changelog/:entryId — linkedPostIds', () => {
+     expect(res.status).toBe(200)
+     const input = mockUpdateChangelog.mock.calls[0][1] as Record<string, unknown>
+     expect(input).not.toHaveProperty('linkedPostIds')
++    expect(input).not.toHaveProperty('featuredImageUrl')
++    expect(input).not.toHaveProperty('publishState')
++  })
++
++  it('forwards featuredImageUrl (and null to clear) and echoes it on the response', async () => {
++    mockUpdateChangelog.mockResolvedValue({
++      ...baseEntry(),
++      featuredImageUrl: '/api/storage/changelog-images/2026/10/hero.png',
++    })
++
++    const res = await PATCH({
++      request: patchRequest({
++        featuredImageUrl: '/api/storage/changelog-images/2026/10/hero.png',
++      }),
++      params: { entryId: ENTRY_ID },
++    })
++
++    expect(res.status).toBe(200)
++    expect(mockUpdateChangelog.mock.calls[0][1]).toMatchObject({
++      featuredImageUrl: '/api/storage/changelog-images/2026/10/hero.png',
++    })
++    const json = await res.json()
++    expect(json.data.featuredImageUrl).toBe('/api/storage/changelog-images/2026/10/hero.png')
+   })
+ 
+   it('echoes linked posts on the update response', async () => {
+diff --git a/apps/web/src/routes/api/v1/changelog/__tests__/index.test.ts b/apps/web/src/routes/api/v1/changelog/__tests__/index.test.ts
+index 0dd1462..77cecfc 100644
+--- a/apps/web/src/routes/api/v1/changelog/__tests__/index.test.ts
++++ b/apps/web/src/routes/api/v1/changelog/__tests__/index.test.ts
+@@ -54,6 +54,7 @@ function entry(overrides: Record<string, unknown> = {}) {
+     contentJson: null,
+     publishedAt: new Date('2026-01-01T00:00:00.000Z'),
+     displayDate: null,
++    featuredImageUrl: '/api/storage/changelog-images/2026/01/hero.png',
+     createdAt: new Date('2026-01-01T00:00:00.000Z'),
+     updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+     linkedPosts: [LINKED_POST],
+@@ -105,11 +106,12 @@ describe('GET /api/v1/changelog — linked posts', () => {
+ })
+ 
+ describe('POST /api/v1/changelog — linked posts', () => {
+-  it('forwards linkedPostIds to createChangelog and echoes linked posts', async () => {
++  it('forwards linkedPostIds and featuredImageUrl to createChangelog and echoes both', async () => {
+     const res = await POST({
+       request: postRequest({
+         title: 'Dark mode',
+         content: 'We shipped dark mode.',
++        featuredImageUrl: '/api/storage/changelog-images/2026/01/hero.png',
+         linkedPostIds: [POST_A],
+       }),
+     })
+@@ -118,9 +120,11 @@ describe('POST /api/v1/changelog — linked posts', () => {
+     expect(mockCreateChangelog).toHaveBeenCalledTimes(1)
+     expect(mockCreateChangelog.mock.calls[0][0]).toMatchObject({
+       title: 'Dark mode',
++      featuredImageUrl: '/api/storage/changelog-images/2026/01/hero.png',
+       linkedPostIds: [POST_A],
+     })
+     const json = await res.json()
++    expect(json.data.featuredImageUrl).toBe('/api/storage/changelog-images/2026/01/hero.png')
+     expect(json.data.linkedPosts).toEqual([LINKED_POST])
+   })
+ 
+diff --git a/apps/web/src/routes/api/v1/changelog/index.ts b/apps/web/src/routes/api/v1/changelog/index.ts
+index 7b88575..7dacf09 100644
+--- a/apps/web/src/routes/api/v1/changelog/index.ts
++++ b/apps/web/src/routes/api/v1/changelog/index.ts
+@@ -21,6 +21,8 @@ const createChangelogSchema = z.object({
+   title: z.string().min(1, 'Title is required').max(200),
+   content: z.string().min(1, 'Content is required'),
+   publishedAt: z.string().datetime().optional(),
++  displayDate: z.string().datetime().nullable().optional(),
++  featuredImageUrl: z.string().max(2048).nullable().optional(),
+   linkedPostIds: z.array(z.string()).optional(),
+ })
+ 
+@@ -99,6 +101,13 @@ export const Route = createFileRoute('/api/v1/changelog/')({
+               title: parsed.data.title,
+               content: parsed.data.content,
+               publishState,
++              ...(parsed.data.displayDate !== undefined && {
++                displayDate:
++                  parsed.data.displayDate === null ? null : new Date(parsed.data.displayDate),
++              }),
++              ...(parsed.data.featuredImageUrl !== undefined && {
++                featuredImageUrl: parsed.data.featuredImageUrl,
++              }),
+               linkedPostIds: parseTypeIdArray<PostId>(
+                 parsed.data.linkedPostIds,
+                 'post',

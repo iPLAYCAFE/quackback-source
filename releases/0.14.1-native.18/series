@@ -1,0 +1,26 @@
+# Ordered patches, applied with `git apply` onto the upstream commit in release.json.
+# '#WITHHELD <file> sha256=<hex>' marks a patch under security embargo (see README).
+# '<file> requires=<file>' applies only after the named patch.
+01-build-image-pins.patch
+02-ai-no-train.patch
+03-thai-widget.patch
+04-native-host-bridge.patch
+05-native-evidence.patch
+06-trusted-proxy-peers.patch
+07-native-ledger-guard.patch
+#WITHHELD 08-withheld.patch sha256=32a8d576900c09496498cd125a67623c580e6299d24cf817a8de102fd1e96cbb
+09-help-center-native-private.patch
+10-ai-log-safety.patch
+11-bound-evidence-delete.patch
+12-widget-provenance-compat.patch
+13-workers-ai-effort.patch
+14-customer-agent-route.patch
+15-luna-classification.patch
+16-native-upload-attachment.patch
+17-support-retention.patch
+18-native-upload-attachment-review.patch
+19-widget-native-ux.patch
+20-native-broker-retired.patch
+21-storage-download-proxy.patch
+22-changelog-shipped-posts.patch
+23-changelog-featured-image.patch

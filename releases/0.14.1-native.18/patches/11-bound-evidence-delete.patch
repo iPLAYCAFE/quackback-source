@@ -1,0 +1,677 @@
+diff --git a/apps/web/src/components/widget/widget-native-evidence.tsx b/apps/web/src/components/widget/widget-native-evidence.tsx
+--- a/apps/web/src/components/widget/widget-native-evidence.tsx
++++ b/apps/web/src/components/widget/widget-native-evidence.tsx
+@@ -1,19 +1,22 @@
+ import { useEffect, useRef, useState } from 'react'
+-import { useQuery } from '@tanstack/react-query'
++import { useQuery, useQueryClient } from '@tanstack/react-query'
+ import { useIntl } from 'react-intl'
+ import type { TicketId } from '@quackback/ids'
+-import { nativeReadEvidenceFn } from '@/lib/server/functions/widget/native-evidence'
++import { nativeReadEvidenceFn, nativeDeleteEvidenceFn } from '@/lib/server/functions/widget/native-evidence'
+ import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
+ 
+ /** Private bytes stay in the iframe; URLs are revoked on close/switch/unmount. */
+ export function WidgetNativeEvidence({ticketId, sessionVersion}: {ticketId: TicketId; sessionVersion: number}) {
+   const intl = useIntl()
+-  const thai = intl.locale.startsWith('th')
++  const queryClient = useQueryClient()
+   const requests = useRef(new Set<AbortController>())
+   const urls = useRef(new Set<string>())
+   const [preview, setPreview] = useState<{url: string; video: boolean} | null>(null)
+   const [busy, setBusy] = useState(false)
+   const [failed, setFailed] = useState(false)
++  const ownerKey = `${sessionVersion}:${ticketId}`
++  const owner = useRef(ownerKey); owner.current = ownerKey
++  const [deletedOwner, setDeletedOwner] = useState<string|null>(null)
+   const {data} = useQuery({
+     queryKey: ['widget', 'native-evidence', sessionVersion, ticketId],
+     queryFn: () => nativeReadEvidenceFn({data: {ticketId}, headers: getWidgetAuthHeaders()}),
+@@ -28,6 +31,22 @@
+     if (preview) { URL.revokeObjectURL(preview.url); urls.current.delete(preview.url) }
+     setPreview(null)
+   }
++  async function remove() {
++    if (busy) return
++    const generation = owner.current
++    for (const request of requests.current) request.abort()
++    close(); setBusy(true); setFailed(false)
++    try {
++      const result = await nativeDeleteEvidenceFn({data:{ticketId},headers:getWidgetAuthHeaders()})
++      if (owner.current === generation) {
++        if (!result.deleted) throw new Error('unavailable')
++        queryClient.setQueryData(['widget','native-evidence',sessionVersion,ticketId],{ticketId,reports:[]})
++        setDeletedOwner(generation)
++      }
++    } catch { if (owner.current === generation) setFailed(true) }
++    finally { if (owner.current === generation) setBusy(false) }
++  }
++  useEffect(()=>{setBusy(false);setFailed(false);setPreview(null)},[ownerKey])
+   async function open(evidenceId: string) {
+     if (busy) return
+     close(); setBusy(true); setFailed(false)
+@@ -47,18 +66,21 @@
+     finally { requests.current.delete(controller); if (!controller.signal.aborted) setBusy(false) }
+   }
+   const evidence = data?.reports.flatMap(report => report.evidence) ?? []
+-  if (!evidence.length) return null
++  if (!evidence.length || deletedOwner === ownerKey) return null
+   return <section className="border-b p-3 text-sm">
+-    <p>{thai ? 'หลักฐานส่วนตัว' : 'Private evidence'}</p>
++    <p>{intl.formatMessage({id: 'widget.nativeEvidence.heading', defaultMessage: 'Private evidence'})}</p>
+     <div className="flex flex-wrap gap-2">{evidence.map((item, index) => <button key={item.evidenceId}
+       type="button" className="rounded border px-2 py-1" disabled={busy} onClick={() => void open(item.evidenceId)}>
+-      {thai ? 'ดูหลักฐาน' : 'View evidence'} {index + 1}
++      {intl.formatMessage({id: 'widget.nativeEvidence.view', defaultMessage: 'View evidence {index}'}, {index: index + 1})}
+     </button>)}</div>
+-    {failed && <p role="alert">{thai ? 'ไม่สามารถเปิดหลักฐานได้' : 'Evidence unavailable'}</p>}
++    <button type="button" className="mt-2 rounded border px-2 py-1" disabled={busy} onClick={()=>void remove()}>
++      {intl.formatMessage({id: 'widget.nativeEvidence.delete', defaultMessage: 'Delete private evidence'})}
++    </button>
++    {failed && <p role="alert">{intl.formatMessage({id: 'widget.nativeEvidence.unavailable', defaultMessage: 'Evidence unavailable'})}</p>}
+     {preview && <div>
+-      <button type="button" onClick={close}>{thai ? 'ปิด' : 'Close'}</button>
++      <button type="button" onClick={close}>{intl.formatMessage({id: 'files.viewer.close', defaultMessage: 'Close'})}</button>
+       {preview.video ? <video src={preview.url} controls className="w-full" /> :
+-        <img src={preview.url} alt={thai ? 'หลักฐานส่วนตัว' : 'Private evidence'} className="w-full" />}
++        <img src={preview.url} alt={intl.formatMessage({id: 'widget.nativeEvidence.heading', defaultMessage: 'Private evidence'})} className="w-full" />}
+     </div>}
+   </section>
+ }
+diff --git a/apps/web/src/components/widget/__tests__/widget-native-evidence-delete.test.tsx b/apps/web/src/components/widget/__tests__/widget-native-evidence-delete.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/apps/web/src/components/widget/__tests__/widget-native-evidence-delete.test.tsx
+@@ -0,0 +1,68 @@
++import {describe,it,expect,vi,beforeEach,afterEach} from 'vitest'
++import {createIntl} from 'react-intl'
++import en from '@/locales/en.json'
++import th from '@/locales/th.json'
++import {render,screen,fireEvent,waitFor,cleanup} from '@testing-library/react'
++const ports = vi.hoisted(()=>({remove:vi.fn(),refetch:vi.fn(),setQueryData:vi.fn(),formatMessage:vi.fn(),locale:'en', data:{reports:[{evidence:[{evidenceId:'qbe_test'}]}]}}))
++vi.mock('react-intl',async()=>({...await vi.importActual('react-intl'),useIntl:()=>({locale:ports.locale,formatMessage:ports.formatMessage})}))
++vi.mock('@tanstack/react-query',()=>({useQueryClient:()=>({setQueryData:ports.setQueryData}),useQuery:()=>({data:ports.data,refetch:ports.refetch})}))
++vi.mock('@/lib/server/functions/widget/native-evidence',()=>({nativeReadEvidenceFn:vi.fn(),nativeDeleteEvidenceFn:ports.remove}))
++vi.mock('@/lib/client/widget-auth',()=>({getWidgetAuthHeaders:()=>({Authorization:'Bearer synthetic'})}))
++import {WidgetNativeEvidence} from '../widget-native-evidence'
++beforeEach(()=>{
++ ports.locale='en'
++ ports.formatMessage.mockImplementation((message,values)=>createIntl({locale:ports.locale,messages:ports.locale==='th'?th:en}).formatMessage(message,values))
++})
++afterEach(()=>{cleanup();vi.unstubAllGlobals()})
++describe('native committed attachment removal',()=>{
++ it('removes only through authenticated own-ticket BFF and hides completed evidence',async()=>{
++  ports.remove.mockResolvedValueOnce({deleted:true})
++  render(<WidgetNativeEvidence ticketId={'ticket_owned' as never} sessionVersion={1}/>)
++  fireEvent.click(screen.getByRole('button',{name:'Delete private evidence'}))
++  await waitFor(()=>expect(ports.remove).toHaveBeenCalledWith({data:{ticketId:'ticket_owned'},headers:{Authorization:'Bearer synthetic'}}))
++  await waitFor(()=>expect(screen.queryByText('Private evidence')).toBeNull())
++  expect(ports.setQueryData).toHaveBeenCalledWith(['widget','native-evidence',1,'ticket_owned'],{ticketId:'ticket_owned',reports:[]})
++  cleanup()
++ })
++ it('a response after session switch cannot remove the new session evidence',async()=>{
++  let finish:(v:unknown)=>void=()=>{}
++  ports.remove.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve}))
++  const view=render(<WidgetNativeEvidence ticketId={'ticket_owned' as never} sessionVersion={1}/>)
++  fireEvent.click(screen.getByRole('button',{name:'Delete private evidence'}))
++  view.rerender(<WidgetNativeEvidence ticketId={'ticket_other' as never} sessionVersion={2}/>)
++  finish({deleted:true})
++  await waitFor(()=>expect(screen.getByText('Private evidence')).toBeTruthy())
++  cleanup()
++ })
++})
++
++describe('native evidence catalog messages',()=>{
++ it.each(['en','th'])('uses the %s catalog and ICU index for labels and failure',async locale=>{
++  ports.locale=locale
++  const catalog=locale==='th'?th:en
++  const intl=createIntl({locale,messages:catalog})
++  const message=(id:string,values?:Record<string,number>)=>intl.formatMessage({id},values)
++  ports.remove.mockRejectedValueOnce(new Error('unavailable'))
++  render(<WidgetNativeEvidence ticketId={'ticket_owned' as never} sessionVersion={1}/>)
++  expect(screen.getByText(message('widget.nativeEvidence.heading'))).toBeTruthy()
++  expect(screen.getByRole('button',{name:message('widget.nativeEvidence.view',{index:1})})).toBeTruthy()
++  fireEvent.click(screen.getByRole('button',{name:message('widget.nativeEvidence.delete')}))
++  await waitFor(()=>expect(screen.getByRole('alert').textContent).toBe(message('widget.nativeEvidence.unavailable')))
++  expect(ports.formatMessage).toHaveBeenCalledWith(expect.objectContaining({id:'widget.nativeEvidence.view'}),{index:1})
++ })
++ it.each(['en','th'])('uses the %s catalog for image alternative text and upstream close label',async locale=>{
++  ports.locale=locale
++  const catalog=locale==='th'?th:en
++  const intl=createIntl({locale,messages:catalog})
++  const message=(id:string,values?:Record<string,number>)=>intl.formatMessage({id},values)
++  vi.stubGlobal('fetch',vi.fn().mockResolvedValue(new Response(new Blob(['image']),{headers:{'Content-Type':'image/png'}})))
++  vi.spyOn(URL,'createObjectURL').mockReturnValue('blob:synthetic')
++  vi.spyOn(URL,'revokeObjectURL').mockImplementation(()=>{})
++  render(<WidgetNativeEvidence ticketId={'ticket_owned' as never} sessionVersion={1}/>)
++  fireEvent.click(screen.getByRole('button',{name:message('widget.nativeEvidence.view',{index:1})}))
++  await waitFor(()=>expect(screen.getByRole('img',{name:message('widget.nativeEvidence.heading')})).toBeTruthy())
++  fireEvent.click(screen.getByRole('button',{name:message('files.viewer.close')}))
++  expect(screen.queryByRole('img')).toBeNull()
++  expect(ports.formatMessage).toHaveBeenCalledWith(expect.objectContaining({id:'files.viewer.close'}))
++ })
++})
+diff --git a/apps/web/src/lib/server/evidence/native.ts b/apps/web/src/lib/server/evidence/native.ts
+--- a/apps/web/src/lib/server/evidence/native.ts
++++ b/apps/web/src/lib/server/evidence/native.ts
+@@ -24,6 +24,7 @@
+   mintEvidenceCapability,
+   readPrivateEvidence,
+   nativeEvidenceBindingCommand,
++  deleteBoundPrivateEvidence,
+   transitionPrivateEvidenceBinding,
+   verifyEvidenceCapability,
+   REPORT_ID,
+@@ -366,9 +367,52 @@
+ }
+ 
+ async function requireConfirmedBinding(tx: Transaction, row: ReportRow) {
++  const deletion = await tx.execute(sql`SELECT phase FROM ipc_native_evidence_deletion WHERE report_id=${row.report_id}`)
++  if (deletion.length) throw new Error('EVIDENCE_DELETED')
+   const states = await tx.execute(sql`SELECT phase FROM ipc_native_evidence_binding
+     WHERE report_id=${row.report_id} AND phase='confirmed' FOR UPDATE`)
+   if (states.length !== 1) throw new Error('EVIDENCE_BINDING_UNAVAILABLE')
++}
++
++/** Delete the exact committed attachment set while retaining its customer Ticket. */
++export async function runDeleteNativeEvidence(ctx: AuthContext, input: {ticketId:string}) {
++  const server = serverConfig()
++  if (!isValidTypeId(input.ticketId,'ticket')) throw new Error('EVIDENCE_DENIED')
++  async function locked(tx:Transaction) {
++    await requireIdentifiedSession(ctx,tx)
++    const rows = await tx.execute(sql`SELECT * FROM ipc_native_evidence_report
++      WHERE ticket_id=${input.ticketId} AND principal_id=${ctx.principal.id} AND tenant_ref=${ctx.settings.id} FOR UPDATE`)
++    const row = rows[0] as unknown as ReportRow | undefined
++    const own = await tx.select({id:tickets.id}).from(tickets).where(and(
++      eq(tickets.id,input.ticketId as TicketId),eq(tickets.requesterPrincipalId,ctx.principal.id),
++      eq(tickets.type,'customer'),isNull(tickets.deletedAt))).for('update').limit(1)
++    if (rows.length !== 1 || !row || !own[0] || row.ticket_id !== input.ticketId ||
++      row.principal_id !== ctx.principal.id || row.tenant_ref !== ctx.settings.id ||
++      !row.submission_id || !row.body_digest || !row.evidence_ids?.length) throw new Error('EVIDENCE_DENIED')
++    const state = (await tx.execute(sql`SELECT * FROM ipc_native_evidence_binding WHERE report_id=${row.report_id} FOR UPDATE`))[0]
++    const tuple = nativeEvidenceBindingCommand(binding(row),{reportId:row.report_id,ticketId:row.ticket_id,
++      submissionId:row.submission_id,bodyDigest:row.body_digest,evidenceIds:row.evidence_ids})
++    if (!state || state.phase !== 'confirmed' || state.binding_ref !== tuple.command.bindingRef ||
++      state.tuple_json !== tuple.tupleJson) throw new Error('EVIDENCE_BINDING_CONFLICT')
++    await tx.execute(sql`INSERT INTO ipc_native_evidence_deletion(report_id,binding_ref,phase)
++      VALUES(${row.report_id},${tuple.command.bindingRef},'deleting') ON CONFLICT(report_id) DO NOTHING`)
++    const deletion = (await tx.execute(sql`SELECT * FROM ipc_native_evidence_deletion WHERE report_id=${row.report_id} FOR UPDATE`))[0]
++    if (!deletion || deletion.binding_ref !== tuple.command.bindingRef || !['deleting','deleted'].includes(deletion.phase as string))
++      throw new Error('EVIDENCE_BINDING_CONFLICT')
++    return {row,tuple,deletion}
++  }
++  // This commit precedes every remote request and fences metadata, old read
++  // grants and every ongoing native stream pull. Unknown outcomes never undo it.
++  const selected = await db.transaction(locked)
++  if (selected.deletion.phase !== 'deleted') {
++    await deleteBoundPrivateEvidence(binding(selected.row),selected.tuple.command,selected.row.allowed_kinds,server)
++    await db.transaction(async tx => {
++      const current = await locked(tx)
++      await tx.execute(sql`UPDATE ipc_native_evidence_deletion SET phase='deleted',completed_at=now()
++        WHERE report_id=${current.row.report_id} AND phase='deleting'`)
++    })
++  }
++  return {ticketId:input.ticketId,deleted:true}
+ }
+ 
+ export async function runReadNativeEvidence(ctx: AuthContext, input: { ticketId: string }) {
+@@ -435,6 +479,12 @@
+     return null
+   // Binding is authoritative even when the host lost the ACK. A browser
+   // cleanup grant must never remove media that now belongs to a native Ticket.
++  const deletion = await db.execute(sql`SELECT binding_ref,phase FROM ipc_native_evidence_deletion WHERE report_id=${claims.reportId}`)
++  if (claims.scope === 'evidence:bound-delete') {
++    return row.ticket_id !== null && deletion.length === 1 && deletion[0].binding_ref === claims.jti &&
++      ['deleting','deleted'].includes(deletion[0].phase as string) ? claims : null
++  }
++  if (deletion.length) return null
+   if (claims.scope.startsWith('evidence:bind-')) {
+     const states = await db.execute(
+       sql`SELECT binding_ref,phase FROM ipc_native_evidence_binding WHERE report_id=${claims.reportId}`
+@@ -539,6 +589,8 @@
+   const select = db.select,
+     execute = db.execute
+   const fence = async () => {
++    const deletion = await execute(sql`SELECT phase FROM ipc_native_evidence_deletion WHERE report_id=${selected.row.report_id}`)
++    if (deletion.length) throw new Error('EVIDENCE_DELETED')
+     const live = await select({ id: session.id })
+       .from(session)
+       .innerJoin(widgetIdentifiedSession, eq(widgetIdentifiedSession.sessionId, session.id))
+diff --git a/apps/web/src/lib/server/evidence/qbe1.ts b/apps/web/src/lib/server/evidence/qbe1.ts
+--- a/apps/web/src/lib/server/evidence/qbe1.ts
++++ b/apps/web/src/lib/server/evidence/qbe1.ts
+@@ -17,7 +17,9 @@
+   | 'server_bind_prepare'
+   | 'server_bind_commit'
+   | 'server_bind_abort'
++  | 'server_bound_delete'
+ const PURPOSE = {
++  server_bound_delete: { aud: 'quackback-evidence-server-bound-delete', scope: 'evidence:bound-delete' },
+   browser_attach: { aud: 'quackback-evidence-browser', scope: 'evidence:attach' },
+   browser_cleanup: { aud: 'quackback-evidence-browser-cleanup', scope: 'evidence:discard' },
+   server_read: { aud: 'quackback-evidence-server', scope: 'evidence:read' },
+@@ -381,6 +383,43 @@
+   bodyDigest: string
+   evidenceIds: string[]
+ }
++
++/** Server only; a successful DELETE must prove both raw and sanitized terminal state. */
++export async function deleteBoundPrivateEvidence(
++  binding: EvidenceBinding,
++  command: NativeEvidenceBindingCommand,
++  allowedKinds: readonly EvidenceKind[],
++  server: NonNullable<ReturnType<typeof evidenceServerConfig>>
++) {
++  const grant = mintEvidenceCapability(binding, allowedKinds, server.signingKey, 'server_bound_delete', Date.now(), () => command.bindingRef)
++  for (const evidenceId of command.evidenceIds) {
++    const abort = new AbortController(), timer = setTimeout(() => abort.abort(), 8000)
++    try {
++      const response = await fetch(`${server.brokerOrigin}/v1/evidence/${evidenceId}`, {
++        method:'DELETE', credentials:'omit', cache:'no-store', redirect:'error', signal:abort.signal,
++        headers:{'Content-Type':'application/json',Accept:'application/json',Authorization:`Bearer ${grant.capability}`},
++        body:JSON.stringify({schemaVersion:1,evidenceId,idempotencyKey:`idem_${command.bindingRef}`}),
++      })
++      if (response.status !== 200) throw new Error()
++      const text = await response.text()
++      if (text.length > 8192) throw new Error()
++      const value = JSON.parse(text)
++      const created = timestamp(value.createdAt), raw = timestamp(value.rawDeleteBy)
++      if (Object.keys(value).sort().join() !== RESPONSE_KEYS.join() || value.schemaVersion !== 1 ||
++        value.evidenceId !== evidenceId || !allowedKinds.includes(value.kind) || value.status !== 'deleted' ||
++        !((value.outcome === 'discarded' && value.reasonCode === 'REPORTER_DISCARDED') ||
++          (value.outcome === 'expired' && value.reasonCode === 'ABSOLUTE_TTL_EXPIRED')) ||
++        created === null || raw !== created + 86400000 || timestamp(value.expiresAt) !== raw ||
++        !Number.isSafeInteger(value.sourceRevision) || value.sourceRevision < 3 ||
++        !Number.isSafeInteger(value.processingRevision) || value.processingRevision <= value.sourceRevision - 2 ||
++        value.revision !== value.processingRevision + 2 || typeof value.idempotentReplay !== 'boolean' || value.textReportMaySubmit !== true ||
++        value.deletionPending !== false || value.processingStatus !== 'deleted' || !['SOURCE_REVOKED','RETENTION_EXPIRED'].includes(value.processingReasonCode) ||
++        value.processingRequired !== false || value.sanitizedDerivativeAvailable !== false ||
++        value.sanitizedDerivativeExpiresAt !== null || value.upload !== null) throw new Error()
++    } catch { throw new Error('EVIDENCE_DELETION_UNAVAILABLE') }
++    finally { clearTimeout(timer) }
++  }
++}
+ export function nativeEvidenceBindingCommand(
+   binding: EvidenceBinding,
+   input: Omit<NativeEvidenceBindingCommand, 'bindingRef'>
+diff --git a/apps/web/src/lib/server/evidence/__tests__/native.test.ts b/apps/web/src/lib/server/evidence/__tests__/native.test.ts
+--- a/apps/web/src/lib/server/evidence/__tests__/native.test.ts
++++ b/apps/web/src/lib/server/evidence/__tests__/native.test.ts
+@@ -5,6 +5,7 @@
+ const fixture = vi.hoisted(() => ({
+   row: null as Record<string, unknown> | null,
+   binding: null as Record<string, unknown> | null,
++  deletion: null as Record<string, unknown> | null,
+   active: true,
+   identified: true,
+   ownPrincipal: true,
+@@ -67,6 +68,14 @@
+   }
+   const execute = async (query: { text: string; values: unknown[] }) => {
+     fixture.calls.push(query)
++    if (query.text.includes('INSERT INTO ipc_native_evidence_deletion')) {
++      fixture.deletion ??= {binding_ref:query.values[1], phase:'deleting'}
++      return []
++    }
++    if (query.text.includes('UPDATE ipc_native_evidence_deletion')) {
++      fixture.deletion!.phase = 'deleted'; return []
++    }
++    if (query.text.includes('FROM ipc_native_evidence_deletion')) return fixture.deletion ? [fixture.deletion] : []
+     if (query.text.includes('FROM ipc_native_session_binding'))
+       return fixture.nativeBound ? [{ session_id: fixture.sessionId }] : []
+     if (query.text.includes('pg_advisory')) return []
+@@ -121,11 +130,13 @@
+     transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+       const saved = structuredClone(fixture.row)
+       const savedBinding = structuredClone(fixture.binding)
++      const savedDeletion = structuredClone(fixture.deletion)
+       try {
+         return await fn({ select, execute })
+       } catch (error) {
+         fixture.row = saved
+         fixture.binding = savedBinding
++        fixture.deletion = savedDeletion
+         throw error
+       }
+     },
+@@ -156,6 +167,7 @@
+   runIssueNativeEvidenceCapability,
+   runReadNativeEvidence,
+   runOpenNativeEvidence,
++  runDeleteNativeEvidence,
+ } from '../native'
+ const ctx = {
+   scope: 'widget',
+@@ -196,6 +208,7 @@
+ beforeEach(() => {
+   fixture.row = null
+   fixture.binding = null
++  fixture.deletion = null
+   fixture.active = true
+   fixture.identified = true
+   fixture.ownPrincipal = true
+@@ -225,6 +238,61 @@
+   )
+ })
+ describe('native capability issuance and revocation', () => {
++  it.each(['raw-pending','sanitized-ready','unknown-reason'])('never confirms deletion from %s broker metadata',async(mode)=>{
++    await runIssueNativeEvidenceCapability(ctx,{reportId}); await runBindNativeEvidence(ctx,input)
++    const terminal = {...ready(),sourceRevision:4,processingRevision:5,revision:7,status:'deleted',outcome:'discarded',reasonCode:'REPORTER_DISCARDED',
++      deletionPending:false,processingStatus:'deleted',processingReasonCode:'SOURCE_REVOKED',
++      sanitizedDerivativeAvailable:false,sanitizedDerivativeExpiresAt:null}
++    if(mode==='raw-pending') terminal.deletionPending=true
++    if(mode==='sanitized-ready') terminal.sanitizedDerivativeAvailable=true
++    if(mode==='unknown-reason') terminal.processingReasonCode='UNKNOWN'
++    vi.stubGlobal('fetch',vi.fn(async()=>Response.json(terminal)))
++    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow('EVIDENCE_DELETION_UNAVAILABLE')
++    expect(fixture.deletion?.phase).toBe('deleting')
++  })
++  it('committed deletion retains Ticket tuple, fences reads before remote calls, and recovers exact retry', async () => {
++    await runIssueNativeEvidenceCapability(ctx, {reportId})
++    await runBindNativeEvidence(ctx, input)
++    const bound = structuredClone(fixture.row)
++    const remote = vi.fn(async (_url: string, options: RequestInit) => {
++      expect(fixture.deletion?.phase).toBe('deleting')
++      const body = JSON.parse(options.body as string)
++      const claims = verifyEvidenceCapability((options.headers as Record<string,string>).Authorization.slice(7), evidenceServerConfig(process.env,'test-only-master-secret-for-qbe1-domain')!.signingKey)!
++      expect(claims.scope).toBe('evidence:bound-delete')
++      expect(await introspectNativeEvidenceCapability((options.headers as Record<string,string>).Authorization.slice(7))).toMatchObject({scope:'evidence:bound-delete'})
++      expect(await introspectNativeEvidenceCapability((await runIssueNativeEvidenceCapability(ctx,{reportId}).catch(()=>null))?.attachToken ?? '')).toBeNull()
++      await expect(runOpenNativeEvidence(ctx,{ticketId:input.ticketId,evidenceId})).rejects.toThrow()
++      return Response.json({...ready(),sourceRevision:4,processingRevision:5,revision:7,evidenceId:body.evidenceId,status:'deleted',outcome:'discarded',reasonCode:'REPORTER_DISCARDED',deletionPending:false,processingStatus:'deleted',processingReasonCode:'SOURCE_REVOKED',sanitizedDerivativeAvailable:false,sanitizedDerivativeExpiresAt:null})
++    })
++    vi.stubGlobal('fetch', remote)
++    expect(await runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).toMatchObject({deleted:true})
++    expect(fixture.row).toEqual(bound)
++    expect(fixture.binding?.phase).toBe('confirmed')
++    expect(fixture.deletion?.phase).toBe('deleted')
++    expect(await runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).toMatchObject({deleted:true})
++    expect(remote).toHaveBeenCalledTimes(1)
++  })
++  it('refuses deletion without fresh identified ownership or confirmed exact tuple', async () => {
++    await runIssueNativeEvidenceCapability(ctx, {reportId})
++    await runBindNativeEvidence(ctx, input)
++    fixture.ownTicket = false
++    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
++    fixture.ownTicket = true; fixture.identified = false
++    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
++    fixture.identified = true; fixture.binding!.phase = 'committed'
++    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
++    fixture.binding!.phase = 'confirmed'; fixture.binding!.tuple_json = '{}'
++    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
++    expect(fixture.deletion).toBeNull()
++  })
++  it('unknown remote deletion leaves durable intent and retryable read fence', async () => {
++    await runIssueNativeEvidenceCapability(ctx, {reportId})
++    await runBindNativeEvidence(ctx, input)
++    vi.stubGlobal('fetch', vi.fn(async()=>{throw new Error('synthetic unavailable')}))
++    await expect(runDeleteNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
++    expect(fixture.deletion?.phase).toBe('deleting')
++    await expect(runReadNativeEvidence(ctx,{ticketId:input.ticketId})).rejects.toThrow()
++  })
+   it('preserves the same opaque report issuance, narrows kind gates, and never discloses server-read grants', async () => {
+     const issued = await runIssueNativeEvidenceCapability(ctx, { reportId })
+     const replay = await runIssueNativeEvidenceCapability(ctx, { reportId })
+diff --git a/apps/web/src/lib/server/functions/widget/native-evidence.ts b/apps/web/src/lib/server/functions/widget/native-evidence.ts
+--- a/apps/web/src/lib/server/functions/widget/native-evidence.ts
++++ b/apps/web/src/lib/server/functions/widget/native-evidence.ts
+@@ -43,3 +43,11 @@
+     const { runAbortNativeEvidenceBinding } = await import('@/lib/server/evidence/native')
+     return runAbortNativeEvidenceBinding(await requireWidgetAuth(), data)
+   })
++
++export const nativeDeleteEvidenceFn = createServerFn({method:'POST'})
++  .validator(ticketIdSchema.strict())
++  .handler(async ({data}) => {
++    const {requireWidgetAuth} = await import('../widget-auth')
++    const {runDeleteNativeEvidence} = await import('@/lib/server/evidence/native')
++    return runDeleteNativeEvidence(await requireWidgetAuth(),data)
++  })
+diff --git a/apps/web/src/lib/server/functions/widget/native-host.ts b/apps/web/src/lib/server/functions/widget/native-host.ts
+--- a/apps/web/src/lib/server/functions/widget/native-host.ts
++++ b/apps/web/src/lib/server/functions/widget/native-host.ts
+@@ -16,6 +16,7 @@
+     ticketId: z.string().min(1), evidenceIds: z.array(evidenceId).min(1).max(5)}).strict()}),
+   z.object({type: z.literal('abort-evidence'), payload: z.object({reportId}).strict()}),
+   z.object({type: z.literal('read-evidence'), payload: z.object({ticketId: z.string().min(1)}).strict()}),
++  z.object({type: z.literal('delete-evidence'), payload: z.object({ticketId: z.string().min(1)}).strict()}),
+ ])
+ 
+ export const nativeHostActionFn = createServerFn({method: 'POST'})
+@@ -48,6 +49,10 @@
+     if (data.action.type === 'read-evidence') {
+       const {runReadNativeEvidence} = await import('@/lib/server/evidence/native')
+       return runReadNativeEvidence(ctx, data.action.payload)
++    }
++    if (data.action.type === 'delete-evidence') {
++      const {runDeleteNativeEvidence} = await import('@/lib/server/evidence/native')
++      return runDeleteNativeEvidence(ctx,data.action.payload)
+     }
+     const native = await import('../tickets')
+     if (data.action.type === 'create-ticket') {
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts
+--- a/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts
++++ b/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts
+@@ -6,11 +6,11 @@
+   fn.handler=(value:typeof handler)=>{handler=value;return fn}
+   return fn
+ }}))
+-const p=vi.hoisted(()=>({auth:vi.fn(),bound:vi.fn(),abort:vi.fn(),bearer:'native-test-bearer'}))
++const p=vi.hoisted(()=>({auth:vi.fn(),bound:vi.fn(),abort:vi.fn(),remove:vi.fn(),bearer:'native-test-bearer'}))
+ vi.mock('@/lib/server/functions/widget-auth',()=>({requireWidgetAuth:p.auth}))
+ vi.mock('@tanstack/react-start/server',()=>({getRequestHeaders:()=>new Headers(p.bearer?{Authorization:`Bearer ${p.bearer}`}:{})}))
+ vi.mock('@/lib/server/widget/native-host-token',()=>({requireBoundNativeHostSession:p.bound}))
+-vi.mock('@/lib/server/evidence/native',()=>({runAbortNativeEvidenceBinding:p.abort}))
++vi.mock('@/lib/server/evidence/native',()=>({runAbortNativeEvidenceBinding:p.abort,runDeleteNativeEvidence:p.remove}))
+ import {nativeHostActionFn,nativeHostActionSchema} from '../native-host'
+ const invoke=nativeHostActionFn as unknown as(args:{data:unknown})=>Promise<unknown>
+ const context={contract:'iplaycafe.feedback/native-1',operationId:'00000000-0000-4000-8000-000000000002',hostOrigin:'https://app.example.test'}
+@@ -19,6 +19,13 @@
+ const ctx={principal:{type:'user',id:'principal-test'},user:{id:'user-test'}}
+ beforeEach(()=>{vi.clearAllMocks();p.bearer='native-test-bearer';p.auth.mockResolvedValue(ctx);p.bound.mockResolvedValue('session-test');p.abort.mockResolvedValue({reportId,aborted:true})})
+ describe('authenticated native abort facade',()=>{
++  it('bound private deletion passes only server-derived Ticket ownership after issuer correlation',async()=>{
++    p.remove.mockResolvedValueOnce({deleted:true})
++    await expect(invoke({data:{context,action:{type:'delete-evidence',payload:{ticketId:'ticket-test'}}}})).resolves.toEqual({deleted:true})
++    expect(p.bound.mock.invocationCallOrder[0]).toBeLessThan(p.remove.mock.invocationCallOrder[0])
++    expect(p.remove).toHaveBeenCalledWith(ctx,{ticketId:'ticket-test'})
++    expect(nativeHostActionSchema.safeParse({type:'delete-evidence',payload:{ticketId:'ticket-test',reportId}}).success).toBe(false)
++  })
+   it('validates bound issuer/session before entering abort authority',async()=>{
+     await expect(invoke({data:request})).resolves.toEqual({reportId,aborted:true})
+     expect(p.bound).toHaveBeenCalledWith(ctx.principal.id,context,p.bearer)
+diff --git a/apps/web/src/lib/shared/widget/native-host.ts b/apps/web/src/lib/shared/widget/native-host.ts
+--- a/apps/web/src/lib/shared/widget/native-host.ts
++++ b/apps/web/src/lib/shared/widget/native-host.ts
+@@ -18,6 +18,6 @@
+ export const nativeHostCommandSchema = z.object({
+   contract: z.literal(NATIVE_HOST_CONTRACT),
+   operationId: z.uuid(),
+-  type: z.enum(['identify', 'logout', 'create-ticket', 'list-tickets', 'read-ticket', 'reply-ticket', 'capture-config', 'evidence-capability', 'bind-evidence', 'abort-evidence', 'read-evidence']),
++  type: z.enum(['identify', 'logout', 'create-ticket', 'list-tickets', 'read-ticket', 'reply-ticket', 'capture-config', 'evidence-capability', 'bind-evidence', 'abort-evidence', 'read-evidence', 'delete-evidence']),
+   payload: z.record(z.string(), z.unknown()),
+ }).strict()
+diff --git a/packages/db/drizzle/0297_native_evidence_deletion.sql b/packages/db/drizzle/0297_native_evidence_deletion.sql
+new file mode 100644
+--- /dev/null
++++ b/packages/db/drizzle/0297_native_evidence_deletion.sql
+@@ -0,0 +1,23 @@
++CREATE TABLE ipc_native_evidence_deletion (
++ report_id text PRIMARY KEY REFERENCES ipc_native_evidence_report(report_id),
++ binding_ref text NOT NULL REFERENCES ipc_native_evidence_binding(binding_ref),
++ phase text NOT NULL CHECK(phase IN ('deleting','deleted')),
++ requested_at timestamptz NOT NULL DEFAULT now(),
++ completed_at timestamptz,
++ CHECK((phase='deleting' AND completed_at IS NULL) OR (phase='deleted' AND completed_at IS NOT NULL))
++);
++--> statement-breakpoint
++CREATE FUNCTION ipc_native_evidence_deletion_fence() RETURNS trigger LANGUAGE plpgsql AS $$
++BEGIN
++ IF TG_OP='INSERT' AND NOT EXISTS(SELECT 1 FROM ipc_native_evidence_binding b
++   WHERE b.report_id=NEW.report_id AND b.binding_ref=NEW.binding_ref AND b.phase='confirmed')
++ THEN RAISE EXCEPTION 'deletion requires confirmed binding'; END IF;
++ IF TG_OP='UPDATE' AND (NEW.report_id IS DISTINCT FROM OLD.report_id OR
++   NEW.binding_ref IS DISTINCT FROM OLD.binding_ref OR NEW.requested_at IS DISTINCT FROM OLD.requested_at OR
++   OLD.phase='deleted' AND NEW IS DISTINCT FROM OLD)
++ THEN RAISE EXCEPTION 'immutable evidence deletion'; END IF;
++ RETURN NEW;
++END $$;
++--> statement-breakpoint
++CREATE TRIGGER ipc_native_evidence_deletion_intent BEFORE INSERT OR UPDATE ON ipc_native_evidence_deletion
++ FOR EACH ROW EXECUTE FUNCTION ipc_native_evidence_deletion_fence();
+diff --git a/packages/db/drizzle/meta/_journal.json b/packages/db/drizzle/meta/_journal.json
+--- a/packages/db/drizzle/meta/_journal.json
++++ b/packages/db/drizzle/meta/_journal.json
+@@ -1919,6 +1919,7 @@
+       "when": 1791244800004,
+       "tag": "0296_ipc_help_center_native_private",
+       "breakpoints": true
+-    }
++    },
++    {"idx":274,"version":"7","when":1791244800005,"tag":"0297_native_evidence_deletion","breakpoints":true}
+   ]
+ }
+diff --git a/apps/web/src/locales/ar.json b/apps/web/src/locales/ar.json
+--- a/apps/web/src/locales/ar.json
++++ b/apps/web/src/locales/ar.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "شاركنا أفكارك",
+   "widget.shell.heading.help": "المساعدة والدعم",
+   "widget.shell.heading.changelog": "آخر المستجدات",
+diff --git a/apps/web/src/locales/de.json b/apps/web/src/locales/de.json
+--- a/apps/web/src/locales/de.json
++++ b/apps/web/src/locales/de.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "Teile deine Ideen",
+   "widget.shell.heading.help": "Hilfe & Support",
+   "widget.shell.heading.changelog": "Neuigkeiten",
+diff --git a/apps/web/src/locales/en.json b/apps/web/src/locales/en.json
+--- a/apps/web/src/locales/en.json
++++ b/apps/web/src/locales/en.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "Share your ideas",
+   "widget.shell.heading.help": "Help & Support",
+   "widget.shell.heading.changelog": "What's new",
+diff --git a/apps/web/src/locales/es.json b/apps/web/src/locales/es.json
+--- a/apps/web/src/locales/es.json
++++ b/apps/web/src/locales/es.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "Comparte tus ideas",
+   "widget.shell.heading.help": "Ayuda y soporte",
+   "widget.shell.heading.changelog": "Novedades",
+diff --git a/apps/web/src/locales/fr.json b/apps/web/src/locales/fr.json
+--- a/apps/web/src/locales/fr.json
++++ b/apps/web/src/locales/fr.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "Partagez vos idées",
+   "widget.shell.heading.help": "Aide et assistance",
+   "widget.shell.heading.changelog": "Nouveautés",
+diff --git a/apps/web/src/locales/nl.json b/apps/web/src/locales/nl.json
+--- a/apps/web/src/locales/nl.json
++++ b/apps/web/src/locales/nl.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "Deel je ideeën",
+   "widget.shell.heading.help": "Help & ondersteuning",
+   "widget.shell.heading.changelog": "Wat is er nieuw",
+diff --git a/apps/web/src/locales/pl.json b/apps/web/src/locales/pl.json
+--- a/apps/web/src/locales/pl.json
++++ b/apps/web/src/locales/pl.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "Podziel się pomysłami",
+   "widget.shell.heading.help": "Pomoc i wsparcie",
+   "widget.shell.heading.changelog": "Co nowego",
+diff --git a/apps/web/src/locales/pt-br.json b/apps/web/src/locales/pt-br.json
+--- a/apps/web/src/locales/pt-br.json
++++ b/apps/web/src/locales/pt-br.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "Compartilhe suas ideias",
+   "widget.shell.heading.help": "Central de Ajuda",
+   "widget.shell.heading.changelog": "Novidades",
+diff --git a/apps/web/src/locales/ru.json b/apps/web/src/locales/ru.json
+--- a/apps/web/src/locales/ru.json
++++ b/apps/web/src/locales/ru.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "Поделитесь предложением",
+   "widget.shell.heading.help": "Помощь и поддержка",
+   "widget.shell.heading.changelog": "Что нового",
+diff --git a/apps/web/src/locales/th.json b/apps/web/src/locales/th.json
+--- a/apps/web/src/locales/th.json
++++ b/apps/web/src/locales/th.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "หลักฐานส่วนตัว",
++  "widget.nativeEvidence.view": "ดูหลักฐาน {index}",
++  "widget.nativeEvidence.delete": "ลบหลักฐานส่วนตัว",
++  "widget.nativeEvidence.unavailable": "ไม่สามารถเปิดหลักฐานได้",
+   "widget.shell.heading.feedback": "แบ่งปันไอเดีย",
+   "widget.shell.heading.help": "ความช่วยเหลือและบริการ",
+   "widget.shell.heading.changelog": "มีอะไรใหม่",
+diff --git a/apps/web/src/locales/zh-cn.json b/apps/web/src/locales/zh-cn.json
+--- a/apps/web/src/locales/zh-cn.json
++++ b/apps/web/src/locales/zh-cn.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "分享你的想法",
+   "widget.shell.heading.help": "帮助与支持",
+   "widget.shell.heading.changelog": "最新动态",
+diff --git a/apps/web/src/locales/zh-tw.json b/apps/web/src/locales/zh-tw.json
+--- a/apps/web/src/locales/zh-tw.json
++++ b/apps/web/src/locales/zh-tw.json
+@@ -1,4 +1,8 @@
+ {
++  "widget.nativeEvidence.heading": "Private evidence",
++  "widget.nativeEvidence.view": "View evidence {index}",
++  "widget.nativeEvidence.delete": "Delete private evidence",
++  "widget.nativeEvidence.unavailable": "Evidence unavailable",
+   "widget.shell.heading.feedback": "分享你的想法",
+   "widget.shell.heading.help": "說明與支援",
+   "widget.shell.heading.changelog": "最新消息",

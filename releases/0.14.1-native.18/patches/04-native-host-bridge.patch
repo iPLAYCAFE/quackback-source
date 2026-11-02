@@ -1,0 +1,2673 @@
+diff --git a/apps/web/src/components/shared/conversation/visitor-conversation-thread.tsx b/apps/web/src/components/shared/conversation/visitor-conversation-thread.tsx
+index ff007fcc2..8a5accd4e 100644
+--- a/apps/web/src/components/shared/conversation/visitor-conversation-thread.tsx
++++ b/apps/web/src/components/shared/conversation/visitor-conversation-thread.tsx
+@@ -125,6 +125,7 @@ export interface VisitorConversationThreadPresence {
+ }
+ 
+ export interface VisitorConversationThreadProps {
++  renderTicketAccessory?: (ticket: RequesterTicketDTO) => import('react').ReactNode
+   /** Which thread to open: an id opens that thread, 'new' starts a fresh one,
+    *  undefined resumes the visitor's active/most-recent thread. */
+   conversationTarget?: ConversationId | 'new'
+@@ -204,6 +205,7 @@ export function VisitorConversationThread({
+   onConversationStarted,
+   autofocusComposer = false,
+   compact = false,
++  renderTicketAccessory,
+ }: VisitorConversationThreadProps) {
+   const intl = useIntl()
+   const formatDate = useLocalDateFormatter()
+@@ -1182,6 +1184,7 @@ export function VisitorConversationThread({
+           watch bell + collapsed details. Only when a linked ticket exists —
+           plain chats render nothing here. */}
+       {linkedTicket && <TicketHeaderCard ticket={linkedTicket} getAuthHeaders={getAuthHeaders} />}
++      {linkedTicket && renderTicketAccessory?.(linkedTicket)}
+ 
+       <div className="relative flex-1 min-h-0">
+         {/* Every attachment in the loaded thread, in message order — lets a
+diff --git a/apps/web/src/components/widget/__tests__/widget-auth-provider-native-races.test.tsx b/apps/web/src/components/widget/__tests__/widget-auth-provider-native-races.test.tsx
+new file mode 100644
+index 000000000..b7469de38
+--- /dev/null
++++ b/apps/web/src/components/widget/__tests__/widget-auth-provider-native-races.test.tsx
+@@ -0,0 +1,170 @@
++// @vitest-environment happy-dom
++import { act, cleanup, render } from '@testing-library/react'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { installInMemoryLocalStorage } from '@/test/local-storage'
++import { clearWidgetToken, getWidgetToken, persistAnonymousToken, readPersistedToken } from '@/lib/client/widget-auth'
++import { WidgetAuthProvider, useWidgetAuth } from '../widget-auth-provider'
++import { authClient } from '@/lib/client/auth-client'
++import { sendToHost } from '@/lib/client/widget-bridge'
++
++installInMemoryLocalStorage()
++type NativeIdentity = {sessionToken: string; user: {id: string; name: string; email: string; avatarUrl: null}}
++const native = vi.hoisted(() => ({ apply: (_value: NativeIdentity) => {}, clear: () => null as string | null, retire: vi.fn(async () => {}) }))
++vi.mock('../use-native-host-bridge', () => ({ useNativeHostBridge: (apply: typeof native.apply, clear: typeof native.clear) => {
++  native.apply = apply; native.clear = clear; return () => native.retire()
++} }))
++vi.mock('@/lib/client/widget-bridge', () => ({sendToHost: vi.fn()}))
++vi.mock('@/lib/client/auth-client', () => ({authClient: {signIn: {anonymous: vi.fn()}}}))
++vi.mock('@/lib/shared/i18n', async orig => ({...(await orig<typeof import('@/lib/shared/i18n')>()), loadMessages: vi.fn(async () => ({}))}))
++
++function deferred<T>() {
++  let resolve!: (value: T) => void
++  const promise = new Promise<T>(r => {resolve = r})
++  return {promise, resolve}
++}
++let current: ReturnType<typeof useWidgetAuth>
++function Probe() { current = useWidgetAuth(); return <span>{current.user?.id ?? 'anonymous'}</span> }
++function mount() { return render(<QueryClientProvider client={new QueryClient()}>
++  <WidgetAuthProvider><Probe /></WidgetAuthProvider></QueryClientProvider>) }
++const identity = (id: string) => ({sessionToken: `session-${id}`, user: {id, name: id, email: `${id}@example.test`, avatarUrl: null}})
++async function ordinary(data: unknown) { await act(async () => {window.dispatchEvent(new MessageEvent('message', {
++  source: window.parent, data: {type: 'quackback:identify', data},
++})); await Promise.resolve()}) }
++function switchNative(id: string) { act(() => {native.clear(); native.apply(identity(id))}) }
++beforeEach(() => {clearWidgetToken(); window.localStorage.clear(); vi.clearAllMocks(); native.retire.mockReset().mockResolvedValue(undefined); vi.stubGlobal('fetch', vi.fn())})
++afterEach(() => {cleanup(); vi.unstubAllGlobals()})
++
++describe('shared identity fence across native and ordinary widget auth', () => {
++  it('preserves anonymous reload continuity when SDK default identity supersedes mount restore', async () => {
++    const old = deferred<Response>(), next = deferred<Response>()
++    persistAnonymousToken('previous-anonymous')
++    vi.stubGlobal('fetch', vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(next.promise))
++    mount(); await ordinary({anonymous: true})
++    await act(async () => {old.resolve(Response.json({})); await old.promise})
++    expect(getWidgetToken()).toBeNull()
++    await act(async () => {next.resolve(Response.json({})); await next.promise})
++    expect(getWidgetToken()).toBe('previous-anonymous')
++    expect(readPersistedToken()).toBe('previous-anonymous')
++    expect(authClient.signIn.anonymous).not.toHaveBeenCalled()
++  })
++  it('never adopts a persisted anonymous restore that finishes after native ACK', async () => {
++    const pending = deferred<Response>()
++    persistAnonymousToken('previous-anonymous')
++    vi.stubGlobal('fetch', vi.fn(() => pending.promise))
++    mount(); switchNative('new-native')
++    await act(async () => {pending.resolve(Response.json({})); await pending.promise})
++    expect(getWidgetToken()).toBe('session-new-native')
++    expect(current.user?.id).toBe('new-native')
++    expect(readPersistedToken()).toBeNull()
++  })
++  it('drops a late ordinary SSO response after native user switch', async () => {
++    const pending = deferred<Response>()
++    vi.stubGlobal('fetch', vi.fn(() => pending.promise))
++    mount(); await ordinary({ssoToken: 'ordinary-SSO'}); switchNative('new-native')
++    await act(async () => {pending.resolve(Response.json(identity('old-ordinary'))); await pending.promise})
++    expect(getWidgetToken()).toBe('session-new-native')
++    expect(current.user?.id).toBe('new-native')
++  })
++  it('drops late anonymous mint callbacks and write continuations after native logout', async () => {
++    const pending = deferred<{data: object; error: null}>()
++    let callback!: (ctx: {response: Response}) => void
++    vi.mocked(authClient.signIn.anonymous).mockImplementationOnce(async options => {
++      callback = options!.fetchOptions!.onSuccess as typeof callback
++      return pending.promise as never
++    })
++    mount()
++    const write = vi.fn()
++    let waiting!: Promise<void>
++    act(() => {waiting = current.ensureSessionThen(write)})
++    act(() => {native.clear()})
++    await act(async () => {
++      callback({response: new Response(null, {headers: {'set-auth-token': 'late-anonymous'}})})
++      pending.resolve({data: {}, error: null}); await waiting
++    })
++    expect(getWidgetToken()).toBeNull()
++    expect(readPersistedToken()).toBeNull()
++    expect(write).not.toHaveBeenCalled()
++  })
++  it('keeps ordinary logout terminal when an older ordinary SSO response arrives', async () => {
++    const pending = deferred<Response>()
++    vi.stubGlobal('fetch', vi.fn(() => pending.promise))
++    mount(); await ordinary({ssoToken: 'ordinary-SSO'}); await ordinary(null)
++    await act(async () => {pending.resolve(Response.json(identity('old-ordinary'))); await pending.promise})
++    expect(getWidgetToken()).toBeNull()
++    expect(current.user).toBeNull()
++  })
++  it('cannot erase a newer mint promise when the previous attempt finally settles', async () => {
++    const old = deferred<{data: object; error: null}>(), next = deferred<{data: object; error: null}>()
++    vi.mocked(authClient.signIn.anonymous).mockImplementationOnce(() => old.promise as never).mockImplementationOnce(() => next.promise as never)
++    mount()
++    let first!: Promise<boolean>, second!: Promise<boolean>, third!: Promise<boolean>
++    act(() => {first = current.ensureSession()})
++    act(() => {native.clear(); second = current.ensureSession()})
++    await act(async () => {old.resolve({data: {}, error: null}); await first})
++    act(() => {third = current.ensureSession()})
++    expect(authClient.signIn.anonymous).toHaveBeenCalledTimes(2)
++    await act(async () => {next.resolve({data: {}, error: null}); await Promise.all([second, third])})
++  })
++  it('does not adopt or persist a restore response after provider unmount', async () => {
++    const pending = deferred<Response>()
++    persistAnonymousToken('previous-anonymous')
++    vi.stubGlobal('fetch', vi.fn(() => pending.promise))
++    const rendered = mount(); rendered.unmount(); clearWidgetToken()
++    await act(async () => {pending.resolve(Response.json({})); await pending.promise})
++    expect(getWidgetToken()).toBeNull()
++  })
++})
++
++
++describe('ordinary handoff waits for native retirement', () => {
++  function delayRetirement() {
++    const pending = deferred<void>()
++    native.retire.mockImplementationOnce(() => {native.clear(); return pending.promise})
++    return pending
++  }
++  it('does not exchange ordinary SSO until the owned native session is retired', async () => {
++    mount(); switchNative('old-native')
++    const retiring = delayRetirement()
++    vi.stubGlobal('fetch', vi.fn(async () => Response.json(identity('ordinary'))))
++    await ordinary({ssoToken: 'ordinary-SSO'})
++    expect(fetch).not.toHaveBeenCalled()
++    expect(getWidgetToken()).toBeNull()
++    await act(async () => {retiring.resolve(); await retiring.promise})
++    expect(fetch).toHaveBeenCalledTimes(1)
++    expect(current.user?.id).toBe('ordinary')
++  })
++  it('a pending ordinary logout cannot clear a later native identity', async () => {
++    mount(); switchNative('old-native')
++    const retiring = delayRetirement()
++    await ordinary(null)
++    switchNative('new-native')
++    await act(async () => {retiring.resolve(); await retiring.promise})
++    expect(getWidgetToken()).toBe('session-new-native')
++    expect(current.user?.id).toBe('new-native')
++  })
++  it('only the newest ordinary identity exchanges when handoffs overlap', async () => {
++    mount(); switchNative('old-native')
++    const retiring = deferred<void>()
++    native.retire.mockImplementation(() => {native.clear(); return retiring.promise})
++    vi.stubGlobal('fetch', vi.fn(async () => Response.json(identity('newest'))))
++    await ordinary({ssoToken: 'older'})
++    await ordinary({ssoToken: 'newest'})
++    expect(fetch).not.toHaveBeenCalled()
++    await act(async () => {retiring.resolve(); await retiring.promise})
++    expect(fetch).toHaveBeenCalledTimes(1)
++    expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string).ssoToken).toBe('newest')
++  })
++  it('failed retirement blocks ordinary exchange and lazy anonymous mint', async () => {
++    mount(); switchNative('old-native')
++    native.retire.mockImplementation(() => {native.clear(); return Promise.reject(new Error('REVOCATION_FAILED'))})
++    await ordinary({ssoToken: 'ordinary-SSO'})
++    expect(fetch).not.toHaveBeenCalled()
++    expect(sendToHost).toHaveBeenCalledWith(expect.objectContaining({success: false, error: 'NATIVE_SESSION_REVOCATION_FAILED'}))
++    await act(async () => {expect(await current.ensureSession()).toBe(false)})
++    expect(authClient.signIn.anonymous).not.toHaveBeenCalled()
++    expect(getWidgetToken()).toBeNull()
++    await ordinary(null)
++    expect(vi.mocked(sendToHost).mock.calls.filter(([message]) => message.type === 'quackback:identify-result').at(-1)?.[0]).toMatchObject({success: false})
++  })
++})
+diff --git a/apps/web/src/components/widget/use-native-host-bridge.ts b/apps/web/src/components/widget/use-native-host-bridge.ts
+new file mode 100644
+index 000000000..ee7326f2a
+--- /dev/null
++++ b/apps/web/src/components/widget/use-native-host-bridge.ts
+@@ -0,0 +1,56 @@
++import { useCallback, useEffect, useRef } from 'react'
++import { createNativeHostController } from '@/lib/client/native-host-controller'
++import { nativeHostActionFn, nativeHostActionSchema } from '@/lib/server/functions/widget/native-host'
++import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
++import type { NativeHostContext } from '@/lib/shared/widget/native-host'
++import { configureNativeCapture } from './widget-native-capture'
++
++export interface NativeIdentifyResult {
++  sessionToken: string
++  user: {id: string; name: string; email: string; avatarUrl: string | null}
++  votedPostIds?: string[]
++  canPortalHandoff?: boolean
++}
++
++export function useNativeHostBridge(
++  applyIdentity: (result: NativeIdentifyResult) => void,
++  clearIdentity: () => string | null
++) {
++  const portsRef = useRef({applyIdentity, clearIdentity})
++  portsRef.current = {applyIdentity, clearIdentity}
++  const controllerRef = useRef<ReturnType<typeof createNativeHostController> | null>(null)
++  useEffect(() => {
++    const action = async (type: string, payload: Record<string, unknown>, context: NativeHostContext, token?: string | null) => {
++      if (type === 'logout' && !token) return {loggedOut: true}
++      const headers = token ? {Authorization: `Bearer ${token}`} : getWidgetAuthHeaders()
++      return nativeHostActionFn({data: {context, action: nativeHostActionSchema.parse({type, payload})}, headers})
++    }
++    const controller = createNativeHostController({
++      audience: window.location.origin,
++      clearIdentity: () => portsRef.current.clearIdentity(),
++      applyIdentity: (value) => portsRef.current.applyIdentity(value as unknown as NativeIdentifyResult),
++      identify: async (payload, context, previousToken) => {
++        const response = await fetch('/api/widget/identify', {
++          method: 'POST', headers: {'Content-Type': 'application/json',
++            ...(previousToken ? {Authorization: `Bearer ${previousToken}`} : {})},
++          body: JSON.stringify({ssoToken: payload.ssoToken, ipc: context,
++            ...(previousToken ? {previousToken} : {})}),
++        })
++        const value = await response.json()
++        if (!response.ok) throw new Error(value.error?.code ?? 'IDENTIFY_FAILED')
++        return value
++      },
++      action,
++      respond: (origin, name, payload) => window.parent.postMessage({type: 'quackback:event', name, payload}, origin),
++      configureCapture: configureNativeCapture,
++    })
++    controllerRef.current = controller
++    function receive(event: MessageEvent) {
++      if (event.source !== window.parent || event.data?.type !== 'quackback:native') return
++      void controller.receive(event.data.data, event.origin)
++    }
++    window.addEventListener('message', receive)
++    return () => { controller.fence(); controllerRef.current = null; window.removeEventListener('message', receive) }
++  }, [])
++  return useCallback(() => controllerRef.current?.retire() ?? Promise.resolve(), [])
++}
+diff --git a/apps/web/src/components/widget/widget-auth-provider.tsx b/apps/web/src/components/widget/widget-auth-provider.tsx
+index a4cbbed9d..3c264d0bf 100644
+--- a/apps/web/src/components/widget/widget-auth-provider.tsx
++++ b/apps/web/src/components/widget/widget-auth-provider.tsx
+@@ -27,6 +27,7 @@ import { normalizeLocale, DEFAULT_LOCALE, type SupportedLocale } from '@/lib/sha
+ import { htmlLangDir } from '@/lib/shared/document-locale'
+ import { useIntlSetup } from '@/lib/client/hooks/use-intl-setup'
+ import { onIntlError } from '@/lib/client/intl-error'
++import { useNativeHostBridge } from './use-native-host-bridge'
+ 
+ interface WidgetUser {
+   id: string
+@@ -124,6 +125,19 @@ export function WidgetAuthProvider({
+   const [sessionVersion, setSessionVersion] = useState(initialSessionVersion)
+   const [identityResolved, setIdentityResolved] = useState(false)
+   const isIdentified = user !== null
++  // Shared across native SSO, ordinary SSO and anonymous restoration/minting.
++  // A response from an earlier identity may never adopt a token or user.
++  const identityGenerationRef = useRef(0)
++  const sessionAttemptRef = useRef(0)
++  const sessionPromiseRef = useRef<Promise<boolean> | null>(null)
++  const nativeRetirementRef = useRef<Promise<void> | null>(null)
++  const advanceIdentity = useCallback(() => {
++    identityGenerationRef.current += 1
++    sessionAttemptRef.current += 1
++    sessionPromiseRef.current = null
++    return identityGenerationRef.current
++  }, [])
++  useEffect(() => () => { advanceIdentity() }, [advanceIdentity])
+   const sessionReadyRef = useRef(portalSessionAdopted)
+   const sessionSourceRef = useRef<SessionSource>(portalSessionAdopted ? 'portal' : null)
+ 
+@@ -184,19 +198,26 @@ export function WidgetAuthProvider({
+   // creates a new session, honoring the lazy-mint-on-first-write model.
+   // Concurrent callers coalesce on the in-flight attempt; if a restore-only
+   // attempt establishes nothing, a mint-allowed caller falls through to mint.
+-  const sessionPromiseRef = useRef<Promise<boolean> | null>(null)
+   const acquireSession = useCallback(
+     async (allowMint: boolean): Promise<boolean> => {
++      const generation = identityGenerationRef.current
++      const retirement = nativeRetirementRef.current
++      if (retirement) {
++        try { await retirement } catch { return false }
++        if (generation !== identityGenerationRef.current) return false
++      }
+       if (sessionReadyRef.current) return true
+       const inFlight = sessionPromiseRef.current
+       if (inFlight) {
+         const ok = await inFlight
++        if (generation !== identityGenerationRef.current) return false
+         if (ok || sessionReadyRef.current) return true
+         if (!allowMint) return false
+       }
+       if (sessionReadyRef.current) return true
+       if (sessionPromiseRef.current) return sessionPromiseRef.current
+ 
++      const attempt = ++sessionAttemptRef.current
+       const p = (async (): Promise<boolean> => {
+         try {
+           // 1. Prefer a persisted anonymous token — validate it server-side
+@@ -207,6 +228,7 @@ export function WidgetAuthProvider({
+               const res = await fetch('/api/widget/session', {
+                 headers: { Authorization: `Bearer ${persisted}` },
+               })
++              if (generation !== identityGenerationRef.current) return false
+               if (res.ok) {
+                 storeToken(persisted)
+                 // Active use rolls the client expiry hint forward (the server
+@@ -218,9 +240,10 @@ export function WidgetAuthProvider({
+             } catch {
+               // Server unreachable — fall through and mint if allowed.
+             }
++            if (generation !== identityGenerationRef.current) return false
+             clearWidgetToken() // stale/invalid → drop the persisted copy
+           }
+-          if (!allowMint) return false
++          if (generation !== identityGenerationRef.current || !allowMint) return false
+ 
+           // 2. Lazy-mint a fresh anonymous session. credentials:'omit' keeps the
+           //    widget iframe from sending/accepting the portal cookie; the token
+@@ -230,6 +253,7 @@ export function WidgetAuthProvider({
+             fetchOptions: {
+               credentials: 'omit',
+               onSuccess: (ctx) => {
++                if (generation !== identityGenerationRef.current) return
+                 const token = ctx.response.headers.get('set-auth-token')
+                 if (token) {
+                   storeToken(token)
+@@ -238,11 +262,11 @@ export function WidgetAuthProvider({
+               },
+             },
+           })
+-          return !error && !!data
++          return generation === identityGenerationRef.current && !error && !!data
+         } catch {
+           return false
+         } finally {
+-          sessionPromiseRef.current = null
++          if (attempt === sessionAttemptRef.current) sessionPromiseRef.current = null
+         }
+       })()
+       sessionPromiseRef.current = p
+@@ -254,12 +278,13 @@ export function WidgetAuthProvider({
+ 
+   const ensureSessionThen = useCallback(
+     async (callback: () => void | Promise<void>) => {
++      const generation = identityGenerationRef.current
+       if (sessionReadyRef.current) {
+         await callback()
+         return
+       }
+       const success = await ensureSession()
+-      if (success) {
++      if (success && generation === identityGenerationRef.current) {
+         await callback()
+       }
+     },
+@@ -293,6 +318,29 @@ export function WidgetAuthProvider({
+     [storeToken, queryClient]
+   )
+ 
++  const clearNativeIdentity = useCallback(() => {
++    advanceIdentity()
++    const previous = getWidgetToken()
++    clearWidgetToken()
++    clearPersistedToken()
++    sessionReadyRef.current = false
++    sessionSourceRef.current = null
++    sessionPromiseRef.current = null
++    sessionVersionRef.current += 1
++    setSessionVersion(sessionVersionRef.current)
++    setUser(null)
++    setCanPortalHandoff(false)
++    setIdentityResolved(true)
++    queryClient.clear()
++    return previous
++  }, [queryClient, advanceIdentity])
++  const applyNativeIdentity = useCallback((result: Parameters<typeof applyIdentifyResult>[0]) => {
++    nativeRetirementRef.current = null
++    sessionSourceRef.current = 'sdk'
++    applyIdentifyResult(result)
++  }, [applyIdentifyResult])
++  const fenceNativeIdentity = useNativeHostBridge(applyNativeIdentity, clearNativeIdentity)
++
+   // NOTE: there is deliberately no inline email-capture identify. A verified
+   // session comes only from an ssoToken signed by the customer's backend (SDK
+   // identify / portal passthrough) — see GH issue #300. Anonymous visitors keep
+@@ -307,6 +355,7 @@ export function WidgetAuthProvider({
+   const portalHydratedRef = useRef(false)
+   useEffect(() => {
+     if (!portalSessionToken || portalHydratedRef.current) return
++    if (identityGenerationRef.current !== 0) { portalHydratedRef.current = true; return }
+     // A token known at mount was adopted before the first render (above); one
+     // that arrives later is adopted here, unless a session is already ready.
+     if (!portalSessionAdopted) {
+@@ -352,7 +401,7 @@ export function WidgetAuthProvider({
+   const [widgetMetadata, setWidgetMetadata] = useState<WidgetMetadata | null>(null)
+ 
+   useEffect(() => {
+-    async function handleIdentify(data: Record<string, unknown>) {
++    async function handleIdentify(data: Record<string, unknown>, generation: number) {
+       try {
+         // Capture current token before the identify call — if it's an anonymous
+         // session, the server will merge its activity into the newly identified user.
+@@ -372,8 +421,10 @@ export function WidgetAuthProvider({
+           body: JSON.stringify(payload),
+         })
+ 
++        if (generation !== identityGenerationRef.current) return
+         if (!response.ok) {
+           const err = await response.json().catch(() => ({ error: { code: 'NETWORK_ERROR' } }))
++          if (generation !== identityGenerationRef.current) return
+           sendToHost({
+             type: 'quackback:identify-result',
+             success: false,
+@@ -382,14 +433,16 @@ export function WidgetAuthProvider({
+           return
+         }
+ 
+-        applyIdentifyResult(await response.json())
++        const result = await response.json()
++        if (generation === identityGenerationRef.current) applyIdentifyResult(result)
+       } catch {
+-        sendToHost({ type: 'quackback:identify-result', success: false, error: 'NETWORK_ERROR' })
++        if (generation === identityGenerationRef.current)
++          sendToHost({ type: 'quackback:identify-result', success: false, error: 'NETWORK_ERROR' })
+       } finally {
+         // Resolved only once the round trip settles: between the message and
+         // the response `user` is still null, and consumers must not read that
+         // window as "this visitor is anonymous".
+-        setIdentityResolved(true)
++        if (generation === identityGenerationRef.current) setIdentityResolved(true)
+       }
+     }
+ 
+@@ -433,34 +486,54 @@ export function WidgetAuthProvider({
+           sessionSource: sessionSourceRef.current,
+         })
+ 
+-        switch (action) {
+-          case 'clear':
+-            clearWidgetToken()
+-            sessionReadyRef.current = false
+-            sessionSourceRef.current = null
+-            sessionPromiseRef.current = null
+-            sessionVersionRef.current += 1
+-            setSessionVersion(sessionVersionRef.current)
+-            setUser(null)
+-            setCanPortalHandoff(true)
+-            setIdentityResolved(true)
+-            sendToHost({ type: 'quackback:identify-result', success: true, user: null })
+-            sendToHost({ type: 'quackback:auth-change', user: null })
+-            break
+-          case 'anonymous':
+-            handleAnonymousIdentify()
+-            break
+-          case 'identify':
+-            sessionSourceRef.current = 'sdk'
+-            handleIdentify(msg.data as Record<string, unknown>)
+-            break
+-          case 'skip':
+-            // Portal session takes precedence — ack without changing state
+-            setIdentityResolved(true)
+-            sendToHost({ type: 'quackback:identify-result', success: true, user: user ?? null })
+-            sendToHost({ type: 'quackback:auth-change', user: user ?? null })
+-            break
+-        }
++        // retire() captures/clears the exact native bearer synchronously. Take
++        // our generation AFTER that clear, then fence every awaited retirement.
++        const retirement = fenceNativeIdentity()
++        nativeRetirementRef.current = retirement
++        const generation = advanceIdentity()
++        void (async () => {
++          try { await retirement } catch {
++            if (generation === identityGenerationRef.current) {
++              setIdentityResolved(true)
++              sendToHost({type: 'quackback:identify-result', success: false,
++                error: 'NATIVE_SESSION_REVOCATION_FAILED'})
++            }
++            return
++          }
++          if (generation !== identityGenerationRef.current) return
++          if (nativeRetirementRef.current === retirement) nativeRetirementRef.current = null
++          switch (action) {
++            case 'clear':
++              clearWidgetToken()
++              sessionReadyRef.current = false
++              sessionSourceRef.current = null
++              sessionPromiseRef.current = null
++              sessionVersionRef.current += 1
++              setSessionVersion(sessionVersionRef.current)
++              setUser(null)
++              setCanPortalHandoff(true)
++              setIdentityResolved(true)
++              sendToHost({ type: 'quackback:identify-result', success: true, user: null })
++              sendToHost({ type: 'quackback:auth-change', user: null })
++              break
++            case 'anonymous':
++              handleAnonymousIdentify()
++              // The SDK's default anonymous intent may supersede a mount-time
++              // restore. Restart it under this generation without minting.
++              void acquireSession(false)
++              break
++            case 'identify':
++              sessionSourceRef.current = 'sdk'
++              handleIdentify(msg.data as Record<string, unknown>, generation)
++              break
++            case 'skip':
++              // Portal session takes precedence — ack without changing state
++              setIdentityResolved(true)
++              sendToHost({ type: 'quackback:identify-result', success: true, user: user ?? null })
++              sendToHost({ type: 'quackback:auth-change', user: user ?? null })
++              break
++          }
++        })()
+       }
+     }
+ 
+@@ -468,7 +541,7 @@ export function WidgetAuthProvider({
+     sendToHost({ type: 'quackback:ready' })
+ 
+     return () => window.removeEventListener('message', handleMessage)
+-  }, [storeToken, applyIdentifyResult])
++  }, [storeToken, applyIdentifyResult, advanceIdentity, acquireSession, fenceNativeIdentity])
+ 
+   const contextValue = useMemo(
+     () => ({
+diff --git a/apps/web/src/components/widget/widget-messenger.tsx b/apps/web/src/components/widget/widget-messenger.tsx
+index 5e023c5df..bb0715df1 100644
+--- a/apps/web/src/components/widget/widget-messenger.tsx
++++ b/apps/web/src/components/widget/widget-messenger.tsx
+@@ -8,6 +8,7 @@ import { VisitorSurfaceRpcProvider } from '@/lib/client/visitor-surface-rpc'
+ import { widgetVisitorRpc } from '@/lib/client/widget-visitor-rpc'
+ import { useConversationPresence, markAgentPresentInCache } from './use-messenger-presence'
+ import { useWidgetFileUpload } from './use-widget-file-upload'
++import { WidgetNativeEvidence } from './widget-native-evidence'
+ 
+ interface WidgetMessengerProps {
+   /** Whether the help center is available (gates in-conversation article suggestions). */
+@@ -79,6 +80,8 @@ export function WidgetMessenger({
+         showHeader={false}
+         autofocusComposer={autofocusComposer}
+         compact
++        renderTicketAccessory={(ticket) => <WidgetNativeEvidence key={`${sessionVersion}:${ticket.id}`}
++          ticketId={ticket.id} sessionVersion={sessionVersion} />}
+       />
+     </VisitorSurfaceRpcProvider>
+   )
+diff --git a/apps/web/src/components/widget/widget-native-capture.tsx b/apps/web/src/components/widget/widget-native-capture.tsx
+new file mode 100644
+index 000000000..9096406c3
+--- /dev/null
++++ b/apps/web/src/components/widget/widget-native-capture.tsx
+@@ -0,0 +1,23 @@
++import { useSyncExternalStore } from 'react'
++import { NATIVE_HOST_CONTRACT } from '@/lib/shared/widget/native-host'
++
++let config: {origin: string; enabled: boolean; label: string} = {origin: '', enabled: false, label: ''}
++const listeners = new Set<() => void>()
++const empty = {origin: '', enabled: false, label: ''}
++export function configureNativeCapture(origin: string, payload: Record<string, unknown>) {
++  config = {origin, enabled: payload.enabled === true,
++    label: typeof payload.label === 'string' ? payload.label.slice(0, 100) : 'Report an issue'}
++  for (const listener of listeners) listener()
++}
++
++/** Host owns capture/editor/consent; this is only the one native Home action. */
++export function WidgetNativeCaptureAction() {
++  const value = useSyncExternalStore((callback) => {listeners.add(callback); return () => {listeners.delete(callback)}},
++    () => config, () => empty)
++  if (!value.enabled || !value.origin) return null
++  return <button type="button" className="mx-4 rounded-2xl border border-border/60 bg-card px-4 py-3 text-left hover:bg-accent"
++    onClick={() => window.parent.postMessage({type: 'quackback:event', name: 'native-capture-request',
++      payload: {contract: NATIVE_HOST_CONTRACT, audience: window.location.origin, hostOrigin: value.origin}}, value.origin)}>
++    {value.label}
++  </button>
++}
+diff --git a/apps/web/src/components/widget/widget-native-evidence.tsx b/apps/web/src/components/widget/widget-native-evidence.tsx
+new file mode 100644
+index 000000000..ecebcb19f
+--- /dev/null
++++ b/apps/web/src/components/widget/widget-native-evidence.tsx
+@@ -0,0 +1,64 @@
++import { useEffect, useRef, useState } from 'react'
++import { useQuery } from '@tanstack/react-query'
++import { useIntl } from 'react-intl'
++import type { TicketId } from '@quackback/ids'
++import { nativeReadEvidenceFn } from '@/lib/server/functions/widget/native-evidence'
++import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
++
++/** Private bytes stay in the iframe; URLs are revoked on close/switch/unmount. */
++export function WidgetNativeEvidence({ticketId, sessionVersion}: {ticketId: TicketId; sessionVersion: number}) {
++  const intl = useIntl()
++  const thai = intl.locale.startsWith('th')
++  const requests = useRef(new Set<AbortController>())
++  const urls = useRef(new Set<string>())
++  const [preview, setPreview] = useState<{url: string; video: boolean} | null>(null)
++  const [busy, setBusy] = useState(false)
++  const [failed, setFailed] = useState(false)
++  const {data} = useQuery({
++    queryKey: ['widget', 'native-evidence', sessionVersion, ticketId],
++    queryFn: () => nativeReadEvidenceFn({data: {ticketId}, headers: getWidgetAuthHeaders()}),
++    retry: false,
++  })
++  useEffect(() => () => {
++    for (const request of requests.current) request.abort()
++    for (const url of urls.current) URL.revokeObjectURL(url)
++    urls.current.clear()
++  }, [sessionVersion, ticketId])
++  function close() {
++    if (preview) { URL.revokeObjectURL(preview.url); urls.current.delete(preview.url) }
++    setPreview(null)
++  }
++  async function open(evidenceId: string) {
++    if (busy) return
++    close(); setBusy(true); setFailed(false)
++    const controller = new AbortController(); requests.current.add(controller)
++    try {
++      const response = await fetch('/api/widget/evidence/private', {
++        method: 'POST', headers: {...getWidgetAuthHeaders(), 'Content-Type': 'application/json'},
++        body: JSON.stringify({ticketId, evidenceId}), signal: controller.signal,
++      })
++      const mime = response.headers.get('content-type')?.split(';')[0] ?? ''
++      if (!response.ok || !/^(image\/(png|jpeg|webp|gif)|video\/(mp4|webm))$/.test(mime)) throw new Error('unavailable')
++      const blob = await response.blob()
++      if (controller.signal.aborted || blob.size > 50 * 1024 * 1024) throw new Error('unavailable')
++      const url = URL.createObjectURL(blob); urls.current.add(url)
++      setPreview({url, video: mime.startsWith('video/')})
++    } catch { if (!controller.signal.aborted) setFailed(true) }
++    finally { requests.current.delete(controller); if (!controller.signal.aborted) setBusy(false) }
++  }
++  const evidence = data?.reports.flatMap(report => report.evidence) ?? []
++  if (!evidence.length) return null
++  return <section className="border-b p-3 text-sm">
++    <p>{thai ? 'หลักฐานส่วนตัว' : 'Private evidence'}</p>
++    <div className="flex flex-wrap gap-2">{evidence.map((item, index) => <button key={item.evidenceId}
++      type="button" className="rounded border px-2 py-1" disabled={busy} onClick={() => void open(item.evidenceId)}>
++      {thai ? 'ดูหลักฐาน' : 'View evidence'} {index + 1}
++    </button>)}</div>
++    {failed && <p role="alert">{thai ? 'ไม่สามารถเปิดหลักฐานได้' : 'Evidence unavailable'}</p>}
++    {preview && <div>
++      <button type="button" onClick={close}>{thai ? 'ปิด' : 'Close'}</button>
++      {preview.video ? <video src={preview.url} controls className="w-full" /> :
++        <img src={preview.url} alt={thai ? 'หลักฐานส่วนตัว' : 'Private evidence'} className="w-full" />}
++    </div>}
++  </section>
++}
+diff --git a/apps/web/src/components/widget/widget-overview.tsx b/apps/web/src/components/widget/widget-overview.tsx
+index a43511f84..3a18491e3 100644
+--- a/apps/web/src/components/widget/widget-overview.tsx
++++ b/apps/web/src/components/widget/widget-overview.tsx
+@@ -20,6 +20,7 @@ import { useWidgetAuth } from './widget-auth-provider'
+ import { firstNameOf } from '@/lib/shared/conversation/personalize'
+ import { WidgetResumeCard } from './widget-resume-card'
+ import { WidgetRecentTicketsCard } from './widget-recent-tickets'
++import { WidgetNativeCaptureAction } from './widget-native-capture'
+ import { WidgetChangelogTeaser } from './widget-changelog-teaser'
+ import type { ConversationId } from '@quackback/ids'
+ import { type EnabledTabs } from './widget-nav'
+@@ -388,6 +389,7 @@ export function WidgetOverview({
+                   </m.div>
+                 )
+               })}
++              <WidgetNativeCaptureAction />
+             </m.div>
+           </div>
+         </div>
+diff --git a/apps/web/src/lib/client/__tests__/native-host-controller.test.ts b/apps/web/src/lib/client/__tests__/native-host-controller.test.ts
+new file mode 100644
+index 000000000..7f7d882d1
+--- /dev/null
++++ b/apps/web/src/lib/client/__tests__/native-host-controller.test.ts
+@@ -0,0 +1,213 @@
++import { describe, it, expect, vi } from 'vitest'
++import { createNativeHostController } from '../native-host-controller'
++import type { NativeHostContext } from '@/lib/shared/widget/native-host'
++const origin = 'https://app.example.test'
++const audience = 'https://feedback.example.test'
++function command(type: string, payload = {}) {
++  return {contract: 'iplaycafe.feedback/native-1', operationId: crypto.randomUUID(), type, payload}
++}
++function ports() {
++  return {audience, clearIdentity: vi.fn(() => 'previous'), applyIdentity: vi.fn(),
++    identify: vi.fn(async (_payload: Record<string, unknown>, context: NativeHostContext, _previous: string | null): Promise<Record<string, unknown>> => ({sessionToken: 'native-session', user: {id: 'u'},
++      nativeAck: {...context, audience, jti: crypto.randomUUID()}})),
++    action: vi.fn(async (): Promise<Record<string, unknown>> => ({loggedOut: true})), respond: vi.fn(), configureCapture: vi.fn()}
++}
++describe('correlated native host operations', () => {
++  it('revokes the old bound session before exchanging a new identity, even if exchange fails', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.identify.mockRejectedValueOnce(new Error('TOKEN_INVALID'))
++    await bridge.receive(command('identify'), origin)
++    expect(p.action).toHaveBeenCalledWith('logout', {}, expect.objectContaining({hostOrigin: origin}), 'previous')
++    expect(p.action.mock.invocationCallOrder[0]).toBeLessThan(p.identify.mock.invocationCallOrder[1])
++    expect(p.identify.mock.calls[1][2]).toBeNull()
++    expect(p.applyIdentity).toHaveBeenCalledTimes(1)
++  })
++  it('does not mint or ACK a replacement if old-session revocation fails', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.action.mockRejectedValue(new Error('REVOCATION_FAILED'))
++    await bridge.receive(command('identify'), origin)
++    expect(p.identify).toHaveBeenCalledTimes(1)
++    expect(p.respond).toHaveBeenLastCalledWith(origin, 'native-result', expect.objectContaining({success: false}))
++  })
++  it('refuses a matching ACK without a real session and user', async () => {
++    const p = ports()
++    p.identify.mockImplementationOnce(async (_payload, context) => ({
++      sessionToken: '', user: {id: ''}, nativeAck: {...context, audience, jti: crypto.randomUUID()},
++    }))
++    await createNativeHostController(p).receive(command('identify'), origin)
++    expect(p.applyIdentity).not.toHaveBeenCalled()
++    expect(p.respond).toHaveBeenCalledWith(origin, 'native-result', expect.objectContaining({success: false}))
++  })
++  it('ACKs only verified identity with the exact operation and origins', async () => {
++    const p = ports(); const bridge = createNativeHostController(p); const op = command('identify')
++    await bridge.receive(op, origin)
++    expect(p.respond).toHaveBeenCalledWith(origin, 'native-result', expect.objectContaining({
++      operationId: op.operationId, audience, hostOrigin: origin, success: true}))
++  })
++  it('never applies or ACKs an identify arriving after logout; revokes the late session', async () => {
++    const p = ports(); let resolve!: (value: Record<string, unknown>) => void
++    p.identify.mockImplementationOnce(() => new Promise((r) => {resolve = r}))
++    const bridge = createNativeHostController(p)
++    const pending = bridge.receive(command('identify'), origin)
++    await Promise.resolve()
++    const logout = bridge.receive(command('logout'), origin)
++    expect(p.respond).not.toHaveBeenCalled()
++    resolve({sessionToken: 'late', user: {id: 'old'}}); await Promise.all([pending, logout])
++    expect(p.applyIdentity).not.toHaveBeenCalled()
++    expect(p.action).toHaveBeenCalledWith('logout', {}, expect.anything(), 'late')
++    expect(p.respond.mock.calls.filter(([, , value]) => value.type === 'identify')).toHaveLength(0)
++  })
++  it('refuses another parent origin and every ticket action before identify', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('create-ticket'), origin)
++    expect(p.action).not.toHaveBeenCalled()
++    await bridge.receive(command('identify'), origin)
++    await bridge.receive(command('list-tickets'), 'https://evil.example.test')
++    expect(p.action).not.toHaveBeenCalled()
++  })
++  it('fences an in-flight report result on user switch', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    let resolve!: (value: Record<string, unknown>) => void
++    p.action.mockImplementationOnce(() => new Promise((r) => {resolve = r}))
++    const report = command('create-ticket'); const pending = bridge.receive(report, origin)
++    await bridge.receive(command('identify'), origin); resolve({id: 'ticket'}); await pending
++    expect(p.respond.mock.calls.filter(([, , value]) => value.operationId === report.operationId)).toHaveLength(0)
++  })
++})
++
++
++describe('authoritative native retirement', () => {
++  it('retries a transient revoke with the original bearer/context before permitting replacement', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.clearIdentity.mockReturnValueOnce('owned').mockReturnValue(null as never)
++    p.action.mockRejectedValueOnce(new Error('NETWORK_FAILED'))
++    await bridge.receive(command('logout'), origin)
++    expect(p.respond).toHaveBeenLastCalledWith(origin, 'native-result', expect.objectContaining({success: false}))
++    await bridge.receive(command('logout'), origin)
++    expect(p.action).toHaveBeenCalledTimes(2)
++    expect(p.action.mock.calls[1]).toEqual(p.action.mock.calls[0])
++    expect(p.respond).toHaveBeenLastCalledWith(origin, 'native-result', expect.objectContaining({success: true}))
++    await bridge.receive(command('identify'), origin)
++    expect(p.identify).toHaveBeenCalledTimes(2)
++  })
++  it('coalesces simultaneous explicit retries of the same retirement', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.action.mockRejectedValueOnce(new Error('NETWORK_FAILED'))
++    await bridge.receive(command('logout'), origin)
++    let confirm!: (value: {loggedOut: boolean}) => void
++    p.action.mockImplementationOnce(() => new Promise(r => {confirm = r}))
++    const first = bridge.receive(command('logout'), origin)
++    const second = bridge.receive(command('logout'), origin)
++    await Promise.resolve()
++    expect(p.action).toHaveBeenCalledTimes(2)
++    confirm({loggedOut: true}); await Promise.all([first, second])
++    expect(p.respond).toHaveBeenLastCalledWith(origin, 'native-result', expect.objectContaining({success: true}))
++  })
++  it('ordinary handoff retires the exact old issuer before any replacement', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    let confirm!: (value: {loggedOut: boolean}) => void
++    p.action.mockImplementationOnce(() => new Promise(r => {confirm = r}))
++    const retiring = bridge.retire()
++    const replacement = bridge.receive(command('identify'), 'https://other.example.test')
++    await Promise.resolve()
++    expect(p.identify).toHaveBeenCalledTimes(1)
++    expect(p.action).toHaveBeenCalledWith('logout', {}, expect.objectContaining({hostOrigin: origin}), 'previous')
++    confirm({loggedOut: true}); await Promise.all([retiring, replacement])
++    expect(p.identify).toHaveBeenCalledTimes(2)
++    expect(p.identify.mock.calls[1][1].hostOrigin).toBe('https://other.example.test')
++  })
++  it('a failed revoke remains failclosed on logout retry even after browser token was cleared', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.clearIdentity.mockReturnValueOnce('owned').mockReturnValue(null as never)
++    p.action.mockRejectedValue(new Error('REVOCATION_FAILED'))
++    await bridge.receive(command('logout'), origin)
++    await bridge.receive(command('logout'), origin)
++    await bridge.receive(command('identify'), origin)
++    await expect(bridge.retire()).rejects.toThrow('REVOCATION_FAILED')
++    expect(p.action).toHaveBeenCalledTimes(4)
++    expect(p.action).toHaveBeenCalledWith('logout', {}, expect.objectContaining({hostOrigin: origin}), 'owned')
++    expect(p.identify).toHaveBeenCalledTimes(1)
++    expect(p.respond.mock.calls.slice(1).every(([, , result]) => result.success === false)).toBe(true)
++  })
++  it('a resolved but unconfirmed revoke is not a successful logout', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command('identify'), origin)
++    p.action.mockResolvedValue({} as never)
++    await bridge.receive(command('logout'), origin)
++    await bridge.receive(command('logout'), origin)
++    expect(p.respond).toHaveBeenLastCalledWith(origin, 'native-result', expect.objectContaining({success: false}))
++    expect(p.action).toHaveBeenCalledTimes(2)
++  })
++  it('ordinary retirement waits for a late native mint and its confirmed revoke', async () => {
++    const p = ports(); let identify!: (value: Record<string, unknown>) => void, revoke!: (value: {loggedOut: boolean}) => void
++    p.identify.mockImplementationOnce(() => new Promise(r => {identify = r}))
++    p.action.mockImplementationOnce(() => new Promise(r => {revoke = r}))
++    const bridge = createNativeHostController(p)
++    const pending = bridge.receive(command('identify'), origin)
++    await Promise.resolve()
++    let settled = false
++    const retiring = bridge.retire().then(() => {settled = true})
++    identify({sessionToken: 'late-owned', user: {id: 'old'}})
++    await Promise.resolve(); await Promise.resolve()
++    expect(settled).toBe(false)
++    expect(p.action).toHaveBeenCalledWith('logout', {}, expect.objectContaining({hostOrigin: origin}), 'late-owned')
++    revoke({loggedOut: true}); await Promise.all([pending, retiring])
++    expect(settled).toBe(true)
++    expect(p.applyIdentity).not.toHaveBeenCalled()
++  })
++  it('keeps the anonymous bearer available for native merge when no native session was owned', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.retire()
++    expect(p.clearIdentity).not.toHaveBeenCalled()
++    expect(p.action).not.toHaveBeenCalled()
++    await bridge.receive(command('identify'), origin)
++    expect(p.identify.mock.calls[0][2]).toBe('previous')
++  })
++})
++
++
++describe('native report abort acknowledgement',()=>{
++  const reportId='brp_00000000-0000-4000-8000-000000000001'
++  it('requires identified ownership and exact parent origin before abort',async()=>{
++    const p=ports(),bridge=createNativeHostController(p)
++    await bridge.receive(command('abort-evidence',{reportId}),origin)
++    expect(p.action).not.toHaveBeenCalled()
++    await bridge.receive(command('identify'),origin)
++    await bridge.receive(command('abort-evidence',{reportId}),'https://other.example.test')
++    expect(p.action).not.toHaveBeenCalled()
++  })
++  it('returns the exact operation and durable abort result through the existing ACK',async()=>{
++    const p=ports(),bridge=createNativeHostController(p)
++    await bridge.receive(command('identify'),origin)
++    p.action.mockResolvedValueOnce({reportId,aborted:true})
++    const op=command('abort-evidence',{reportId})
++    await bridge.receive(op,origin)
++    expect(p.action).toHaveBeenCalledWith('abort-evidence',{reportId},expect.objectContaining({operationId:op.operationId,hostOrigin:origin}))
++    expect(p.respond).toHaveBeenLastCalledWith(origin,'native-result',expect.objectContaining({operationId:op.operationId,type:'abort-evidence',audience,hostOrigin:origin,success:true,result:{reportId,aborted:true}}))
++  })
++  it('refuses cleanup acknowledgement when abort authority is committed or ambiguous',async()=>{
++    const p=ports(),bridge=createNativeHostController(p)
++    await bridge.receive(command('identify'),origin)
++    p.action.mockRejectedValueOnce(new Error('EVIDENCE_BINDING_CONFLICT'))
++    await bridge.receive(command('abort-evidence',{reportId}),origin)
++    expect(p.respond).toHaveBeenLastCalledWith(origin,'native-result',expect.objectContaining({type:'abort-evidence',success:false,error:'EVIDENCE_BINDING_CONFLICT'}))
++  })
++  it('fences a late abort result on identity switch',async()=>{
++    const p=ports(),bridge=createNativeHostController(p)
++    await bridge.receive(command('identify'),origin)
++    let resolve!:(value:Record<string,unknown>)=>void
++    p.action.mockImplementationOnce(()=>new Promise(r=>{resolve=r}))
++    const op=command('abort-evidence',{reportId}),pending=bridge.receive(op,origin)
++    expect(p.action).toHaveBeenCalledTimes(1)
++    await bridge.receive(command('identify'),origin)
++    resolve({reportId,aborted:true});await pending
++    expect(p.respond.mock.calls.some(([, , value])=>value.operationId===op.operationId)).toBe(false)
++  })
++})
+diff --git a/apps/web/src/lib/client/native-host-controller.ts b/apps/web/src/lib/client/native-host-controller.ts
+new file mode 100644
+index 000000000..04ab6804b
+--- /dev/null
++++ b/apps/web/src/lib/client/native-host-controller.ts
+@@ -0,0 +1,118 @@
++import { nativeHostCommandSchema, NATIVE_HOST_CONTRACT } from '@/lib/shared/widget/native-host'
++import type { NativeHostContext } from '@/lib/shared/widget/native-host'
++
++interface Ports {
++  audience: string
++  clearIdentity(): string | null
++  applyIdentity(result: Record<string, unknown>): void
++  identify(payload: Record<string, unknown>, context: NativeHostContext, previous: string | null): Promise<Record<string, unknown>>
++  action(type: string, payload: Record<string, unknown>, context: NativeHostContext, token?: string | null): Promise<unknown>
++  respond(origin: string, event: string, payload: Record<string, unknown>): void
++  configureCapture(origin: string, payload: Record<string, unknown>): void
++}
++
++/** One controller per iframe. Identity changes fence every older async result. */
++export function createNativeHostController(ports: Ports) {
++  let generation = 0
++  let identityOrigin: string | null = null
++  let retirement: {token: string | null; context: NativeHostContext; promise: Promise<void> | null} | null = null
++  const inFlight = new Set<string>()
++  const identifying = new Set<Promise<void>>()
++  function fence() { generation += 1; identityOrigin = null; ports.configureCapture('', {enabled: false}) }
++  function beginRetirement(token: string | null, hostOrigin: string, operationId: string = crypto.randomUUID()): Promise<void> {
++    if (retirement?.promise) return retirement.promise
++    const owned = retirement ?? {token, context: {contract: NATIVE_HOST_CONTRACT, operationId, hostOrigin}, promise: null}
++    const pending = (async () => {
++      if (!owned.token) throw new Error('NATIVE_SESSION_TOKEN_REQUIRED')
++      const result = await ports.action('logout', {}, owned.context, owned.token)
++      if (!result || typeof result !== 'object' || (result as Record<string, unknown>).loggedOut !== true)
++        throw new Error('NATIVE_SESSION_REVOCATION_FAILED')
++    })()
++    owned.promise = pending
++    retirement = owned
++    // Keep exact cleanup authority after uncertainty; only an explicit retry
++    // resends it. Concurrent callers share the pending attempt.
++    void pending.then(() => {if (retirement === owned) retirement = null}, () => {
++      if (retirement === owned && owned.promise === pending) owned.promise = null
++    })
++    return pending
++  }
++  /** Ordinary SDK logout/handoff retires only our own exact bound issuer. */
++  async function retire(): Promise<void> {
++    const previousOrigin = identityOrigin
++    fence()
++    const earlier = [...identifying]
++    if (previousOrigin) await beginRetirement(ports.clearIdentity(), previousOrigin)
++    else if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
++    await Promise.all(earlier)
++    if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
++  }
++  async function receive(raw: unknown, origin: string) {
++    const parsed = nativeHostCommandSchema.safeParse(raw)
++    if (!parsed.success || origin === 'null') return
++    const command = parsed.data
++    const context: NativeHostContext = {contract: NATIVE_HOST_CONTRACT,
++      operationId: command.operationId, hostOrigin: origin}
++    if (inFlight.has(command.operationId)) return
++    inFlight.add(command.operationId)
++    const previousOrigin = identityOrigin
++    if (command.type === 'identify' || command.type === 'logout') fence()
++    const current = generation
++    const reply = (success: boolean, result?: unknown, error?: string) => ports.respond(origin, 'native-result', {
++      ...context, audience: ports.audience, type: command.type, success,
++      ...(result === undefined ? {} : {result}), ...(error ? {error} : {}),
++    })
++    try {
++      if (command.type === 'capture-config') {
++        if (identityOrigin !== origin) throw new Error('IDENTITY_REQUIRED')
++        ports.configureCapture(origin, command.payload)
++        reply(true, {configured: true})
++      } else if (command.type === 'identify') {
++        const earlier = [...identifying]
++        const work = (async () => {
++          const previous = ports.clearIdentity()
++          if (previousOrigin) await beginRetirement(previous, previousOrigin, command.operationId)
++          else if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
++          await Promise.all(earlier)
++          if (generation !== current) return
++          const result = await ports.identify(command.payload, context, previousOrigin ? null : previous)
++          if (generation !== current) {
++            // The late server session must not survive a switch/logout.
++            await beginRetirement(result.sessionToken as string, origin, command.operationId)
++            return
++          }
++          const ack = result.nativeAck as Record<string, unknown> | undefined
++          const user = result.user as Record<string, unknown> | undefined
++          if (!ack || ack.contract !== context.contract || ack.operationId !== context.operationId ||
++              ack.hostOrigin !== origin || ack.audience !== ports.audience || typeof ack.jti !== 'string' ||
++              typeof result.sessionToken !== 'string' || result.sessionToken.length === 0 ||
++              !user || typeof user.id !== 'string' || user.id.length === 0) {
++            if (typeof result.sessionToken === 'string') await beginRetirement(result.sessionToken, origin, command.operationId)
++            throw new Error('ACK_INVALID')
++          }
++          ports.applyIdentity(result)
++          identityOrigin = origin
++          reply(true, {jti: ack.jti, user: result.user})
++        })()
++        identifying.add(work)
++        try { await work } finally { identifying.delete(work) }
++      } else if (command.type === 'logout') {
++        const token = ports.clearIdentity()
++        const earlier = [...identifying]
++        if (previousOrigin) await beginRetirement(token, previousOrigin, command.operationId)
++        else if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
++        await Promise.all(earlier)
++        if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
++        if (generation === current) reply(true, {loggedOut: true})
++      } else {
++        if (identityOrigin !== origin) throw new Error('IDENTITY_REQUIRED')
++        const result = await ports.action(command.type, command.payload, context)
++        if (generation === current) reply(true, result)
++      }
++    } catch (error) {
++      if (generation === current) reply(false, undefined,
++        error instanceof Error && /^[A-Z_]+$/.test(error.message) ? error.message : 'NATIVE_OPERATION_FAILED')
++    } finally { inFlight.delete(command.operationId) }
++  }
++  return {receive, fence, retire}
++}
+diff --git a/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-core.concurrent.test.ts b/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-core.concurrent.test.ts
+new file mode 100644
+index 000000000..926d1a344
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/tickets/__tests__/native-ticket-core.concurrent.test.ts
+@@ -0,0 +1,222 @@
++// @vitest-environment node
++import {afterAll, describe, expect, it, vi} from 'vitest'
++// oxlint-disable-next-line no-restricted-imports
++import {createDb, type Database} from '@quackback/db/client'
++import {createId} from '@quackback/ids'
++import postgres from 'postgres'
++
++// Every actual domain DB call resolves to its request's independent pool. The
++// production services and their SQL are unchanged; no shared savepoint race.
++const routing = await vi.hoisted(async () => new (await import('node:async_hooks')).AsyncLocalStorage<Database>())
++vi.mock('@/lib/server/db', async original => ({
++  ...await original<typeof import('@/lib/server/db')>(),
++  db: new Proxy({} as Database, {get(_, key) {
++    const handle = routing.getStore()
++    if (!handle) throw new Error('Native core test DB access outside request context')
++    const value = Reflect.get(handle, key)
++    return typeof value === 'function' ? value.bind(handle) : value
++  }}),
++}))
++// config getters validate the full env (absent in tests); provide just what the
++// attachment/avatar URL checks read (same stub the sibling suites use).
++vi.mock('@/lib/server/config', () => ({
++  config: { s3PublicUrl: undefined, baseUrl: 'http://localhost:3000' },
++  getBaseUrl: () => 'http://localhost:3000',
++}))
++
++// Neutralize the Postgres-backed realtime fan-out on BOTH channels.
++const realtime = vi.hoisted(() => ({
++  publishTicketEvent: vi.fn(),
++  publishConversationEvent: vi.fn(),
++  publishConversationMessage: vi.fn(),
++  publishAgentConversationEvent: vi.fn(),
++  publishConversationUpdate: vi.fn(),
++  publishTyping: vi.fn(),
++}))
++vi.mock('@/lib/server/realtime/conversation-channels', () => realtime)
++
++// The ticket-side event bridge (createTicketCore emits created).
++const ticketEmit = vi.hoisted(() => ({
++  emitTicketCreated: vi.fn().mockResolvedValue(undefined),
++  emitTicketStatusChanged: vi.fn().mockResolvedValue(undefined),
++  emitTicketAssigned: vi.fn().mockResolvedValue(undefined),
++  emitTicketReplied: vi.fn().mockResolvedValue(undefined),
++  emitTicketNoteAdded: vi.fn().mockResolvedValue(undefined),
++  emitTicketExternalStatusChanged: vi.fn().mockResolvedValue(undefined),
++}))
++vi.mock('../ticket.webhooks', () => ticketEmit)
++
++// The conversation-side event bridge: emitConversationCreated is the gating
++// table's FIRE assertion point (conversation.created workflows + webhooks both
++// ride it); emitMessageCreated is the redirect pipeline's assertion point.
++const convEmit = vi.hoisted(() => ({
++  emitConversationCreated: vi.fn().mockResolvedValue(undefined),
++  emitMessageCreated: vi.fn().mockResolvedValue(undefined),
++  emitMessageNoteCreated: vi.fn().mockResolvedValue(undefined),
++  emitMessageDeleted: vi.fn().mockResolvedValue(undefined),
++  emitConversationStatusChanged: vi.fn().mockResolvedValue(undefined),
++  emitConversationAssigned: vi.fn().mockResolvedValue(undefined),
++  emitConversationPriorityChanged: vi.fn().mockResolvedValue(undefined),
++  emitConversationCsatSubmitted: vi.fn().mockResolvedValue(undefined),
++  emitConversationCsatCommentAdded: vi.fn().mockResolvedValue(undefined),
++}))
++vi.mock('../../conversation/conversation.webhooks', () => convEmit)
++
++// The notify layer: notifyConversationStarted is the gating table's started-
++// notify SUPPRESS assertion point.
++const convNotify = vi.hoisted(() => ({
++  notifyVisitorMessage: vi.fn().mockResolvedValue(undefined),
++  notifyAgentReply: vi.fn().mockResolvedValue(undefined),
++  notifyConversationStarted: vi.fn().mockResolvedValue(undefined),
++}))
++vi.mock('../../conversation/conversation.notify', () => convNotify)
++
++// The Quinn spy: the dispatch site's dynamic import resolves here, so a
++// gated-out turn is simply "never called".
++const assistant = vi.hoisted(() => ({
++  runAssistantTurnForConversation: vi.fn().mockResolvedValue(undefined),
++}))
++vi.mock('@/lib/server/domains/assistant/assistant.orchestrator', () => assistant)
++
++
++// Fire-and-forget timeline is not the intake or opening-message write. Prevent
++// it outliving the bounded request/cleanup; retain the actual subscription,
++// pair, message redirect, DTO and all createTicketCore database queries.
++vi.mock('../ticket-activity.service', () => ({recordTicketActivity: vi.fn()}))
++import {conversations, conversationMessages, principal, settings, tickets, ticketConversations,
++  ticketStatuses, user, eq, and, isNull, sql} from '@/lib/server/db'
++import {ANONYMOUS_ACTOR} from '@/lib/server/policy/types'
++import {createTicketCore} from '../ticket-intake.service'
++import {nativeSubmissionDigest} from '@/lib/server/widget/native-submission'
++
++const target = new URL(process.env.DATABASE_URL ?? 'postgresql://localhost/quackback_test')
++if (!['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname) || !target.pathname.endsWith('_test')) {
++  throw new Error('Native core concurrency requires a disposable loopback test database')
++}
++const first = createDb(target.toString(), {max: 1, prepare: false})
++const second = createDb(target.toString(), {max: 1, prepare: false})
++const observer = postgres(target.toString(), {max: 1, prepare: false, onnotice: () => {}})
++let available = false
++try {
++  await first.execute(sql`select 1`)
++  await first.execute(sql`select principal_id, submission_id from ipc_native_submission limit 0`)
++  await first.select({id: ticketConversations.ticketId}).from(ticketConversations).limit(0)
++  await second.execute(sql`select 1`)
++  await observer`select 1`
++  available = true
++} catch { /* Mandatory CI rejects skips; local absence is not passing proof. */ }
++afterAll(async () => {
++  await Promise.all([(first as unknown as {$client: postgres.Sql}).$client.end(),
++    (second as unknown as {$client: postgres.Sql}).$client.end(), observer.end()])
++})
++
++describe.skipIf(!available)('full native Ticket intake concurrency on real PostgreSQL', () => {
++  it('blocks the second full create on the winner, then converges retry/conflict to one Ticket, pair and opening message', async () => {
++    const userId = createId('user'), principalId = createId('principal')
++    const statusId = createId('ticket_status'), settingsId = createId('workspace')
++    const submissionId = crypto.randomUUID()
++    const input = {title: 'Concurrent native report', description: 'One private opening', type: 'customer' as const,
++      requesterPrincipalId: principalId, withBackingConversation: true,
++      nativeSubmission: {submissionId, digest: nativeSubmissionDigest({title: 'Concurrent native report', description: 'One private opening'})}}
++    const actor = {...ANONYMOUS_ACTOR, principalId, principalType: 'user' as const}
++    let release!: () => void, reached!: () => void
++    const hold = new Promise<void>(resolve => {release = resolve})
++    const reachedCommit = new Promise<void>(resolve => {reached = resolve})
++    let winner: ReturnType<typeof createTicketCore> | undefined
++    let loser: ReturnType<typeof createTicketCore> | undefined
++    let loserSettled = false
++    let commitTimer: ReturnType<typeof setTimeout> | undefined
++    // Delay only the first full intake transaction's COMMIT, after the actual
++    // callback inserted its pair and submission mapping. The winner's actual
++    // post-commit opening-message redirect subsequently runs normally.
++    let parked = false
++    const winnerDb = new Proxy(first, {get(handle, key) {
++      if (key === 'transaction') return (...args: Parameters<Database['transaction']>) => {
++        const [callback, options] = args
++        return handle.transaction(async tx => {
++          const result = await callback(tx)
++          if (!parked) {parked = true; reached(); await hold}
++          return result
++        }, options)
++      }
++      const value = Reflect.get(handle, key)
++      return typeof value === 'function' ? value.bind(handle) : value
++    }})
++    try {
++      // Only synthetic fixture rows are committed; existing workspace/default
++      // rows are never modified. An existing default may serve the real core.
++      await first.transaction(async tx => {
++        await tx.insert(user).values({id: userId, name: 'Synthetic concurrency visitor'})
++        await tx.insert(principal).values({id: principalId, userId, role: 'user', type: 'user', createdAt: new Date()})
++        await tx.insert(settings).values({id: settingsId, name: 'Synthetic concurrency workspace', slug: settingsId, createdAt: new Date()})
++        const defaults = await tx.select({id: ticketStatuses.id}).from(ticketStatuses)
++          .where(and(eq(ticketStatuses.isDefault, true), isNull(ticketStatuses.deletedAt))).limit(1)
++        if (!defaults.length) await tx.insert(ticketStatuses).values({id: statusId, name: 'Synthetic received', slug: statusId,
++          category: 'open', publicStage: 'received', position: 0, isDefault: true})
++      })
++      await first.execute(sql`set lock_timeout = '8s'`)
++      await first.execute(sql`set statement_timeout = '10s'`)
++      await second.execute(sql`set lock_timeout = '8s'`)
++      await second.execute(sql`set statement_timeout = '10s'`)
++      const [winningPid] = await first.execute(sql`select pg_backend_pid() as pid`)
++      const [retryPid] = await second.execute(sql`select pg_backend_pid() as pid`)
++      winner = routing.run(winnerDb, () => createTicketCore(input, actor))
++      void winner.catch(() => {})
++      try {
++        await Promise.race([reachedCommit,
++          winner.then(() => {throw new Error('Winner did not reach held intake COMMIT')}),
++          new Promise<never>((_, reject) => {
++            commitTimer = setTimeout(() => reject(new Error('Native intake did not reach COMMIT within eight seconds')), 8_000)
++          }),
++        ])
++      } finally {clearTimeout(commitTimer)}
++      loser = routing.run(second, () => createTicketCore(input, actor)).finally(() => {loserSettled = true})
++      void loser.catch(() => {})
++      let waiting = false
++      for (let attempt = 0; attempt < 200 && !waiting; attempt++) {
++        const rows = await observer`select 1 from pg_stat_activity
++          where pid = ${Number(retryPid.pid)} and wait_event = 'advisory'
++          and ${Number(winningPid.pid)} = any(pg_blocking_pids(pid))`
++        waiting = rows.length === 1
++        if (!waiting) await new Promise(resolve => setTimeout(resolve, 10))
++      }
++      expect(waiting).toBe(true)
++      expect(loserSettled).toBe(false)
++      release()
++      const [created, retried] = await Promise.all([winner, loser])
++      expect(retried.id).toBe(created.id)
++      const pair = await first.select().from(ticketConversations).where(eq(ticketConversations.ticketId, created.id))
++      expect(await first.select().from(tickets).where(eq(tickets.requesterPrincipalId, principalId))).toHaveLength(1)
++      expect(pair).toHaveLength(1)
++      expect(await first.select().from(conversations).where(eq(conversations.visitorPrincipalId, principalId))).toHaveLength(1)
++      const messages = await first.select().from(conversationMessages).where(eq(conversationMessages.conversationId, pair[0].conversationId))
++      expect(messages).toHaveLength(1)
++      expect(messages[0]).toMatchObject({principalId, senderType: 'visitor', content: input.description, ticketId: null})
++      expect(await first.select().from(conversationMessages).where(eq(conversationMessages.ticketId, created.id))).toHaveLength(0)
++      expect(await routing.run(second, () => createTicketCore(input, actor))).toMatchObject({id: created.id})
++      await expect(routing.run(second, () => createTicketCore({...input, title: 'Conflicting native report',
++        nativeSubmission: {...input.nativeSubmission, digest: nativeSubmissionDigest({
++          title: 'Conflicting native report', description: input.description,
++        })}}, actor))).rejects.toMatchObject({code: 'SUBMISSION_CONFLICT'})
++      const mapping = await first.execute(sql`select ticket_id from ipc_native_submission where principal_id = ${principalId} and submission_id = ${submissionId}`)
++      expect(mapping).toHaveLength(1); expect(mapping[0].ticket_id).toBe(created.id)
++      expect(await first.select().from(tickets).where(eq(tickets.requesterPrincipalId, principalId))).toHaveLength(1)
++      expect(await first.select().from(conversationMessages).where(eq(conversationMessages.conversationId, pair[0].conversationId))).toHaveLength(1)
++    } finally {
++      clearTimeout(commitTimer)
++      release()
++      await Promise.allSettled([...(winner ? [winner] : []), ...(loser ? [loser] : [])])
++      // Exact generated owner bounds all cleanup, including partially failed
++      // intake rows. Cascading message/pair/watcher children are native FKs.
++      await first.transaction(async tx => {
++        await tx.execute(sql`delete from ipc_native_submission where principal_id = ${principalId} and submission_id = ${submissionId}`)
++        await tx.delete(tickets).where(eq(tickets.requesterPrincipalId, principalId))
++        await tx.delete(conversations).where(eq(conversations.visitorPrincipalId, principalId))
++        await tx.delete(principal).where(eq(principal.id, principalId))
++        await tx.delete(user).where(eq(user.id, userId))
++        await tx.delete(ticketStatuses).where(eq(ticketStatuses.id, statusId))
++        await tx.delete(settings).where(eq(settings.id, settingsId))
++      })
++    }
++  }, 30_000)
++})
+diff --git a/apps/web/src/lib/server/domains/tickets/__tests__/ticket-convergence-1b.test.ts b/apps/web/src/lib/server/domains/tickets/__tests__/ticket-convergence-1b.test.ts
+index 21d98ac43..f4412205b 100644
+--- a/apps/web/src/lib/server/domains/tickets/__tests__/ticket-convergence-1b.test.ts
++++ b/apps/web/src/lib/server/domains/tickets/__tests__/ticket-convergence-1b.test.ts
+@@ -256,6 +256,23 @@ describe.skipIf(!fixture.available)('convergence Phase 1b (real DB, rolled back)
+   afterAll(fixture.close)
+ 
+   describe('the intake transaction (createTicketCore withBackingConversation)', () => {
++    it('retries the same native submission without a second ticket, pair or opening message', async () => {
++      await seedDefaultStatus()
++      const requesterP = await seedPrincipal({})
++      const { nativeSubmissionDigest } = await import('@/lib/server/widget/native-submission')
++      const input = {title: 'One native report', description: 'Same payload', type: 'customer' as const,
++        requesterPrincipalId: requesterP, withBackingConversation: true,
++        nativeSubmission: {submissionId: crypto.randomUUID(), digest: nativeSubmissionDigest({title: 'One native report'})}}
++      const first = await createTicketCore(input, requesterActor(requesterP))
++      const second = await createTicketCore(input, requesterActor(requesterP))
++      expect(second.id).toBe(first.id)
++      expect(await testDb.select().from(tickets).where(eq(tickets.requesterPrincipalId, requesterP))).toHaveLength(1)
++      expect(await testDb.select().from(ticketConversations).where(eq(ticketConversations.ticketId, first.id))).toHaveLength(1)
++      const pair = await readPairLink(first.id)
++      expect(await testDb.select().from(conversationMessages).where(eq(conversationMessages.conversationId, pair!.conversationId))).toHaveLength(1)
++      await expect(createTicketCore({...input, nativeSubmission: {...input.nativeSubmission,
++        digest: nativeSubmissionDigest({title: 'Different'})}}, requesterActor(requesterP))).rejects.toMatchObject({code: 'SUBMISSION_CONFLICT'})
++    })
+     it('creates conversation + ticket + link in one transaction, opening message conversation-parented', async () => {
+       await seedDefaultStatus()
+       const requesterP = await seedPrincipal({})
+diff --git a/apps/web/src/lib/server/domains/tickets/requester.service.ts b/apps/web/src/lib/server/domains/tickets/requester.service.ts
+index 418100ae8..c3509db9f 100644
+--- a/apps/web/src/lib/server/domains/tickets/requester.service.ts
++++ b/apps/web/src/lib/server/domains/tickets/requester.service.ts
+@@ -315,6 +315,7 @@ export async function createMyTicket(
+     ticketTypeId?: TicketTypeId | null
+     /** Validated intake-form answers, stored on the ticket's customAttributes. */
+     customAttributes?: Record<string, unknown>
++    nativeSubmission?: import('@/lib/server/widget/native-submission').NativeSubmission
+   }
+ ): Promise<RequesterTicketDTO> {
+   const principalId = requireRequester(actor)
+@@ -333,6 +334,7 @@ export async function createMyTicket(
+       customAttributes: input.customAttributes,
+       requesterPrincipalId: principalId,
+       withBackingConversation: true,
++      nativeSubmission: input.nativeSubmission,
+     },
+     actor
+   )
+diff --git a/apps/web/src/lib/server/domains/tickets/ticket-intake.service.ts b/apps/web/src/lib/server/domains/tickets/ticket-intake.service.ts
+index 61b06ab1d..df2e8eaf3 100644
+--- a/apps/web/src/lib/server/domains/tickets/ticket-intake.service.ts
++++ b/apps/web/src/lib/server/domains/tickets/ticket-intake.service.ts
+@@ -46,6 +46,7 @@ import { loadAuthors, fallbackAuthor } from '../principals/principal-display'
+ import { resolveTicketTypeForCreate } from './ticket-type.service'
+ import { resolveStage } from './ticket.lifecycle'
+ import type { CreateTicketInput, TicketDTO } from './ticket.types'
++import { lookupNativeSubmission, recordNativeSubmission } from '@/lib/server/widget/native-submission'
+ 
+ const log = logger.child({ component: 'tickets' })
+ 
+@@ -198,6 +199,20 @@ export async function createTicketCore(input: CreateTicketInput, actor: Actor):
+     wantsBackingConversation && hasOpeningMessage && (filedByRequester || !!actor.principalId)
+ 
+   const created = await db.transaction(async (tx) => {
++    if (input.nativeSubmission) {
++      if (!filedByRequester || !input.requesterPrincipalId) {
++        throw new ValidationError('FORBIDDEN', 'Native submission must belong to its requester')
++      }
++      const previousId = await lookupNativeSubmission(tx, input.requesterPrincipalId, input.nativeSubmission)
++      if (previousId) {
++        const [previous] = await tx.select().from(tickets).where(and(
++          eq(tickets.id, previousId), eq(tickets.requesterPrincipalId, input.requesterPrincipalId),
++          eq(tickets.type, 'customer'), isNull(tickets.deletedAt)
++        )).limit(1)
++        if (!previous) throw new ValidationError('NOT_FOUND', 'Previous report is unavailable')
++        return {ticket: previous, backingConversation: null, replayed: true}
++      }
++    }
+     // PHASE 1b (1/3): the backing conversation FIRST, so the pair is
+     // identity-consistent by construction — visitorPrincipalId IS the ticket's
+     // requester. (Legacy edge, NOT this phase: a pre-1a pair can have
+@@ -307,9 +322,14 @@ export async function createTicketCore(input: CreateTicketInput, actor: Actor):
+         .limit(1)
+       if (creator) await subscribeToTicket(actor.principalId, ticket.id, 'manual', { tx })
+     }
+-    return { ticket, backingConversation }
++    if (input.nativeSubmission && input.requesterPrincipalId) {
++      await recordNativeSubmission(tx, input.requesterPrincipalId, input.nativeSubmission, ticket.id)
++    }
++    return { ticket, backingConversation, replayed: false }
+   })
+ 
++  if (created.replayed) return ticketRowToDTO(created.ticket)
++
+   // PHASE 1b post-commit, backing conversations only — the side-effect gating
+   // table in the doc header. Order: the opening message first (so a
+   // conversation.created handler dispatched below finds the full opening
+diff --git a/apps/web/src/lib/server/domains/tickets/ticket.types.ts b/apps/web/src/lib/server/domains/tickets/ticket.types.ts
+index b12952eca..f6612c8aa 100644
+--- a/apps/web/src/lib/server/domains/tickets/ticket.types.ts
++++ b/apps/web/src/lib/server/domains/tickets/ticket.types.ts
+@@ -30,6 +30,8 @@ import type { JsonValue } from '@/lib/shared/json'
+ 
+ /** Fields accepted when opening a ticket. Status + number are resolved server-side. */
+ export interface CreateTicketInput {
++  /** Server-only native host idempotency; never populated by API/MCP schemas. */
++  nativeSubmission?: import('@/lib/server/widget/native-submission').NativeSubmission
+   /** The behavior-axis category. OPTIONAL when `ticketTypeId` is given: the
+    *  type's category is derived onto `tickets.type` at write time
+    *  (convergence Phase 4) and a mismatched explicit category is rejected.
+diff --git a/apps/web/src/lib/server/functions/tickets.ts b/apps/web/src/lib/server/functions/tickets.ts
+index 07346606c..64c47d48e 100644
+--- a/apps/web/src/lib/server/functions/tickets.ts
++++ b/apps/web/src/lib/server/functions/tickets.ts
+@@ -1063,7 +1063,8 @@ export const getMyTicketsFn = createServerFn({ method: 'GET' }).handler(async ()
+  */
+ export const runCreateMyTicket = createServerOnlyFn(async function runCreateMyTicket(
+   ctx: Awaited<ReturnType<typeof requireAuth>>,
+-  data: CreateMyTicketInput
++  data: CreateMyTicketInput,
++  nativeSubmission?: import('@/lib/server/widget/native-submission').NativeSubmission
+ ) {
+   await requireSupportTicketsEnabled()
+   const actor = await policyActorFromAuth(ctx)
+@@ -1094,6 +1095,7 @@ export const runCreateMyTicket = createServerOnlyFn(async function runCreateMyTi
+     attachments: data.attachments as ConversationAttachment[] | undefined,
+     ticketTypeId: intake.ticketTypeId,
+     customAttributes: intake.customAttributes,
++    nativeSubmission,
+   })
+ })
+ 
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts
+new file mode 100644
+index 000000000..879e45323
+--- /dev/null
++++ b/apps/web/src/lib/server/functions/widget/__tests__/native-evidence-abort.test.ts
+@@ -0,0 +1,40 @@
++import {beforeEach,describe,expect,it,vi} from 'vitest'
++vi.mock('@tanstack/react-start',()=>({createServerFn:()=>{
++  let schema:{parse(v:unknown):unknown},handler:(args:{data:unknown})=>Promise<unknown>
++  const fn=async(args:{data:unknown})=>handler({data:schema.parse(args.data)})
++  fn.validator=(value:typeof schema)=>{schema=value;return fn}
++  fn.handler=(value:typeof handler)=>{handler=value;return fn}
++  return fn
++}}))
++const p=vi.hoisted(()=>({auth:vi.fn(),bound:vi.fn(),abort:vi.fn(),bearer:'native-test-bearer'}))
++vi.mock('@/lib/server/functions/widget-auth',()=>({requireWidgetAuth:p.auth}))
++vi.mock('@tanstack/react-start/server',()=>({getRequestHeaders:()=>new Headers(p.bearer?{Authorization:`Bearer ${p.bearer}`}:{})}))
++vi.mock('@/lib/server/widget/native-host-token',()=>({requireBoundNativeHostSession:p.bound}))
++vi.mock('@/lib/server/evidence/native',()=>({runAbortNativeEvidenceBinding:p.abort}))
++import {nativeHostActionFn,nativeHostActionSchema} from '../native-host'
++const invoke=nativeHostActionFn as unknown as(args:{data:unknown})=>Promise<unknown>
++const context={contract:'iplaycafe.feedback/native-1',operationId:'00000000-0000-4000-8000-000000000002',hostOrigin:'https://app.example.test'}
++const reportId='brp_00000000-0000-4000-8000-000000000001'
++const request={context,action:{type:'abort-evidence',payload:{reportId}}}
++const ctx={principal:{type:'user',id:'principal-test'},user:{id:'user-test'}}
++beforeEach(()=>{vi.clearAllMocks();p.bearer='native-test-bearer';p.auth.mockResolvedValue(ctx);p.bound.mockResolvedValue('session-test');p.abort.mockResolvedValue({reportId,aborted:true})})
++describe('authenticated native abort facade',()=>{
++  it('validates bound issuer/session before entering abort authority',async()=>{
++    await expect(invoke({data:request})).resolves.toEqual({reportId,aborted:true})
++    expect(p.bound).toHaveBeenCalledWith(ctx.principal.id,context,p.bearer)
++    expect(p.abort).toHaveBeenCalledWith(ctx,{reportId})
++    expect(p.bound.mock.invocationCallOrder[0]).toBeLessThan(p.abort.mock.invocationCallOrder[0])
++  })
++  it.each(['missing-bearer','wrong-binding','non-user'])('denies %s without abort effects',async(reason)=>{
++    if(reason==='missing-bearer')p.bearer=''
++    if(reason==='wrong-binding')p.bound.mockRejectedValueOnce(new Error('binding refused'))
++    if(reason==='non-user')p.auth.mockResolvedValueOnce({principal:{type:'anonymous'}})
++    await expect(invoke({data:request})).rejects.toThrow()
++    expect(p.abort).not.toHaveBeenCalled()
++  })
++  it('rejects widened abort payload and propagates committed/ambiguous refusal',async()=>{
++    expect(nativeHostActionSchema.safeParse({type:'abort-evidence',payload:{reportId,ticketId:'ticket-test'}}).success).toBe(false)
++    p.abort.mockRejectedValueOnce(new Error('EVIDENCE_BINDING_CONFLICT'))
++    await expect(invoke({data:request})).rejects.toThrow('EVIDENCE_BINDING_CONFLICT')
++  })
++})
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-host-facade.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-host-facade.test.ts
+new file mode 100644
+index 000000000..6c976fc7e
+--- /dev/null
++++ b/apps/web/src/lib/server/functions/widget/__tests__/native-host-facade.test.ts
+@@ -0,0 +1,71 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++vi.mock('@tanstack/react-start', () => ({ createServerFn: () => {
++  let schema: {parse(value: unknown): unknown}, handler: (value: {data: unknown}) => Promise<unknown>
++  const fn = async (value: {data: unknown}) => handler({data: schema.parse(value.data)})
++  fn.validator = (value: typeof schema) => {schema = value; return fn}
++  fn.handler = (value: typeof handler) => {handler = value; return fn}
++  return fn
++}}))
++const ports = vi.hoisted(() => ({auth: vi.fn(), bound: vi.fn(), retirement: vi.fn(), list: vi.fn(), bearer: 'synthetic-native-bearer'}))
++vi.mock('@/lib/server/functions/widget-auth', () => ({requireWidgetAuth: ports.auth}))
++vi.mock('@/lib/server/widget/native-host-token', () => ({requireBoundNativeHostSession: ports.bound, retireNativeHostSession: ports.retirement}))
++vi.mock('@tanstack/react-start/server', () => ({getRequestHeaders: () => new Headers(ports.bearer ? {authorization: `Bearer ${ports.bearer}`} : {})}))
++vi.mock('@/lib/server/functions/tickets', () => ({runGetMyTickets: ports.list}))
++// A refused authority must not reach the database, even if a supplied ID exists.
++vi.mock('@/lib/server/db', () => {throw new Error('Unexpected database access after refused authority')})
++import { nativeHostActionFn } from '../native-host'
++const invoke = nativeHostActionFn as unknown as (args: {data: unknown}) => Promise<unknown>
++const context = {contract: 'iplaycafe.feedback/native-1', operationId: '00000000-0000-4000-8000-000000000002', hostOrigin: 'https://app.example.test'}
++const ctx = {principal: {type: 'user', id: 'synthetic-principal', role: 'user'}, user: {id: 'synthetic-user'}, scope: 'widget'}
++const actions = [
++  {type: 'list-tickets', payload: {}}, {type: 'read-ticket', payload: {ticketId: 'foreign-ticket'}},
++  {type: 'reply-ticket', payload: {ticketId: 'foreign-ticket', content: 'Visitor reply'}},
++]
++beforeEach(() => {vi.resetAllMocks(); ports.bearer = 'synthetic-native-bearer'; ports.auth.mockResolvedValue(ctx); ports.bound.mockResolvedValue('session'); ports.list.mockResolvedValue([{id: 'own-ticket'}])})
++describe('native Ticket facade authority', () => {
++  it('reconciles an already committed logout without requiring the deleted authentication session', async () => {
++    ports.auth.mockRejectedValueOnce(new Error('Widget session expired'))
++    ports.retirement.mockResolvedValueOnce({loggedOut: true})
++    await expect(invoke({data: {context, action: {type: 'logout', payload: {}}}})).resolves.toEqual({loggedOut: true})
++    expect(ports.retirement).toHaveBeenCalledWith(ports.bearer, context)
++    expect(ports.auth).not.toHaveBeenCalled()
++  })
++  it('never confirms an unknown or wrong-origin logout when its dedicated admission refuses', async () => {
++    ports.retirement.mockRejectedValueOnce(new Error('NATIVE_SESSION_REVOCATION_FAILED'))
++    await expect(invoke({data: {context, action: {type: 'logout', payload: {}}}})).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++    expect(ports.auth).not.toHaveBeenCalled()
++    expect(ports.bound).not.toHaveBeenCalled()
++    expect(ports.list).not.toHaveBeenCalled()
++  })
++  it('lists only through the authenticated native requester port after bound-session admission', async () => {
++    await expect(invoke({data: {context, action: actions[0]}})).resolves.toEqual([{id: 'own-ticket'}])
++    expect(ports.bound).toHaveBeenCalledWith(ctx.principal.id, context, ports.bearer)
++    expect(ports.list).toHaveBeenCalledWith(ctx)
++    expect(ports.bound.mock.invocationCallOrder[0]).toBeLessThan(ports.list.mock.invocationCallOrder[0])
++  })
++  it.each(actions)('refuses $type before any downstream work when native binding is unavailable', async action => {
++    ports.bound.mockRejectedValueOnce(new Error('NATIVE_SESSION_BINDING_REQUIRED'))
++    await expect(invoke({data: {context, action}})).rejects.toThrow('NATIVE_SESSION_BINDING_REQUIRED')
++    expect(ports.list).not.toHaveBeenCalled()
++  })
++  it.each(['anonymous', 'service'])('refuses principal type %s before session admission', async type => {
++    ports.auth.mockResolvedValueOnce({...ctx, principal: {...ctx.principal, type}})
++    await expect(invoke({data: {context, action: actions[0]}})).rejects.toThrow('Verified widget identity required')
++    expect(ports.bound).not.toHaveBeenCalled()
++  })
++  it('passes the actual replacement principal and caller origin to admission, never the old owner', async () => {
++    ports.auth.mockResolvedValueOnce({...ctx, principal: {...ctx.principal, id: 'replacement-principal'}})
++    ports.bound.mockRejectedValueOnce(new Error('NATIVE_SESSION_BINDING_REQUIRED'))
++    const otherContext = {...context, hostOrigin: 'https://other.example.test'}
++    await expect(invoke({data: {context: otherContext, action: actions[0]}})).rejects.toThrow()
++    expect(ports.bound).toHaveBeenCalledWith('replacement-principal', otherContext, ports.bearer)
++    expect(ports.list).not.toHaveBeenCalled()
++  })
++  it('rejects missing bearer, invalid issuer context and widened logout payload without mutation', async () => {
++    ports.bearer = ''
++    await expect(invoke({data: {context, action: {type: 'logout', payload: {}}}})).rejects.toThrow('Widget token required')
++    expect(ports.bound).not.toHaveBeenCalled()
++    await expect(invoke({data: {context: {...context, hostOrigin: 'http://untrusted.example'}, action: actions[0]}})).rejects.toThrow()
++    await expect(invoke({data: {context, action: {type: 'logout', payload: {token: 'another-session'}}}})).rejects.toThrow()
++  })
++})
+diff --git a/apps/web/src/lib/server/functions/widget/__tests__/native-host-tickets.integration.test.ts b/apps/web/src/lib/server/functions/widget/__tests__/native-host-tickets.integration.test.ts
+new file mode 100644
+index 000000000..34e60bfda
+--- /dev/null
++++ b/apps/web/src/lib/server/functions/widget/__tests__/native-host-tickets.integration.test.ts
+@@ -0,0 +1,98 @@
++// @vitest-environment node
++import {afterAll, afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
++import {createId} from '@quackback/ids'
++vi.mock('@tanstack/react-start', () => ({createServerFn: () => {
++  let schema: {parse(value: unknown): unknown}, handler: (value: {data: unknown}) => Promise<unknown>
++  const fn = async (value: {data: unknown}) => handler({data: schema.parse(value.data)})
++  fn.validator = (value: typeof schema) => {schema = value; return fn}
++  fn.handler = (value: typeof handler) => {handler = value; return fn}
++  return fn
++}}))
++const ports = vi.hoisted(() => ({auth: vi.fn(), bound: vi.fn(), read: vi.fn(), reply: vi.fn(), summary: vi.fn(), bearer: 'synthetic-native-bearer'}))
++vi.mock('@/lib/server/functions/widget-auth', () => ({requireWidgetAuth: ports.auth}))
++vi.mock('@/lib/server/widget/native-host-token', async original => ({...await original<typeof import('@/lib/server/widget/native-host-token')>(), requireBoundNativeHostSession: ports.bound}))
++vi.mock('@/lib/server/config', () => ({config: {baseUrl: 'https://feedback.example.test'}}))
++vi.mock('@tanstack/react-start/server', () => ({getRequestHeaders: () => new Headers({authorization: `Bearer ${ports.bearer}`})}))
++vi.mock('@/lib/server/functions/tickets', () => ({}))
++vi.mock('@/lib/server/functions/conversation', () => ({runListConversationMessages: ports.read, runSendConversationMessage: ports.reply}))
++vi.mock('@/lib/server/domains/tickets/requester.service', () => ({getRequesterTicketForConversation: ports.summary}))
++vi.mock('@/lib/server/db', async original => ({...await original<typeof import('@/lib/server/db')>(), db: (await import('@/lib/server/__tests__/db-test-fixture')).testDb}))
++import {createDbTestFixture, testDb} from '@/lib/server/__tests__/db-test-fixture'
++import {conversations, principal, session, ticketConversations, tickets, ticketStatuses, user, widgetIdentifiedSession, eq} from '@/lib/server/db'
++import {consumeNativeHostToken, bindNativeHostSession} from '@/lib/server/widget/native-host-token'
++import {nativeHostActionFn} from '../native-host'
++const invoke = nativeHostActionFn as unknown as (args: {data: unknown}) => Promise<unknown>
++const context = {contract: 'iplaycafe.feedback/native-1' as const, operationId: '00000000-0000-4000-8000-000000000002', hostOrigin: 'https://app.example.test'}
++const fixture = await createDbTestFixture({probe: async db => {await db.select({id: ticketConversations.ticketId}).from(ticketConversations).limit(0)}})
++afterAll(fixture.close)
++async function owner() {
++  const userId = createId('user'), principalId = createId('principal')
++  await testDb.insert(user).values({id: userId, name: 'Synthetic visitor'})
++  await testDb.insert(principal).values({id: principalId, userId, role: 'user', type: 'user', createdAt: new Date()})
++  return {user: {id: userId}, principal: {id: principalId, role: 'user', type: 'user'}, scope: 'widget'}
++}
++async function pair(requester: Awaited<ReturnType<typeof owner>>, type = 'customer', deletedAt: Date | null = null) {
++  const statusId = createId('ticket_status'), conversationId = createId('conversation'), ticketId = createId('ticket')
++  await testDb.insert(ticketStatuses).values({id: statusId, name: 'Synthetic open', slug: statusId, category: 'open', position: 0})
++  await testDb.insert(conversations).values({id: conversationId, visitorPrincipalId: requester.principal.id, channel: 'messenger'})
++  await testDb.insert(tickets).values({id: ticketId, title: 'Private report', statusId, type: type as 'customer', requesterPrincipalId: requester.principal.id, deletedAt})
++  await testDb.insert(ticketConversations).values({ticketId, conversationId, ticketType: 'customer'})
++  return {ticketId, conversationId}
++}
++describe.skipIf(!fixture.available)('native Ticket facade real PostgreSQL ownership and retirement', () => {
++  beforeEach(fixture.begin)
++  beforeEach(() => {vi.resetAllMocks(); ports.bearer = 'synthetic-native-bearer'; ports.bound.mockResolvedValue('session')})
++  afterEach(fixture.rollback)
++  it('reads the owned customer pair through requester DTO and visitor message ports, preserving the visitor context', async () => {
++    const ctx = await owner(), own = await pair(ctx)
++    ports.auth.mockResolvedValue(ctx)
++    ports.summary.mockResolvedValue({id: own.ticketId, title: 'Private report'})
++    ports.read.mockResolvedValue({messages: [{id: 'visible-reply', content: 'Customer-visible reply'}]})
++    const result = await invoke({data: {context, action: {type: 'read-ticket', payload: {ticketId: own.ticketId}}}})
++    expect(result).toEqual({ticket: {id: own.ticketId, title: 'Private report'}, replies: {messages: [{id: 'visible-reply', content: 'Customer-visible reply'}]}})
++    expect(ports.summary).toHaveBeenCalledWith(own.conversationId, ctx.principal.id)
++    // This is the visitor port, not the team transcript/enrichment path. Native
++    // conversation tests own internal-note filtering; this proves delegation.
++    expect(ports.read).toHaveBeenCalledWith(ctx, {conversationId: own.conversationId})
++  })
++  it.each(['read-ticket', 'reply-ticket'])('denies %s for foreign, deleted, non-customer and malformed IDs before any conversation port', async type => {
++    const ctx = await owner(), other = await owner()
++    ports.auth.mockResolvedValue(ctx)
++    const foreign = await pair(other), deleted = await pair(ctx, 'customer', new Date()), tracker = await pair(ctx, 'back_office')
++    for (const ticketId of [foreign.ticketId, deleted.ticketId, tracker.ticketId, 'malformed-ticket']) {
++      await expect(invoke({data: {context, action: {type, payload: {ticketId, content: 'Visitor reply'}}}})).rejects.toThrow('Ticket not found')
++    }
++    expect(ports.read).not.toHaveBeenCalled(); expect(ports.reply).not.toHaveBeenCalled(); expect(ports.summary).not.toHaveBeenCalled()
++  })
++  it('replies only to the owned backing conversation with the authenticated visitor context', async () => {
++    const ctx = await owner(), own = await pair(ctx)
++    ports.auth.mockResolvedValue(ctx); ports.reply.mockResolvedValue({id: 'native-reply'})
++    await expect(invoke({data: {context, action: {type: 'reply-ticket', payload: {ticketId: own.ticketId, content: 'Visitor reply'}}}})).resolves.toEqual({id: 'native-reply'})
++    expect(ports.reply).toHaveBeenCalledWith(ctx, {conversationId: own.conversationId, content: 'Visitor reply'})
++  })
++  it.each(['widget', 'portal'])('revokes only the bound %s bearer and confirms a repeated identical retirement', async scope => {
++    const ctx = await owner(), other = await owner()
++    ports.auth.mockResolvedValue(ctx)
++    const ownId = crypto.randomUUID(), otherId = crypto.randomUUID()
++    await testDb.insert(session).values([{id: ownId, token: ports.bearer, userId: ctx.user.id, scope, updatedAt: new Date(), expiresAt: new Date(Date.now()+60_000)}, {id: otherId, token: 'other-bearer', userId: other.user.id, scope, updatedAt: new Date(), expiresAt: new Date(Date.now()+60_000)}])
++    await testDb.insert(widgetIdentifiedSession).values({sessionId: ownId, hmacVerified: true})
++    const now = Math.floor(Date.now()/1000)
++    const claim = {aud: 'https://feedback.example.test', jti: crypto.randomUUID(), iat: now, exp: now+60, ipc: context}
++    expect(await consumeNativeHostToken(claim)).toBe(true)
++    await bindNativeHostSession(ownId, ctx.principal.id, claim)
++    ports.bearer += '.synthetic-signature'
++    const request = {data: {context, action: {type: 'logout', payload: {}}}}
++    await expect(invoke(request)).resolves.toEqual({loggedOut: true})
++    expect(await testDb.select({id: session.id}).from(session).where(eq(session.id, otherId))).toHaveLength(1)
++    ports.auth.mockRejectedValueOnce(new Error('Deleted widget session'))
++    await expect(invoke(request)).resolves.toEqual({loggedOut: true})
++  })
++  it.each(['dashboard', 'foreign-user'])('cannot revoke a %s session even if an admission port erroneously accepts it', async reason => {
++    const ctx = await owner(), other = await owner()
++    ports.auth.mockResolvedValue(ctx)
++    const id = crypto.randomUUID()
++    await testDb.insert(session).values({id, token: ports.bearer, userId: reason === 'foreign-user' ? other.user.id : ctx.user.id, scope: reason === 'dashboard' ? 'dashboard' : 'widget', updatedAt: new Date(), expiresAt: new Date(Date.now()+60_000)})
++    await expect(invoke({data: {context, action: {type: 'logout', payload: {}}}})).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++    expect(await testDb.select({id: session.id}).from(session).where(eq(session.id, id))).toHaveLength(1)
++  })
++})
+diff --git a/apps/web/src/lib/server/functions/widget/native-host.ts b/apps/web/src/lib/server/functions/widget/native-host.ts
+new file mode 100644
+index 000000000..c0124ee51
+--- /dev/null
++++ b/apps/web/src/lib/server/functions/widget/native-host.ts
+@@ -0,0 +1,84 @@
++import { createServerFn } from '@tanstack/react-start'
++import { z } from 'zod'
++import { createMyTicketSchema } from '@/lib/shared/schemas/tickets'
++import { nativeHostContextSchema } from '@/lib/shared/widget/native-host'
++
++const reportId = z.string().regex(/^brp_[0-9a-f-]{36}$/)
++const evidenceId = z.string().regex(/^qbe_[0-9a-f-]{36}$/)
++export const nativeHostActionSchema = z.discriminatedUnion('type', [
++  z.object({type: z.literal('create-ticket'), payload: z.object({submissionId: z.uuid(), ticket: createMyTicketSchema})}),
++  z.object({type: z.literal('list-tickets'), payload: z.object({}).strict()}),
++  z.object({type: z.literal('read-ticket'), payload: z.object({ticketId: z.string().min(1)})}),
++  z.object({type: z.literal('reply-ticket'), payload: z.object({ticketId: z.string().min(1), content: z.string().min(1).max(4000)})}),
++  z.object({type: z.literal('logout'), payload: z.object({}).strict()}),
++  z.object({type: z.literal('evidence-capability'), payload: z.object({reportId}).strict()}),
++  z.object({type: z.literal('bind-evidence'), payload: z.object({reportId, submissionId: z.uuid(),
++    ticketId: z.string().min(1), evidenceIds: z.array(evidenceId).min(1).max(5)}).strict()}),
++  z.object({type: z.literal('abort-evidence'), payload: z.object({reportId}).strict()}),
++  z.object({type: z.literal('read-evidence'), payload: z.object({ticketId: z.string().min(1)}).strict()}),
++])
++
++export const nativeHostActionFn = createServerFn({method: 'POST'})
++  .validator(z.object({context: nativeHostContextSchema, action: nativeHostActionSchema}))
++  .handler(async ({data}) => {
++    const {getRequestHeaders} = await import('@tanstack/react-start/server')
++    const bearer = getRequestHeaders().get('authorization')?.match(/^Bearer (.+)$/)?.[1]
++    if (!bearer) throw new Error('Widget token required')
++    if (data.action.type === 'logout') {
++      const {retireNativeHostSession} = await import('@/lib/server/widget/native-host-token')
++      return retireNativeHostSession(bearer, data.context)
++    }
++    const { requireWidgetAuth } = await import('../widget-auth')
++    const ctx = await requireWidgetAuth()
++    if (ctx.principal.type !== 'user') throw new Error('Verified widget identity required')
++    const {requireBoundNativeHostSession} = await import('@/lib/server/widget/native-host-token')
++    await requireBoundNativeHostSession(ctx.principal.id, data.context, bearer)
++    if (data.action.type === 'evidence-capability') {
++      const {runIssueNativeEvidenceCapability} = await import('@/lib/server/evidence/native')
++      return runIssueNativeEvidenceCapability(ctx, data.action.payload)
++    }
++    if (data.action.type === 'bind-evidence') {
++      const {runBindNativeEvidence} = await import('@/lib/server/evidence/native')
++      return runBindNativeEvidence(ctx, data.action.payload)
++    }
++    if (data.action.type === 'abort-evidence') {
++      const {runAbortNativeEvidenceBinding} = await import('@/lib/server/evidence/native')
++      return runAbortNativeEvidenceBinding(ctx, data.action.payload)
++    }
++    if (data.action.type === 'read-evidence') {
++      const {runReadNativeEvidence} = await import('@/lib/server/evidence/native')
++      return runReadNativeEvidence(ctx, data.action.payload)
++    }
++    const native = await import('../tickets')
++    if (data.action.type === 'create-ticket') {
++      const {nativeSubmissionDigest} = await import('@/lib/server/widget/native-submission')
++      return native.runCreateMyTicket(ctx, data.action.payload.ticket, {
++        submissionId: data.action.payload.submissionId,
++        digest: nativeSubmissionDigest(data.action.payload.ticket),
++      })
++    }
++    if (data.action.type === 'list-tickets') return native.runGetMyTickets(ctx)
++    const {db, tickets, ticketConversations, eq, and, isNull} = await import('@/lib/server/db')
++    // Own-ticket lookup precedes every thread read/reply. It does not depend
++    // on the native recent-50 listing and never exposes team-only ticket data.
++    const {isValidTypeId} = await import('@quackback/ids')
++    const ticketId = data.action.payload.ticketId
++    if (!isValidTypeId(ticketId, 'ticket')) throw new Error('Ticket not found')
++    const [pair] = await db.select({conversationId: ticketConversations.conversationId})
++      .from(tickets).innerJoin(ticketConversations, eq(tickets.id, ticketConversations.ticketId))
++      .where(and(eq(tickets.id, ticketId as import('@quackback/ids').TicketId),
++        eq(tickets.requesterPrincipalId, ctx.principal.id), eq(tickets.type, 'customer'),
++        eq(ticketConversations.ticketType, 'customer'), isNull(tickets.deletedAt))).limit(1)
++    if (!pair) throw new Error('Ticket not found')
++    const conversation = await import('../conversation')
++    if (data.action.type === 'reply-ticket') {
++      return conversation.runSendConversationMessage(ctx, {
++        conversationId: pair.conversationId, content: data.action.payload.content,
++      })
++    }
++    const {getRequesterTicketForConversation} = await import('@/lib/server/domains/tickets/requester.service')
++    return {
++      ticket: await getRequesterTicketForConversation(pair.conversationId, ctx.principal.id),
++      replies: await conversation.runListConversationMessages(ctx, {conversationId: pair.conversationId}),
++    }
++  })
+diff --git a/apps/web/src/lib/server/widget/__tests__/native-host-session.integration.test.ts b/apps/web/src/lib/server/widget/__tests__/native-host-session.integration.test.ts
+new file mode 100644
+index 000000000..13240fee4
+--- /dev/null
++++ b/apps/web/src/lib/server/widget/__tests__/native-host-session.integration.test.ts
+@@ -0,0 +1,100 @@
++import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { createId } from '@quackback/ids'
++vi.mock('@/lib/server/db', async original => ({
++  ...await original<typeof import('@/lib/server/db')>(),
++  db: (await import('@/lib/server/__tests__/db-test-fixture')).testDb,
++}))
++vi.mock('@/lib/server/config', () => ({config: {baseUrl: 'https://feedback.example.test'}}))
++import { createDbTestFixture, testDb } from '@/lib/server/__tests__/db-test-fixture'
++import { session, user, widgetIdentifiedSession, sql } from '@/lib/server/db'
++import { findOrCreateSession } from '@/routes/api/widget/identify'
++import { bindNativeHostSession, consumeNativeHostToken, requireBoundNativeHostSession, revokePreviousNativeHostSession, retireNativeHostSession } from '../native-host-token'
++
++const context = {contract: 'iplaycafe.feedback/native-1' as const, operationId: crypto.randomUUID(), hostOrigin: 'https://app.example.test'}
++const fixture = await createDbTestFixture({probe: async db => {await db.execute(sql`select 1 from ipc_native_session_binding limit 0`)}})
++afterAll(fixture.close)
++async function seed(scope: 'widget' | 'portal' | 'dashboard' = 'widget') {
++    const userId = createId('user'), principalId = createId('principal'), sessionId = crypto.randomUUID(), token = crypto.randomUUID()
++    const now = Math.floor(Date.now()/1000)
++    const claims = {aud: 'https://feedback.example.test', jti: crypto.randomUUID(), iat: now, exp: now+60, ipc: context}
++    await testDb.insert(user).values({id: userId, name: 'Synthetic native session regression'})
++    await testDb.insert(session).values({id: sessionId, token, userId, scope,
++      expiresAt: new Date(Date.now()+60_000), createdAt: new Date(), updatedAt: new Date()})
++    // Native provenance insertion correctly demotes a dashboard scope. A
++    // dashboard-refusal witness must retain the actual stored dashboard scope.
++    if (scope !== 'dashboard') await testDb.insert(widgetIdentifiedSession).values({sessionId, hmacVerified: true})
++    expect(await testDb.execute(sql`select scope from session where id=${sessionId}`))
++      .toMatchObject([{scope}])
++    expect(await consumeNativeHostToken(claims)).toBe(true)
++    await bindNativeHostSession(sessionId, principalId, claims)
++    return {userId, principalId, sessionId, token, claims}
++  }
++
++describe.skipIf(!fixture.available)('native bound-session revocation on real PostgreSQL', () => {
++  beforeEach(fixture.begin)
++  afterEach(fixture.rollback)
++  it('reconciles a lost logout response through the exact durable receipt without restoring access', async () => {
++    const value = await seed()
++    await expect(retireNativeHostSession(value.token, context)).resolves.toEqual({loggedOut: true})
++    expect(await testDb.execute(sql`select id from session where id=${value.sessionId}`)).toHaveLength(0)
++    await expect(requireBoundNativeHostSession(value.principalId, context, value.token)).rejects.toThrow('NATIVE_SESSION_BINDING_REQUIRED')
++    await expect(retireNativeHostSession(value.token + '.synthetic-signature', context)).resolves.toEqual({loggedOut: true})
++    expect(await testDb.execute(sql`select token_sha256 from ipc_native_retirement`)).toHaveLength(1)
++    await expect(retireNativeHostSession(value.token, {...context, operationId: crypto.randomUUID()})).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++    await expect(retireNativeHostSession(value.token, {...context, hostOrigin: 'https://other.example.test'})).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++    await testDb.execute(sql`update ipc_native_retirement set audience='https://other-feedback.example.test'`)
++    await expect(retireNativeHostSession(value.token, context)).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++  })
++  it('refuses unknown, dashboard, expired-receipt and unbound bearers without a success confirmation', async () => {
++    await expect(retireNativeHostSession(crypto.randomUUID(), context)).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++    const dashboard = await seed('dashboard')
++    await expect(retireNativeHostSession(dashboard.token, context)).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++    expect(await testDb.execute(sql`select id from session where id=${dashboard.sessionId}`)).toHaveLength(1)
++    const value = await seed()
++    await testDb.execute(sql`delete from ipc_native_session_binding where session_id=${value.sessionId}`)
++    await expect(retireNativeHostSession(value.token, context)).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++    expect(await testDb.execute(sql`select id from session where id=${value.sessionId}`)).toHaveLength(1)
++    const retired = await seed()
++    await retireNativeHostSession(retired.token, context)
++    await testDb.execute(sql`update ipc_native_retirement set expires_at=now()-interval '1 second'`)
++    await expect(retireNativeHostSession(retired.token, context)).rejects.toThrow('NATIVE_SESSION_REVOCATION_FAILED')
++  })
++  it.each(['widget', 'portal'] as const)('revokes exact %s binding while keeping JWT redemption terminal', async scope => {
++    const value = await seed(scope)
++    expect(await requireBoundNativeHostSession(value.principalId, context, value.token)).toBe(value.sessionId)
++    await revokePreviousNativeHostSession(value.token, context)
++    await expect(requireBoundNativeHostSession(value.principalId, context, value.token)).rejects.toThrow('NATIVE_SESSION_BINDING_REQUIRED')
++    expect(await testDb.execute(sql`select session_id from ipc_native_session_binding where session_id=${value.sessionId}`)).toHaveLength(0)
++    expect(await consumeNativeHostToken(value.claims)).toBe(false)
++  })
++  it('does not revoke a dashboard token, another bearer or a different host origin', async () => {
++    const value = await seed()
++    await revokePreviousNativeHostSession(crypto.randomUUID(), context)
++    await revokePreviousNativeHostSession(value.token, {...context, hostOrigin: 'https://other.example.test'})
++    expect(await requireBoundNativeHostSession(value.principalId, context, value.token)).toBe(value.sessionId)
++    const dashboard = await seed('dashboard')
++    await revokePreviousNativeHostSession(dashboard.token, context)
++    expect(await testDb.execute(sql`select id from session where id=${dashboard.sessionId}`)).toHaveLength(1)
++    await expect(requireBoundNativeHostSession(dashboard.principalId, context, dashboard.token)).rejects.toThrow('NATIVE_SESSION_BINDING_REQUIRED')
++  })
++})
++
++
++// Uses the exact repository query and session creation path on the required
++// disposable PostgreSQL fixture. No test returns production bearer values.
++describe.skipIf(!fixture.available)('ordinary SSO cannot reuse an issuer-owned native bearer', () => {
++  beforeEach(fixture.begin)
++  afterEach(fixture.rollback)
++  const request = () => new Request('https://feedback.example.test/api/widget/identify')
++  it.each(['widget', 'portal'] as const)('excludes bound %s sessions while reusing an unbound identified session', async scope => {
++    const native = await seed(scope)
++    const ordinary = await findOrCreateSession(native.userId, request())
++    expect(ordinary.id).not.toBe(native.sessionId)
++    expect(ordinary.token).not.toBe(native.token)
++    expect(await testDb.execute(sql`select session_id from ipc_native_session_binding where session_id=${ordinary.id}`)).toHaveLength(0)
++    await testDb.insert(widgetIdentifiedSession).values({sessionId: ordinary.id, hmacVerified: true})
++    expect(await findOrCreateSession(native.userId, request())).toEqual(ordinary)
++    await revokePreviousNativeHostSession(native.token, context)
++    expect(await testDb.execute(sql`select id from session where id=${ordinary.id}`)).toHaveLength(1)
++  })
++})
+diff --git a/apps/web/src/lib/server/widget/__tests__/native-host-token.test.ts b/apps/web/src/lib/server/widget/__tests__/native-host-token.test.ts
+new file mode 100644
+index 000000000..565e6429b
+--- /dev/null
++++ b/apps/web/src/lib/server/widget/__tests__/native-host-token.test.ts
+@@ -0,0 +1,35 @@
++import { describe, expect, it } from 'vitest'
++import { readNativeHostClaims } from '../native-host-token'
++
++const context = {
++  contract: 'iplaycafe.feedback/native-1',
++  operationId: '0dd2f406-47c2-49de-8a6f-9b55f0ff92c9',
++  hostOrigin: 'https://app.example.test',
++}
++const claims = {
++  sub: 'host-user-1', email: 'customer@example.test',
++  aud: 'https://feedback.example.test',
++  jti: 'a2c6ea42-d3c7-4b69-8a44-b7c884f117f4',
++  iat: 1000, exp: 1060, ipc: context,
++}
++
++describe('native host SSO constraints after signature verification', () => {
++  it('accepts the exact signed operation and origins', () => {
++    expect(readNativeHostClaims(claims, context, claims.aud, 1020)?.jti).toBe(claims.jti)
++  })
++  it.each([
++    { ...claims, aud: 'https://other.example.test' },
++    { ...claims, exp: 1020 },
++    { ...claims, exp: 1100 },
++    { ...claims, iat: 1050 },
++    { ...claims, jti: '' },
++    { ...claims, ipc: { ...context, operationId: crypto.randomUUID() } },
++    { ...claims, ipc: { ...context, hostOrigin: 'https://evil.example.test' } },
++    { ...claims, ipc: { ...context, contract: 'iplaycafe.feedback/7' } },
++    { ...claims, ipc: { ...context, hostOrigin: 'https://app.example.test/path' } },
++    { ...claims, ipc: undefined },
++    { ...claims, exp: '1060' },
++  ])('refuses malformed, expired or mismatched signed constraints %#', (invalid) => {
++    expect(readNativeHostClaims(invalid, context, claims.aud, 1020)).toBeNull()
++  })
++})
+diff --git a/apps/web/src/lib/server/widget/__tests__/native-submission.concurrent.test.ts b/apps/web/src/lib/server/widget/__tests__/native-submission.concurrent.test.ts
+new file mode 100644
+index 000000000..e65554fd9
+--- /dev/null
++++ b/apps/web/src/lib/server/widget/__tests__/native-submission.concurrent.test.ts
+@@ -0,0 +1,67 @@
++// @vitest-environment node
++import { afterAll, describe, expect, it } from 'vitest'
++import { createDb } from '@quackback/db/client'
++import { createId } from '@quackback/ids'
++import { sql } from 'drizzle-orm'
++import postgres from 'postgres'
++import { lookupNativeSubmission, nativeSubmissionDigest, recordNativeSubmission } from '../native-submission'
++
++const target = new URL(process.env.DATABASE_URL ?? 'postgresql://localhost/quackback_test')
++if (!['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname) || !target.pathname.endsWith('_test')) {
++  throw new Error('Native concurrency regression requires a disposable loopback test database')
++}
++const first = createDb(target.toString(), { max: 1, prepare: false })
++const second = createDb(target.toString(), { max: 1, prepare: false })
++const observer = postgres(target.toString(), { max: 1, prepare: false, onnotice: () => {} })
++afterAll(async () => {
++  await Promise.all([(first as unknown as { $client: postgres.Sql }).$client.end(),
++    (second as unknown as { $client: postgres.Sql }).$client.end(), observer.end()])
++})
++
++describe('native submission concurrency on independent PostgreSQL sessions', () => {
++  it('waits for the winning transaction then reuses its immutable ticket mapping', async () => {
++    const principalId = createId('principal')
++    const ticketId = createId('ticket')
++    const submission = { submissionId: crypto.randomUUID(), digest: nativeSubmissionDigest({ title: 'Concurrent retry' }) }
++    let release!: () => void
++    let acquired!: () => void
++    const held = new Promise<void>(resolve => { release = resolve })
++    const locked = new Promise<void>(resolve => { acquired = resolve })
++    let loserSettled = false
++    let loser: Promise<unknown> | undefined
++    const winner = first.transaction(async tx => {
++      expect(await lookupNativeSubmission(tx, principalId, submission)).toBeNull()
++      await recordNativeSubmission(tx, principalId, submission, ticketId)
++      acquired()
++      await held
++    })
++    try {
++      await locked
++      loser = second.transaction(tx => lookupNativeSubmission(tx, principalId, submission))
++        .then(result => { loserSettled = true; return result })
++      // Inspect the server's actual advisory-lock waiter, rather than relying on
++      // an arbitrary delay or a same-connection savepoint pretending to race.
++      let waiting = false
++      for (let attempt = 0; attempt < 100 && !waiting; attempt++) {
++        const rows = await observer`select 1 from pg_stat_activity where wait_event = 'advisory' and datname = current_database()`
++        waiting = rows.length > 0
++        if (!waiting) await new Promise(resolve => setTimeout(resolve, 10))
++      }
++      expect(waiting).toBe(true)
++      expect(loserSettled).toBe(false)
++      release()
++      await winner
++      expect(await loser).toBe(ticketId)
++      const rows = await first.execute(sql`select ticket_id from ipc_native_submission where principal_id = ${principalId} and submission_id = ${submission.submissionId}`)
++      expect(rows).toHaveLength(1)
++      expect(rows[0].ticket_id).toBe(ticketId)
++      await expect(second.transaction(tx => lookupNativeSubmission(tx, principalId,
++        { ...submission, digest: nativeSubmissionDigest({ title: 'Changed retry' }) })))
++        .rejects.toMatchObject({ code: 'SUBMISSION_CONFLICT' })
++    } finally {
++      release()
++      await Promise.allSettled([winner, ...(loser ? [loser] : [])])
++      await first.execute(sql`delete from ipc_native_submission where principal_id = ${principalId} and submission_id = ${submission.submissionId}`)
++    }
++  })
++})
+diff --git a/apps/web/src/lib/server/widget/__tests__/native-submission.test.ts b/apps/web/src/lib/server/widget/__tests__/native-submission.test.ts
+new file mode 100644
+index 000000000..dee78f13c
+--- /dev/null
++++ b/apps/web/src/lib/server/widget/__tests__/native-submission.test.ts
+@@ -0,0 +1,15 @@
++import { describe, expect, it } from 'vitest'
++import { nativeSubmissionDigest } from '../native-submission'
++
++describe('native submission digest', () => {
++  it('ignores JSON object key order but binds every nested field and array order', () => {
++    const report = {title: 'Broken save', fieldValues: {b: 2, a: 1}, attachments: []}
++    expect(nativeSubmissionDigest(report)).toBe(nativeSubmissionDigest({attachments: [], fieldValues: {a: 1, b: 2}, title: 'Broken save'}))
++    expect(nativeSubmissionDigest(report)).not.toBe(nativeSubmissionDigest({...report, title: 'Other report'}))
++    expect(nativeSubmissionDigest({items: [1, 2]})).not.toBe(nativeSubmissionDigest({items: [2, 1]}))
++  })
++  it('normalizes absent optional JSON fields without accepting a changed value', () => {
++    expect(nativeSubmissionDigest({title: 't'})).toBe(nativeSubmissionDigest({title: 't', description: undefined}))
++    expect(nativeSubmissionDigest({title: 't'})).not.toBe(nativeSubmissionDigest({title: 't', description: ''}))
++  })
++})
+diff --git a/apps/web/src/lib/server/widget/native-host-token.ts b/apps/web/src/lib/server/widget/native-host-token.ts
+new file mode 100644
+index 000000000..2d7ee5a5a
+--- /dev/null
++++ b/apps/web/src/lib/server/widget/native-host-token.ts
+@@ -0,0 +1,108 @@
++import { z } from 'zod'
++import { db, sql } from '@/lib/server/db'
++import { nativeHostContextSchema, nativeOriginSchema } from '@/lib/shared/widget/native-host'
++export { nativeHostContextSchema } from '@/lib/shared/widget/native-host'
++const claimSchema = z.object({
++  aud: nativeOriginSchema,
++  jti: z.uuid(),
++  iat: z.number().int(),
++  exp: z.number().int(),
++  ipc: nativeHostContextSchema,
++})
++
++/** Signature is verified by upstream; this adds the host contract constraints. */
++export function readNativeHostClaims(
++  payload: unknown,
++  context: unknown,
++  audience: string,
++  now = Math.floor(Date.now() / 1000)
++) {
++  const claim = claimSchema.safeParse(payload)
++  const host = nativeHostContextSchema.safeParse(context)
++  if (!claim.success || !host.success) return null
++  const value = claim.data
++  if (value.aud !== audience || value.exp <= now || value.iat > now + 5 ||
++      value.exp - value.iat <= 0 || value.exp - value.iat > 60 ||
++      value.ipc.operationId !== host.data.operationId ||
++      value.ipc.hostOrigin !== host.data.hostOrigin) return null
++  return value
++}
++
++/** Unique insertion is the concurrency boundary; a store failure fails closed. */
++export async function consumeNativeHostToken(claim: NonNullable<ReturnType<typeof readNativeHostClaims>>) {
++  const rows = await db.execute(sql`
++    INSERT INTO ipc_native_redemption (jti, expires_at)
++    VALUES (${claim.jti}, to_timestamp(${claim.exp}))
++    ON CONFLICT (jti) DO NOTHING RETURNING jti
++  `)
++  return rows.length === 1
++}
++
++export async function bindNativeHostSession(sessionId: string, principalId: string,
++  claim: NonNullable<ReturnType<typeof readNativeHostClaims>>) {
++  await db.execute(sql`INSERT INTO ipc_native_session_binding
++    (session_id, principal_id, host_origin, audience, jti)
++    VALUES (${sessionId}, ${principalId}, ${claim.ipc.hostOrigin}, ${claim.aud}, ${claim.jti})`)
++}
++
++/** Bearer possession authorizes logout, including a failed re-identify after reload.
++ * Only the exact native binding for this host/audience may be deleted. Anonymous
++ * sessions remain available to upstream's ownership-checked merge path.
++ */
++export async function revokePreviousNativeHostSession(bearer: string, context: unknown) {
++  const host = nativeHostContextSchema.parse(context)
++  const { rawSessionToken } = await import('@/lib/server/auth/session-token')
++  const { config } = await import('@/lib/server/config')
++  await db.execute(sql`DELETE FROM session s USING ipc_native_session_binding b
++    WHERE s.id=b.session_id AND s.token=${rawSessionToken(bearer)}
++      AND s.scope IN ('widget','portal') AND b.host_origin=${host.hostOrigin}
++      AND b.audience=${new URL(config.baseUrl).origin}`)
++}
++
++/** Only a committed receipt can confirm a logout whose HTTP response was lost.
++ * Retain a hash of the credential, never its value or a user/profile identifier.
++ * This admission is logout-only; it never restores authentication or data access.
++ */
++export async function retireNativeHostSession(bearer: string, context: unknown) {
++  const host = nativeHostContextSchema.parse(context)
++  const { rawSessionToken } = await import('@/lib/server/auth/session-token')
++  const { config } = await import('@/lib/server/config')
++  const { createHash } = await import('node:crypto')
++  const token = rawSessionToken(bearer)
++  if (!token) throw new Error('NATIVE_SESSION_REVOCATION_FAILED')
++  const digest = createHash('sha256').update(token).digest('hex')
++  const audience = new URL(config.baseUrl).origin
++  return db.transaction(async tx => {
++    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${'native-retire:' + digest}, 0))`)
++    await tx.execute(sql`DELETE FROM ipc_native_retirement WHERE expires_at<=now()`)
++    const receipt = await tx.execute(sql`SELECT token_sha256 FROM ipc_native_retirement
++      WHERE token_sha256=${digest} AND host_origin=${host.hostOrigin}
++        AND audience=${audience} AND operation_id=${host.operationId} AND expires_at>now()`)
++    if (receipt.length === 1) return {loggedOut: true}
++    const deleted = await tx.execute(sql`DELETE FROM session s USING ipc_native_session_binding b, widget_identified_session w
++      WHERE s.id=b.session_id AND w.session_id=s.id AND w.hmac_verified=true
++        AND s.token=${token} AND s.scope IN ('widget','portal')
++        AND b.host_origin=${host.hostOrigin} AND b.audience=${audience}
++      RETURNING s.id`)
++    if (deleted.length !== 1) throw new Error('NATIVE_SESSION_REVOCATION_FAILED')
++    await tx.execute(sql`INSERT INTO ipc_native_retirement
++      (token_sha256,host_origin,audience,operation_id,expires_at)
++      VALUES (${digest},${host.hostOrigin},${audience},${host.operationId},now()+interval '30 days')`)
++    return {loggedOut: true}
++  })
++}
++
++/** Every operation uses the issuer-bound host, never a caller-selected origin. */
++export async function requireBoundNativeHostSession(principalId: string, context: unknown, bearer: string) {
++  const host = nativeHostContextSchema.parse(context)
++  const { rawSessionToken } = await import('@/lib/server/auth/session-token')
++  const { config } = await import('@/lib/server/config')
++  const rows = await db.execute(sql`SELECT b.session_id FROM ipc_native_session_binding b
++    JOIN session s ON s.id=b.session_id
++    JOIN widget_identified_session w ON w.session_id=s.id AND w.hmac_verified=true
++    WHERE s.token=${rawSessionToken(bearer)} AND s.expires_at>now()
++      AND s.scope IN ('widget','portal') AND b.principal_id=${principalId}
++      AND b.host_origin=${host.hostOrigin} AND b.audience=${new URL(config.baseUrl).origin}`)
++  if (rows.length !== 1) throw new Error('NATIVE_SESSION_BINDING_REQUIRED')
++  return rows[0].session_id as string
++}
+diff --git a/apps/web/src/lib/server/widget/native-submission.ts b/apps/web/src/lib/server/widget/native-submission.ts
+new file mode 100644
+index 000000000..74c62832b
+--- /dev/null
++++ b/apps/web/src/lib/server/widget/native-submission.ts
+@@ -0,0 +1,43 @@
++import { createHash } from 'node:crypto'
++import { sql, type Transaction } from '@/lib/server/db'
++import type { PrincipalId, TicketId } from '@quackback/ids'
++import { ValidationError } from '@/lib/shared/errors'
++
++export interface NativeSubmission { submissionId: string; digest: string }
++
++function canonical(value: unknown): unknown {
++  if (Array.isArray(value)) return value.map(canonical)
++  if (value && typeof value === 'object') return Object.fromEntries(
++    Object.entries(value).filter(([, entry]) => entry !== undefined)
++      .sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, canonical(entry)])
++  )
++  return value
++}
++
++export function nativeSubmissionDigest(input: unknown): string {
++  return createHash('sha256').update(JSON.stringify(canonical(input))).digest('hex')
++}
++
++/** The lock, mapping and native ticket/pair share ONE native create transaction. */
++export async function lookupNativeSubmission(
++  tx: Transaction, principalId: PrincipalId, submission: NativeSubmission
++): Promise<TicketId | null> {
++  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(
++    ${`ipc-native:${principalId}:${submission.submissionId}`}, 0))`)
++  const rows = await tx.execute(sql`SELECT ticket_id, body_digest FROM ipc_native_submission
++    WHERE principal_id = ${principalId} AND submission_id = ${submission.submissionId}`)
++  const previous = rows[0]
++  if (!previous) return null
++  if (previous.body_digest !== submission.digest) {
++    throw new ValidationError('SUBMISSION_CONFLICT', 'Submission ID already has a different report')
++  }
++  return previous.ticket_id as TicketId
++}
++
++export async function recordNativeSubmission(
++  tx: Transaction, principalId: PrincipalId, submission: NativeSubmission, ticketId: TicketId
++) {
++  await tx.execute(sql`INSERT INTO ipc_native_submission
++    (principal_id, submission_id, body_digest, ticket_id)
++    VALUES (${principalId}, ${submission.submissionId}, ${submission.digest}, ${ticketId})`)
++}
+diff --git a/apps/web/src/lib/shared/widget/native-host.ts b/apps/web/src/lib/shared/widget/native-host.ts
+new file mode 100644
+index 000000000..c1cd2becb
+--- /dev/null
++++ b/apps/web/src/lib/shared/widget/native-host.ts
+@@ -0,0 +1,23 @@
++import { z } from 'zod'
++
++export const NATIVE_HOST_CONTRACT = 'iplaycafe.feedback/native-1' as const
++export const nativeOriginSchema = z.string().refine((value) => {
++  try {
++    const url = new URL(value)
++    return (url.protocol === 'https:' || url.protocol === 'http:') &&
++      !url.username && !url.password && url.origin === value
++  } catch { return false }
++})
++export const nativeHostContextSchema = z.object({
++  contract: z.literal(NATIVE_HOST_CONTRACT),
++  operationId: z.uuid(),
++  hostOrigin: nativeOriginSchema,
++}).strict()
++export type NativeHostContext = z.infer<typeof nativeHostContextSchema>
++
++export const nativeHostCommandSchema = z.object({
++  contract: z.literal(NATIVE_HOST_CONTRACT),
++  operationId: z.uuid(),
++  type: z.enum(['identify', 'logout', 'create-ticket', 'list-tickets', 'read-ticket', 'reply-ticket', 'capture-config', 'evidence-capability', 'bind-evidence', 'abort-evidence', 'read-evidence']),
++  payload: z.record(z.string(), z.unknown()),
++}).strict()
+diff --git a/apps/web/src/routes/api/widget/__tests__/native-reidentify-retirement.test.ts b/apps/web/src/routes/api/widget/__tests__/native-reidentify-retirement.test.ts
+new file mode 100644
+index 000000000..c5681b2ae
+--- /dev/null
++++ b/apps/web/src/routes/api/widget/__tests__/native-reidentify-retirement.test.ts
+@@ -0,0 +1,37 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++vi.mock('@tanstack/react-router', () => ({createFileRoute: () => (options: unknown) => ({options})}))
++vi.mock('@/lib/server/config', () => ({config: {baseUrl: 'https://feedback.example.test'}}))
++vi.mock('@/lib/server/domains/settings/settings.widget', () => ({getWidgetConfig: vi.fn(async () => ({enabled: true})), getWidgetSecret: vi.fn(async () => 'fake')}))
++vi.mock('@/lib/server/auth/widget-rate-limit', () => ({checkWidgetIdentifyRateLimit: vi.fn(async () => ({allowed: true}))}))
++vi.mock('@/lib/server/domains/api/rate-limit', () => ({getClientIp: () => '127.0.0.1'}))
++vi.mock('@/lib/server/widget/identity-token', () => ({verifyHS256JWT: vi.fn(() => null)}))
++vi.mock('@/lib/server/widget/native-host-token', async original => ({
++  ...await original<typeof import('@/lib/server/widget/native-host-token')>(), revokePreviousNativeHostSession: vi.fn(async () => {}),
++}))
++import { Route } from '../identify'
++import { getWidgetConfig } from '@/lib/server/domains/settings/settings.widget'
++import { checkWidgetIdentifyRateLimit } from '@/lib/server/auth/widget-rate-limit'
++import { revokePreviousNativeHostSession } from '@/lib/server/widget/native-host-token'
++const POST = (Route as unknown as {options: {server: {handlers: {POST: (input: {request: Request}) => Promise<Response>}}}}).options.server.handlers.POST
++const ipc = {contract: 'iplaycafe.feedback/native-1', operationId: crypto.randomUUID(), hostOrigin: 'https://app.example.test'}
++const body = {ssoToken: 'invalid-SSO', previousToken: 'previous-owned-token', ipc}
++function request(value = body, bearer = body.previousToken) {
++  return POST({request: new Request('https://feedback.example.test/api/widget/identify', {method: 'POST',
++    headers: {'Content-Type': 'application/json', Authorization: `Bearer ${bearer}`}, body: JSON.stringify(value)})})
++}
++beforeEach(() => {vi.clearAllMocks(); vi.mocked(getWidgetConfig).mockResolvedValue({enabled: true} as never); vi.mocked(checkWidgetIdentifyRateLimit).mockResolvedValue({allowed: true} as never)})
++describe('actual identify handler retires restored native sessions on failed replacement', () => {
++  it.each(['disabled', 'rate-limited', 'empty-SSO', 'invalid-SSO'])('retires owned prior binding before %s refusal', async failure => {
++    if (failure === 'disabled') vi.mocked(getWidgetConfig).mockResolvedValue({enabled: false} as never)
++    if (failure === 'rate-limited') vi.mocked(checkWidgetIdentifyRateLimit).mockResolvedValue({allowed: false} as never)
++    const response = await request({...body, ssoToken: failure === 'empty-SSO' ? '' : body.ssoToken})
++    expect(response.status).toBe(failure === 'rate-limited' ? 429 : failure === 'empty-SSO' ? 400 : 403)
++    expect(revokePreviousNativeHostSession).toHaveBeenCalledWith(body.previousToken, ipc)
++    expect(vi.mocked(revokePreviousNativeHostSession).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(getWidgetConfig).mock.invocationCallOrder[0])
++  })
++  it('never revokes a mismatched bearer or ordinary anonymous-merge request', async () => {
++    await request(body, 'different-token')
++    await request({...body, ipc: undefined} as never)
++    expect(revokePreviousNativeHostSession).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/web/src/routes/api/widget/identify.ts b/apps/web/src/routes/api/widget/identify.ts
+index 55776f7da..5e7b93c9d 100644
+--- a/apps/web/src/routes/api/widget/identify.ts
++++ b/apps/web/src/routes/api/widget/identify.ts
+@@ -24,6 +24,8 @@ import { absolutizeOffHostAssetUrl } from '@/lib/server/storage/asset-url'
+ import { getPublicUrlOrNull } from '@/lib/server/storage/s3'
+ import { resolveAndMergeAnonymousToken } from '@/lib/server/auth/identify-merge'
+ import { verifyHS256JWT } from '@/lib/server/widget/identity-token'
++import { consumeNativeHostToken, nativeHostContextSchema, readNativeHostClaims, revokePreviousNativeHostSession } from '@/lib/server/widget/native-host-token'
++import { config } from '@/lib/server/config'
+ import { getClientIp } from '@/lib/server/domains/api/rate-limit'
+ import { checkWidgetIdentifyRateLimit } from '@/lib/server/auth/widget-rate-limit'
+ import {
+@@ -45,6 +47,7 @@ const identifySchema = z.object({
+   ssoToken: z.string().min(1),
+   // Anonymous→identified merge: previous widget session token
+   previousToken: z.string().optional(),
++  ipc: nativeHostContextSchema.optional(),
+ })
+ 
+ /** JWT claims that are identity fields or standard JWT metadata — not custom attributes */
+@@ -62,6 +65,7 @@ export const RESERVED_JWT_CLAIMS = new Set([
+   'iss',
+   'aud',
+   'jti',
++  'ipc',
+ ])
+ 
+ /** Extract non-reserved claims from a verified JWT payload for attribute processing */
+@@ -107,10 +111,10 @@ export async function recordWidgetSessionProvenance(
+     })
+ }
+ 
+-async function findOrCreateSession(
++export async function findOrCreateSession(
+   userId: UserId,
+   request: Request,
+-  opts?: { teammate?: boolean }
++  opts?: { teammate?: boolean; fresh?: boolean }
+ ): Promise<{ id: string; token: string }> {
+   // Teammates must not reuse a portal-scoped session from an earlier
+   // customer handoff — that token would pass widget-only mutation guards.
+@@ -122,10 +126,13 @@ async function findOrCreateSession(
+       eq(session.userId, userId),
+       gt(session.expiresAt, new Date()),
+       scopeClause,
+-      sql`exists (select 1 from widget_identified_session wis where wis.session_id = ${session.id} and wis.hmac_verified = true)`
++      sql`exists (select 1 from widget_identified_session wis where wis.session_id = ${session.id} and wis.hmac_verified = true)`,
++      // An ordinary SSO exchange must never return a bearer owned by a
++      // different native iframe/issuer, or its later logout can revoke ours.
++      sql`not exists (select 1 from ipc_native_session_binding b where b.session_id = ${session.id})`
+     ),
+   })
+-  if (existingSession && !(opts?.teammate && existingSession.scope !== 'widget')) {
++  if (!opts?.fresh && existingSession && !(opts?.teammate && existingSession.scope !== 'widget')) {
+     await db
+       .update(session)
+       .set({ updatedAt: new Date() })
+@@ -160,6 +167,21 @@ export const Route = createFileRoute('/api/widget/identify')({
+   server: {
+     handlers: {
+       POST: async ({ request }) => {
++        let raw: unknown
++        try { raw = await request.json() } catch {
++          return jsonError('VALIDATION_ERROR', 'Invalid request body', 400)
++        }
++        // Possession authorizes retirement independently of the replacement
++        // JWT. This must precede disabled/rate-limit/invalid-SSO returns, including
++        // a restored session whose browser controller has no prior issuer state.
++        const retirement = z.object({previousToken: z.string().min(1), ipc: nativeHostContextSchema}).safeParse(raw)
++        if (retirement.success && request.headers.get('authorization') === `Bearer ${retirement.data.previousToken}`) {
++          try {
++            await revokePreviousNativeHostSession(retirement.data.previousToken, retirement.data.ipc)
++          } catch {
++            return jsonError('SESSION_REVOCATION_UNAVAILABLE', 'Previous session revocation is unavailable', 503)
++          }
++        }
+         const widgetConfig = await getWidgetConfig()
+         if (!widgetConfig.enabled) {
+           return jsonError('WIDGET_DISABLED', 'Widget is not enabled', 403)
+@@ -180,7 +202,6 @@ export const Route = createFileRoute('/api/widget/identify')({
+ 
+         let body: z.infer<typeof identifySchema>
+         try {
+-          const raw = await request.json()
+           body = identifySchema.parse(raw)
+         } catch {
+           return jsonError('VALIDATION_ERROR', 'Invalid request body', 400)
+@@ -197,6 +218,23 @@ export const Route = createFileRoute('/api/widget/identify')({
+           return jsonError('TOKEN_INVALID', 'Invalid or expired ssoToken', 403)
+         }
+         const claims: Record<string, unknown> = payload
++        // Ordinary upstream SSO remains native. Host-bound tokens must not be
++        // redeemable through the ordinary path with their context stripped.
++        const nativeClaims = claims.ipc !== undefined || body.ipc !== undefined
++          ? readNativeHostClaims(claims, body.ipc, new URL(config.baseUrl).origin)
++          : null
++        if ((claims.ipc !== undefined || body.ipc !== undefined) && !nativeClaims) {
++          return jsonError('HOST_BINDING_INVALID', 'Invalid host operation or audience', 403)
++        }
++        if (nativeClaims) {
++          try {
++            if (!await consumeNativeHostToken(nativeClaims)) {
++              return jsonError('TOKEN_REPLAY', 'Host identity token has already been redeemed', 403)
++            }
++          } catch {
++            return jsonError('REDEMPTION_UNAVAILABLE', 'Host identity redemption is unavailable', 503)
++          }
++        }
+ 
+         // Extract identity fields from the JWT claims
+         const sub =
+@@ -456,6 +494,7 @@ export const Route = createFileRoute('/api/widget/identify')({
+         const [sessionInfo, votedPostIdSet] = await Promise.all([
+           findOrCreateSession(userId, request, {
+             teammate: isTeamMember(principalRecord.role),
++            fresh: Boolean(nativeClaims),
+           }),
+           getAllUserVotedPostIds(principalId),
+         ])
+@@ -466,6 +505,10 @@ export const Route = createFileRoute('/api/widget/identify')({
+         // the portal widget branch. Identify is verified-only, so every
+         // identified session carries hmacVerified=true.
+         await recordWidgetSessionProvenance(sessionInfo.id, true)
++        if (nativeClaims) {
++          const { bindNativeHostSession } = await import('@/lib/server/widget/native-host-token')
++          await bindNativeHostSession(sessionInfo.id, principalId, nativeClaims)
++        }
+ 
+         // No Set-Cookie — the widget sends the token as Bearer header.
+         // An unsigned cookie here would poison Better Auth's signed-cookie
+@@ -478,6 +521,9 @@ export const Route = createFileRoute('/api/widget/identify')({
+           null
+ 
+         return Response.json({
++          ...(nativeClaims ? {nativeAck: {
++            ...nativeClaims.ipc, audience: nativeClaims.aud, jti: nativeClaims.jti,
++          }} : {}),
+           sessionToken: sessionInfo.token,
+           user: {
+             id: userRecord.id,
+diff --git a/packages/db/drizzle/0293_ipc_native_bridge.sql b/packages/db/drizzle/0293_ipc_native_bridge.sql
+new file mode 100644
+index 000000000..61a45e16c
+--- /dev/null
++++ b/packages/db/drizzle/0293_ipc_native_bridge.sql
+@@ -0,0 +1,34 @@
++CREATE TABLE IF NOT EXISTS ipc_native_redemption (
++  jti text PRIMARY KEY,
++  expires_at timestamptz NOT NULL,
++  redeemed_at timestamptz NOT NULL DEFAULT now()
++);
++--> statement-breakpoint
++CREATE INDEX IF NOT EXISTS ipc_native_redemption_expiry ON ipc_native_redemption(expires_at);
++--> statement-breakpoint
++CREATE TABLE IF NOT EXISTS ipc_native_submission (
++  principal_id text NOT NULL,
++  submission_id text NOT NULL,
++  body_digest text NOT NULL CHECK (body_digest ~ '^[a-f0-9]{64}$'),
++  ticket_id text NOT NULL,
++  created_at timestamptz NOT NULL DEFAULT now(),
++  PRIMARY KEY (principal_id, submission_id)
++);
++--> statement-breakpoint
++CREATE TABLE IF NOT EXISTS ipc_native_session_binding (
++  session_id text PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
++  principal_id text NOT NULL,
++  host_origin text NOT NULL,
++  audience text NOT NULL,
++  jti text NOT NULL UNIQUE REFERENCES ipc_native_redemption(jti)
++);
++--> statement-breakpoint
++CREATE TABLE IF NOT EXISTS ipc_native_retirement (
++  token_sha256 text PRIMARY KEY CHECK (token_sha256 ~ '^[a-f0-9]{64}$'),
++  host_origin text NOT NULL,
++  audience text NOT NULL,
++  operation_id uuid NOT NULL,
++  expires_at timestamptz NOT NULL
++);
++--> statement-breakpoint
++CREATE INDEX IF NOT EXISTS ipc_native_retirement_expiry ON ipc_native_retirement(expires_at);
+diff --git a/packages/db/drizzle/meta/_journal.json b/packages/db/drizzle/meta/_journal.json
+index c35fa1c8c..433150d64 100644
+--- a/packages/db/drizzle/meta/_journal.json
++++ b/packages/db/drizzle/meta/_journal.json
+@@ -1891,6 +1891,20 @@
+       "when": 1789987200008,
+       "tag": "0292_account_profile_sync",
+       "breakpoints": true
++    },
++    {
++      "idx": 270,
++      "version": "7",
++      "when": 1791244800001,
++      "tag": "0293_ipc_native_bridge",
++      "breakpoints": true
++    },
++    {
++      "idx": 271,
++      "version": "7",
++      "when": 1791244800002,
++      "tag": "0294_native_evidence",
++      "breakpoints": true
+     }
+   ]
+ }
+diff --git a/packages/db/src/schema/index.ts b/packages/db/src/schema/index.ts
+index a1a6cdce0..47e073c84 100644
+--- a/packages/db/src/schema/index.ts
++++ b/packages/db/src/schema/index.ts
+@@ -72,3 +72,4 @@ export * from './labs'
+ export * from './slack'
+ export * from './integration-deliveries'
+ export * from './integration-sync'
++export * from './ipc-native'
+diff --git a/packages/db/src/schema/ipc-native.ts b/packages/db/src/schema/ipc-native.ts
+new file mode 100644
+index 000000000..c711f1fe8
+--- /dev/null
++++ b/packages/db/src/schema/ipc-native.ts
+@@ -0,0 +1,35 @@
++import { pgTable, text, timestamp, uuid, index, primaryKey, check } from 'drizzle-orm/pg-core'
++import { sql } from 'drizzle-orm'
++import { session } from './auth'
++
++export const ipcNativeRedemption = pgTable('ipc_native_redemption', {
++  jti: text('jti').primaryKey(),
++  expiresAt: timestamp('expires_at', {withTimezone: true}).notNull(),
++  redeemedAt: timestamp('redeemed_at', {withTimezone: true}).defaultNow().notNull(),
++}, (t) => [index('ipc_native_redemption_expiry').on(t.expiresAt)])
++
++export const ipcNativeSubmission = pgTable('ipc_native_submission', {
++  principalId: text('principal_id').notNull(),
++  submissionId: text('submission_id').notNull(),
++  bodyDigest: text('body_digest').notNull(),
++  ticketId: text('ticket_id').notNull(),
++  createdAt: timestamp('created_at', {withTimezone: true}).defaultNow().notNull(),
++}, (t) => [primaryKey({columns: [t.principalId, t.submissionId]}),
++  check('ipc_native_submission_body_digest_check', sql`${t.bodyDigest} ~ '^[a-f0-9]{64}$'`)])
++
++export const ipcNativeSessionBinding = pgTable('ipc_native_session_binding', {
++  sessionId: text('session_id').primaryKey().references(() => session.id, {onDelete: 'cascade'}),
++  principalId: text('principal_id').notNull(),
++  hostOrigin: text('host_origin').notNull(),
++  audience: text('audience').notNull(),
++  jti: text('jti').notNull().unique().references(() => ipcNativeRedemption.jti),
++})
++
++export const ipcNativeRetirement = pgTable('ipc_native_retirement', {
++  tokenSha256: text('token_sha256').primaryKey(),
++  hostOrigin: text('host_origin').notNull(),
++  audience: text('audience').notNull(),
++  operationId: uuid('operation_id').notNull(),
++  expiresAt: timestamp('expires_at', {withTimezone: true}).notNull(),
++}, t => [index('ipc_native_retirement_expiry').on(t.expiresAt),
++  check('ipc_native_retirement_token_sha256_check', sql`${t.tokenSha256} ~ '^[a-f0-9]{64}$'`)])
+diff --git a/packages/widget/__tests__/native-source.test.ts b/packages/widget/__tests__/native-source.test.ts
+new file mode 100644
+index 000000000..00dcc4d3f
+--- /dev/null
++++ b/packages/widget/__tests__/native-source.test.ts
+@@ -0,0 +1,64 @@
++// @vitest-environment happy-dom
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { createSDK } from '../src/core/sdk'
++import { createBridge } from '../src/core/postmessage'
++const origin = 'https://feedback.example.test'
++const source = {postMessage: vi.fn()} as unknown as Window
++vi.mock('../src/core/panel', () => ({createPanel: () => ({iframe: document.createElement('iframe'),
++  show() {}, hide() {}, destroy() {}, setPlacement() {}, setExpanded() {}})}))
++beforeEach(() => {
++  document.body.innerHTML = ''; document.head.innerHTML = ''
++  vi.spyOn(HTMLIFrameElement.prototype, 'contentWindow', 'get').mockReturnValue(source)
++  vi.stubGlobal('matchMedia', vi.fn(() => ({matches: false, addEventListener() {}, removeEventListener() {}})))
++  vi.stubGlobal('fetch', vi.fn(async () => ({ok: true, json: async () => ({})})))
++  vi.mocked(source.postMessage).mockClear()
++})
++afterEach(() => {vi.restoreAllMocks(); vi.unstubAllGlobals()})
++function receive(type: string, exact = false, rest = {}) {
++  window.dispatchEvent(new MessageEvent('message', {origin, source: exact ? source : window,
++    data: {type, ...rest}}))
++}
++describe('native iframe source admission', () => {
++  it('rejects native ACK and capture envelopes from same-origin sibling frames', () => {
++    const iframe = document.createElement('iframe')
++    const bridge = createBridge({origin, getIframe: () => iframe})
++    const received = vi.fn(); bridge.onMessage(received)
++    for (const name of ['native-result', 'native-capture-request']) {
++      receive('quackback:event', false, {name, payload: {success: true}})
++      expect(received).not.toHaveBeenCalled()
++    }
++    receive('quackback:event', true, {name: 'native-result', payload: {success: true}})
++    receive('quackback:event', true, {name: 'native-capture-request', payload: {}})
++    expect(received).toHaveBeenCalledTimes(2)
++    bridge.dispose()
++  })
++  it('keeps native commands pending after forged ordinary readiness and flushes on exact iframe readiness', () => {
++    const sdk = createSDK(); sdk.dispatch('init', {instanceUrl: origin})
++    sdk.dispatch('native', {type: 'identify', payload: {ssoToken: 'test-only-SSO'}})
++    receive('quackback:ready')
++    const nativeCalls = () => vi.mocked(source.postMessage).mock.calls.filter(([data]) => data.type === 'quackback:native')
++    expect(nativeCalls()).toHaveLength(0)
++    sdk.dispatch('native', {type: 'list-tickets', payload: {}})
++    expect(nativeCalls()).toHaveLength(0)
++    receive('quackback:ready', true)
++    expect(nativeCalls()).toHaveLength(2)
++    sdk.dispatch('native', {type: 'read-ticket', payload: {ticketId: 'ticket-test'}})
++    expect(nativeCalls()).toHaveLength(3)
++    sdk.dispatch('destroy')
++  })
++})
++
++
++it('queues abort through exact iframe readiness and admits its ACK only from that iframe',()=>{
++  const sdk=createSDK();sdk.dispatch('init',{instanceUrl:origin})
++  const command={contract:'iplaycafe.feedback/native-1',operationId:crypto.randomUUID(),type:'abort-evidence',payload:{reportId:'brp_00000000-0000-4000-8000-000000000001'}}
++  const ack=vi.fn();sdk.dispatch('on','native-result',ack)
++  sdk.dispatch('native',command);receive('quackback:ready')
++  expect(vi.mocked(source.postMessage).mock.calls.some(([data])=>data.type==='quackback:native')).toBe(false)
++  receive('quackback:ready',true)
++  expect(source.postMessage).toHaveBeenCalledWith({type:'quackback:native',data:command},origin)
++  const payload={...command,success:true,audience:origin,hostOrigin:window.location.origin,result:{reportId:command.payload.reportId,aborted:true}}
++  receive('quackback:event',false,{name:'native-result',payload});expect(ack).not.toHaveBeenCalled()
++  receive('quackback:event',true,{name:'native-result',payload});expect(ack).toHaveBeenCalledWith(payload)
++  sdk.dispatch('destroy')
++})
+diff --git a/packages/widget/__tests__/sdk.test.ts b/packages/widget/__tests__/sdk.test.ts
+index ae3feec08..d4fb17aec 100644
+--- a/packages/widget/__tests__/sdk.test.ts
++++ b/packages/widget/__tests__/sdk.test.ts
+@@ -22,6 +22,17 @@ function fireReady() {
+ }
+ 
+ describe('sdk', () => {
++  it('does not replay a pre-ready native identity after destroy and re-init', () => {
++    const { postMessage } = stubIframe()
++    const sdk = createSDK()
++    sdk.dispatch('init', { instanceUrl: ORIGIN })
++    sdk.dispatch('native', {contract: 'iplaycafe.feedback/native-1', operationId: 'old', type: 'identify', payload: {ssoToken: 'fake'}})
++    sdk.dispatch('destroy')
++    sdk.dispatch('init', { instanceUrl: ORIGIN })
++    fireReady()
++    expect(postMessage.mock.calls.some(([message]) => message.type === 'quackback:native')).toBe(false)
++    sdk.dispatch('destroy')
++  })
+   beforeEach(() => {
+     document.body.innerHTML = ''
+     document.head.innerHTML = ''
+diff --git a/packages/widget/src/core/postmessage.ts b/packages/widget/src/core/postmessage.ts
+index 6e60c1207..63fcfe34c 100644
+--- a/packages/widget/src/core/postmessage.ts
++++ b/packages/widget/src/core/postmessage.ts
+@@ -1,6 +1,7 @@
+ export type InboundMessage =
+   | { type: 'quackback:init'; data?: unknown }
+   | { type: 'quackback:identify'; data: unknown }
++  | { type: 'quackback:native'; data: unknown }
+   | { type: 'quackback:device'; data: string }
+   | { type: 'quackback:metadata'; data: Record<string, string> }
+   | { type: 'quackback:open'; data?: unknown }
+@@ -24,18 +25,26 @@ export interface BridgeOptions {
+ 
+ export interface Bridge {
+   send(type: InboundMessage['type'], data?: unknown): void
++  /** Native readiness must come from this exact iframe, not a sibling origin. */
++  isNativeReady(): boolean
+   onMessage(handler: (msg: OutboundMessage) => void): () => void
+   dispose(): void
+ }
+ 
+ export function createBridge(opts: BridgeOptions): Bridge {
+   const handlers = new Set<(msg: OutboundMessage) => void>()
++  let nativeReady = false
+ 
+   const listener = (event: MessageEvent) => {
+     if (event.origin !== opts.origin) return
+     const msg = event.data
+     if (!msg || typeof msg !== 'object' || typeof (msg as { type?: unknown }).type !== 'string')
+       return
++    const expectedSource = opts.getIframe()?.contentWindow
++    const exactSource = !!expectedSource && event.source === expectedSource
++    if (msg.type === 'quackback:ready' && exactSource) nativeReady = true
++    if (msg.type === 'quackback:event' &&
++        (msg.name === 'native-result' || msg.name === 'native-capture-request') && !exactSource) return
+     for (const h of handlers) {
+       try {
+         h(msg as OutboundMessage)
+@@ -47,6 +56,7 @@ export function createBridge(opts: BridgeOptions): Bridge {
+   window.addEventListener('message', listener)
+ 
+   return {
++    isNativeReady: () => nativeReady,
+     send(type, data) {
+       const iframe = opts.getIframe()
+       if (!iframe?.contentWindow) return
+diff --git a/packages/widget/src/core/sdk.ts b/packages/widget/src/core/sdk.ts
+index d4871db25..a1991ac09 100644
+--- a/packages/widget/src/core/sdk.ts
++++ b/packages/widget/src/core/sdk.ts
+@@ -27,6 +27,7 @@ type Command =
+   | 'metadata'
+   | 'on'
+   | 'off'
++  | 'native'
+ 
+ export interface SDK {
+   dispatch(command: Command, arg1?: unknown, arg2?: unknown): unknown
+@@ -56,6 +57,7 @@ export function createSDK(): SDK {
+   let pendingIdentify: unknown = null
+   let pendingIdentifyPresent = false
+   let pendingOpen: OpenOptions | null = null
++  const pendingNative: unknown[] = []
+   let panelOpen = false
+   let currentUser: WidgetUser | null = null
+   // Effective launcher/panel corner: the init `placement` until the server
+@@ -95,6 +97,8 @@ export function createSDK(): SDK {
+           pendingOpen = null
+         }
+         sendMobileState()
++        if (bridge!.isNativeReady())
++          for (const command of pendingNative.splice(0)) bridge!.send('quackback:native', command)
+         emitter.emit('ready', {})
+         break
+       case 'quackback:close':
+@@ -329,6 +333,18 @@ export function createSDK(): SDK {
+       case 'identify':
+         sendIdentity((a as Identity | undefined) ?? { anonymous: true })
+         return
++      case 'native':
++        if (!config) return
++        if (ready && bridge?.isNativeReady()) bridge.send('quackback:native', a)
++        else {
++          // A bounded queue avoids unbounded pre-ready work. Identity changes
++          // replace all queued commands so logout cannot replay an old identify.
++          if ((a as {type?: string})?.type === 'identify' || (a as {type?: string})?.type === 'logout') pendingNative.length = 0
++          if (pendingNative.length >= 16) throw new Error('Quackback: native queue is full')
++          pendingNative.push(a)
++          ensurePanel()
++        }
++        return
+       case 'logout':
+         panel?.hide()
+         launcher?.setOpen(false)
+@@ -412,6 +428,7 @@ export function createSDK(): SDK {
+         pendingIdentify = null
+         pendingIdentifyPresent = false
+         pendingOpen = null
++        pendingNative.length = 0
+         panelOpen = false
+         currentUser = null
+         placement = 'right'
+diff --git a/packages/widget/src/index.ts b/packages/widget/src/index.ts
+index d2d9cc99e..0f3ced017 100644
+--- a/packages/widget/src/index.ts
++++ b/packages/widget/src/index.ts
+@@ -37,6 +37,14 @@ export const Quackback = {
+   logout(): void {
+     sdk.dispatch('logout')
+   },
++  native(command: {
++    contract: 'iplaycafe.feedback/native-1'
++    operationId: string
++    type: string
++    payload: Record<string, unknown>
++  }): void {
++    sdk.dispatch('native', command)
++  },
+   open(options?: OpenOptions): void {
+     sdk.dispatch('open', options)
+   },
+diff --git a/packages/widget/src/types.ts b/packages/widget/src/types.ts
+index dd650110f..2ee450f50 100644
+--- a/packages/widget/src/types.ts
++++ b/packages/widget/src/types.ts
+@@ -94,6 +94,9 @@ export interface WidgetUser {
+  * which view is showing so subscribers can react to deep-link flows.
+  */
+ export interface EventMap {
++  'native-result': {contract: 'iplaycafe.feedback/native-1'; operationId: string; type: string;
++    success: boolean; audience: string; hostOrigin: string; result?: unknown; error?: string}
++  'native-capture-request': {contract: 'iplaycafe.feedback/native-1'; audience: string; hostOrigin: string}
+   ready: Record<string, never>
+   open: {
+     view?: 'home' | 'new-post' | 'changelog' | 'help'

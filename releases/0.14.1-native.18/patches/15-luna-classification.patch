@@ -1,0 +1,420 @@
+diff --git a/apps/web/src/lib/server/domains/ai/classification-model-options.ts b/apps/web/src/lib/server/domains/ai/classification-model-options.ts
+new file mode 100644
+index 00000000..6476a326
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/classification-model-options.ts
+@@ -0,0 +1,19 @@
++/**
++ * Preserve the existing classification option object for every model except
++ * the measured Chat Completions model that rejects `max_tokens`.
++ */
++export function classificationModelOptions(
++  model: string,
++  options: Record<string, unknown>
++): Record<string, unknown> {
++  if (model !== 'gpt-6-luna') return options
++
++  const providerOptions = { ...options }
++  delete providerOptions.max_tokens
++  delete providerOptions.reasoning
++  if (typeof options.max_tokens === 'number') {
++    providerOptions.max_completion_tokens = options.max_tokens
++  }
++  providerOptions.reasoning_effort = 'none'
++  return providerOptions
++}
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/classification-model-options.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/classification-model-options.test.ts
+new file mode 100644
+index 00000000..406631f6
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/__tests__/classification-model-options.test.ts
+@@ -0,0 +1,31 @@
++import { describe, expect, it } from 'vitest'
++import { classificationModelOptions } from '../classification-model-options'
++
++describe('classificationModelOptions', () => {
++  it('keeps every non-Luna model option unchanged', () => {
++    const options = {
++      max_tokens: 100,
++      reasoning: { effort: 'high' },
++      provider: { require_parameters: true },
++    }
++    expect(classificationModelOptions('other-model', options)).toBe(options)
++  })
++
++  it('uses Luna Chat Completions fields and retains unrelated provider options', () => {
++    const result = classificationModelOptions('gpt-6-luna', {
++      max_tokens: 100,
++      reasoning: { effort: 'high' },
++      reasoning_effort: 'high',
++      response_format: { type: 'json_schema' },
++      provider: { require_parameters: true, data_collection: 'deny' },
++    })
++    expect(result).toEqual({
++      max_completion_tokens: 100,
++      reasoning_effort: 'none',
++      response_format: { type: 'json_schema' },
++      provider: { require_parameters: true, data_collection: 'deny' },
++    })
++    expect(result).not.toHaveProperty('max_tokens')
++    expect(result).not.toHaveProperty('reasoning')
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/ai/structured-chat.ts b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+index 63f02ec1..bd427fe2 100644
+--- a/apps/web/src/lib/server/domains/ai/structured-chat.ts
++++ b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+@@ -30,6 +30,7 @@ import {
+   stripCodeFences,
+   structuredOutputProviderOptions,
+ } from './config'
++import { classificationModelOptions } from './classification-model-options'
+ 
+ const log = logger.child({ component: 'ai-structured-chat' })
+ 
+@@ -124,11 +125,11 @@ export async function structuredChat<S extends z.ZodType>(
+         ...common,
+         systemPrompts: input.systemPrompts,
+         outputSchema: input.schema,
+-        modelOptions: {
++        modelOptions: classificationModelOptions(input.model, {
+           max_tokens: input.maxTokens,
+           ...structuredOutputProviderOptions(),
+           ...reasoningEffortProviderOptions(),
+-        },
++        }),
+       } as never)) as z.infer<S>
+     } catch (err) {
+       if (!isResponseFormatRejection(err)) throw err
+@@ -146,12 +147,12 @@ export async function structuredChat<S extends z.ZodType>(
+       ...getAIChatOptions(),
+       ...common,
+       systemPrompts: [...input.systemPrompts, describeSchema(input.schema)],
+-      modelOptions: {
++      modelOptions: classificationModelOptions(input.model, {
+         max_tokens: input.maxTokens,
+         ...(lvl === 'json_object' ? { response_format: { type: 'json_object' } } : {}),
+         ...structuredOutputProviderOptions(),
+         ...reasoningEffortProviderOptions(),
+-      },
++      }),
+     } as never) as unknown as Promise<string>
+ 
+   let text: string
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+index 45eb164a..504dfbb0 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+@@ -13,6 +13,7 @@ const hoisted = vi.hoisted(() => ({
+   cfg: {
+     openaiBaseUrl: 'https://llm.internal/v1' as string | null,
+     aiRequireParameters: undefined,
++    aiReasoningEffort: undefined as string | undefined,
+   },
+ }))
+ 
+@@ -32,6 +33,9 @@ vi.mock('@/lib/server/config', () => ({
+     get aiRequireParameters() {
+       return hoisted.cfg.aiRequireParameters
+     },
++    get aiReasoningEffort() {
++      return hoisted.cfg.aiReasoningEffort
++    },
+   },
+ }))
+ vi.mock('@/lib/server/logger', () => {
+@@ -74,6 +78,7 @@ beforeEach(() => {
+   hoisted.warn.mockReset()
+   hoisted.cfg.openaiBaseUrl = 'https://llm.internal/v1'
+   hoisted.cfg.aiRequireParameters = undefined
++  hoisted.cfg.aiReasoningEffort = undefined
+   resetStructuredFallbackMemory()
+ })
+ 
+@@ -242,6 +247,33 @@ describe('structuredChat', () => {
+     })
+   })
+ 
++  it('uses Luna options on the schema, json_object, and prompt-only paths', async () => {
++    hoisted.cfg.openaiBaseUrl = 'https://openrouter.ai/api/v1'
++    hoisted.cfg.aiReasoningEffort = 'high'
++    hoisted.chat
++      .mockRejectedValueOnce(rejection('response_format json_schema not supported'))
++      .mockRejectedValueOnce(rejection('response_format json_object not supported'))
++      .mockResolvedValueOnce('{"sentiment":"positive","confidence":1}')
++
++    await expect(structuredChat({ ...base, model: 'gpt-6-luna' })).resolves.toEqual({
++      sentiment: 'positive',
++      confidence: 1,
++    })
++
++    const requests = hoisted.chat.mock.calls.map(([request]) => request)
++    expect(requests).toHaveLength(3)
++    for (const request of requests) {
++      expect(request.modelOptions).toHaveProperty('max_completion_tokens', 500)
++      expect(request.modelOptions).toHaveProperty('reasoning_effort', 'none')
++      expect(request.modelOptions).not.toHaveProperty('max_tokens')
++      expect(request.modelOptions).not.toHaveProperty('reasoning')
++      expect(request.modelOptions.provider).toEqual({ require_parameters: true })
++    }
++    expect(requests[0].modelOptions).not.toHaveProperty('response_format')
++    expect(requests[1].modelOptions.response_format).toEqual({ type: 'json_object' })
++    expect(requests[2].modelOptions).not.toHaveProperty('response_format')
++  })
++
+   it('passes middleware to both attempts', async () => {
+     const mw = [{ name: 'usage' }]
+     hoisted.chat
+diff --git a/apps/web/src/lib/server/domains/conversation/conversation.spam-filter.ts b/apps/web/src/lib/server/domains/conversation/conversation.spam-filter.ts
+index 280feda9..e288ef51 100644
+--- a/apps/web/src/lib/server/domains/conversation/conversation.spam-filter.ts
++++ b/apps/web/src/lib/server/domains/conversation/conversation.spam-filter.ts
+@@ -31,6 +31,7 @@ import { openaiCompatibleText } from '@tanstack/ai-openai/compatible'
+ import { z } from 'zod'
+ import type { ConversationId } from '@quackback/ids'
+ import { config } from '@/lib/server/config'
++import { classificationModelOptions } from '@/lib/server/domains/ai/classification-model-options'
+ import {
+   isAiClientConfigured,
+   structuredOutputProviderOptions,
+@@ -150,7 +151,10 @@ export async function classifyInboundAsSpam(input: ClassifyInboundSpamInput): Pr
+       ],
+       outputSchema: VerdictSchema,
+       stream: false,
+-      modelOptions: { max_tokens: 100, ...structuredOutputProviderOptions() },
++      modelOptions: classificationModelOptions(model, {
++        max_tokens: 100,
++        ...structuredOutputProviderOptions(),
++      }),
+       middleware: [
+         createUsageLoggingMiddleware({
+           pipelineStep: 'spam_classification',
+diff --git a/apps/web/src/lib/server/domains/conversation/__tests__/conversation-spam-filter.test.ts b/apps/web/src/lib/server/domains/conversation/__tests__/conversation-spam-filter.test.ts
+index 40221c86..f68c1c91 100644
+--- a/apps/web/src/lib/server/domains/conversation/__tests__/conversation-spam-filter.test.ts
++++ b/apps/web/src/lib/server/domains/conversation/__tests__/conversation-spam-filter.test.ts
+@@ -82,6 +82,22 @@ describe('classifyInboundAsSpam', () => {
+     await expect(classifyInboundAsSpam(input)).resolves.toBe(false)
+   })
+ 
++  it('uses measured Luna request options only for the exact Luna model', async () => {
++    mockGetChatModel.mockReturnValue('gpt-6-luna')
++    await classifyInboundAsSpam(input)
++    expect(mockChat.mock.calls[0]?.[0].modelOptions).toEqual({
++      max_completion_tokens: 100,
++      reasoning_effort: 'none',
++    })
++    expect(mockChat.mock.calls[0]?.[0].modelOptions).not.toHaveProperty('max_tokens')
++  })
++
++  it('leaves non-Luna classification request options unchanged', async () => {
++    mockGetChatModel.mockReturnValue('other-classification-model')
++    await classifyInboundAsSpam(input)
++    expect(mockChat.mock.calls[0]?.[0].modelOptions).toEqual({ max_tokens: 100 })
++  })
++
+   it('bypasses classification entirely for a trusted sender', async () => {
+     mockGetSpamFilterConfig.mockResolvedValue({
+       trustedSenders: ['example.com'],
+diff --git a/apps/web/src/lib/server/domains/conversation/__tests__/conversation-spam-filter.luna-wire.test.ts b/apps/web/src/lib/server/domains/conversation/__tests__/conversation-spam-filter.luna-wire.test.ts
+new file mode 100644
+index 00000000..681c2242
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/conversation/__tests__/conversation-spam-filter.luna-wire.test.ts
+@@ -0,0 +1,106 @@
++// @vitest-environment node
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const fixture = vi.hoisted(() => ({
++  config: {
++    openaiApiKey: 'synthetic-classification-key',
++    openaiBaseUrl: 'https://openrouter.ai/api/v1',
++    openaiDefaultHeaders: '{"x-classification-test":"synthetic-classification-header"}',
++    aiRequireParameters: undefined as boolean | undefined,
++  },
++  model: 'gpt-6-luna',
++  log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
++}))
++
++vi.mock('@/lib/server/config', () => ({ config: fixture.config }))
++vi.mock('@/lib/server/domains/ai/models', () => ({
++  getChatModel: () => fixture.model,
++}))
++vi.mock('@/lib/server/domains/settings/tier-enforce', () => ({
++  enforceAiTokenBudget: async () => {},
++}))
++vi.mock('@/lib/server/domains/settings/settings.spam', () => ({
++  getSpamFilterConfig: async () => ({ trustedSenders: [], aiClassifier: true }),
++  isTrustedSender: () => false,
++}))
++vi.mock('@/lib/server/domains/ai/usage-middleware', () => ({
++  createUsageLoggingMiddleware: () => ({ name: 'synthetic-usage-middleware' }),
++}))
++vi.mock('@/lib/server/logger', () => ({
++  logger: { child: () => fixture.log },
++}))
++
++import { classifyInboundAsSpam } from '../conversation.spam-filter'
++
++const input = {
++  senderEmail: 'synthetic@example.test',
++  subject: 'Synthetic classification request',
++  content: 'Synthetic request body for the installed SDK wire test.',
++}
++
++beforeEach(() => {
++  fixture.config.openaiApiKey = 'synthetic-classification-key'
++  fixture.config.openaiBaseUrl = 'https://openrouter.ai/api/v1'
++  fixture.config.openaiDefaultHeaders =
++    '{"x-classification-test":"synthetic-classification-header"}'
++  fixture.config.aiRequireParameters = undefined
++})
++
++describe('classification request options on the installed OpenAI-compatible SDK', () => {
++  afterEach(() => vi.restoreAllMocks())
++
++  it('uses Luna completion options while retaining schema, gateway headers, and no-train routing', async () => {
++    fixture.model = 'gpt-6-luna'
++    const originalFetch = globalThis.fetch
++    const observed: Array<{ request: Request; body: Record<string, unknown> }> = []
++    globalThis.fetch = Object.assign(
++      async (input: string | URL | Request, init?: RequestInit) => {
++        const request = new Request(input, init)
++        observed.push({ request, body: await request.clone().json() })
++        return Response.json({ error: { message: 'synthetic transport stop' } }, { status: 400 })
++      },
++      { preconnect: originalFetch.preconnect }
++    )
++    try {
++      await expect(classifyInboundAsSpam(input)).resolves.toBe(false)
++    } finally {
++      globalThis.fetch = originalFetch
++    }
++
++    expect(observed).toHaveLength(1)
++    const { request, body } = observed[0]!
++    expect(request.url).toBe('https://openrouter.ai/api/v1/chat/completions')
++    expect(request.headers.get('authorization')).toBe('Bearer synthetic-classification-key')
++    expect(request.headers.get('x-classification-test')).toBe('synthetic-classification-header')
++    expect(body).toHaveProperty('max_completion_tokens', 100)
++    expect(body).not.toHaveProperty('max_tokens')
++    expect(body).toHaveProperty('reasoning_effort', 'none')
++    expect(body.response_format).toMatchObject({ type: 'json_schema' })
++    expect(body.provider).toEqual({ require_parameters: true, data_collection: 'deny' })
++  })
++
++  it('leaves other classification models on their existing max_tokens wire shape', async () => {
++    fixture.model = 'synthetic-legacy-classifier'
++    const originalFetch = globalThis.fetch
++    const observed: Array<Record<string, unknown>> = []
++    globalThis.fetch = Object.assign(
++      async (input: string | URL | Request, init?: RequestInit) => {
++        const request = new Request(input, init)
++        observed.push(await request.clone().json())
++        return Response.json({ error: { message: 'synthetic transport stop' } }, { status: 400 })
++      },
++      { preconnect: originalFetch.preconnect }
++    )
++    try {
++      await expect(classifyInboundAsSpam(input)).resolves.toBe(false)
++    } finally {
++      globalThis.fetch = originalFetch
++    }
++
++    expect(observed).toHaveLength(1)
++    expect(observed[0]).toHaveProperty('max_tokens', 100)
++    expect(observed[0]).not.toHaveProperty('max_completion_tokens')
++    expect(observed[0]).not.toHaveProperty('reasoning_effort')
++    expect(observed[0]?.provider).toEqual({ require_parameters: true, data_collection: 'deny' })
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/conversation-attributes/classification-core.ts b/apps/web/src/lib/server/domains/conversation-attributes/classification-core.ts
+index bae3a3ed..19dea226 100644
+--- a/apps/web/src/lib/server/domains/conversation-attributes/classification-core.ts
++++ b/apps/web/src/lib/server/domains/conversation-attributes/classification-core.ts
+@@ -19,6 +19,7 @@ import { chat } from '@tanstack/ai'
+ import { openaiCompatibleText } from '@tanstack/ai-openai/compatible'
+ import { z } from 'zod'
+ import { config } from '@/lib/server/config'
++import { classificationModelOptions } from '@/lib/server/domains/ai/classification-model-options'
+ import { structuredOutputProviderOptions } from '@/lib/server/domains/ai/config'
+ import { createUsageLoggingMiddleware } from '@/lib/server/domains/ai/usage-middleware'
+ 
+@@ -155,7 +156,10 @@ export async function runClassificationCall(
+     messages: [{ role: 'user', content: userContent }],
+     outputSchema: ClassificationResponseSchema,
+     stream: false,
+-    modelOptions: { max_tokens: 1500, ...structuredOutputProviderOptions() },
++    modelOptions: classificationModelOptions(model, {
++      max_tokens: 1500,
++      ...structuredOutputProviderOptions(),
++    }),
+     middleware: [
+       createUsageLoggingMiddleware({
+         pipelineStep: 'classification',
+diff --git a/apps/web/src/lib/server/domains/conversation-attributes/attribute-description-draft.service.ts b/apps/web/src/lib/server/domains/conversation-attributes/attribute-description-draft.service.ts
+index 6b531ac1..c5f78354 100644
+--- a/apps/web/src/lib/server/domains/conversation-attributes/attribute-description-draft.service.ts
++++ b/apps/web/src/lib/server/domains/conversation-attributes/attribute-description-draft.service.ts
+@@ -23,6 +23,7 @@ import { chat } from '@tanstack/ai'
+ import { openaiCompatibleText } from '@tanstack/ai-openai/compatible'
+ import { z } from 'zod'
+ import { config } from '@/lib/server/config'
++import { classificationModelOptions } from '@/lib/server/domains/ai/classification-model-options'
+ import {
+   isAiClientConfigured,
+   structuredOutputProviderOptions,
+@@ -112,7 +113,10 @@ export async function draftAttributeDescriptions(
+     messages: [{ role: 'user', content: userContent }],
+     outputSchema: DraftDescriptionsSchema,
+     stream: false,
+-    modelOptions: { max_tokens: 1500, ...structuredOutputProviderOptions() },
++    modelOptions: classificationModelOptions(model, {
++      max_tokens: 1500,
++      ...structuredOutputProviderOptions(),
++    }),
+     middleware: [
+       createUsageLoggingMiddleware({
+         pipelineStep: 'classification',
+diff --git a/apps/web/src/lib/server/domains/conversation-attributes/__tests__/attribute-description-draft.service.test.ts b/apps/web/src/lib/server/domains/conversation-attributes/__tests__/attribute-description-draft.service.test.ts
+index cfeab5af..a1f78571 100644
+--- a/apps/web/src/lib/server/domains/conversation-attributes/__tests__/attribute-description-draft.service.test.ts
++++ b/apps/web/src/lib/server/domains/conversation-attributes/__tests__/attribute-description-draft.service.test.ts
+@@ -78,6 +78,16 @@ describe('draftAttributeDescriptions: gating', () => {
+ })
+ 
+ describe('draftAttributeDescriptions: happy path', () => {
++  it('uses Luna completion options for the classification-model draft call', async () => {
++    mockGetChatModel.mockReturnValue('gpt-6-luna')
++    mockChat.mockResolvedValue({ attributeDescription: 'desc', options: [{ label: 'Billing' }] })
++    await draftAttributeDescriptions({ label: 'Issue type', optionLabels: ['Billing'] })
++    expect(mockChat.mock.calls[0]?.[0].modelOptions).toEqual({
++      max_completion_tokens: 1500,
++      reasoning_effort: 'none',
++    })
++  })
++
+   it('returns an attribute description and one description per option, in the given order', async () => {
+     mockChat.mockResolvedValue({
+       attributeDescription: 'What kind of issue the customer has.',
+diff --git a/apps/web/src/lib/server/domains/conversation-attributes/__tests__/ai-classification.service.test.ts b/apps/web/src/lib/server/domains/conversation-attributes/__tests__/ai-classification.service.test.ts
+index 126bb31f..d407614c 100644
+--- a/apps/web/src/lib/server/domains/conversation-attributes/__tests__/ai-classification.service.test.ts
++++ b/apps/web/src/lib/server/domains/conversation-attributes/__tests__/ai-classification.service.test.ts
+@@ -440,4 +440,16 @@ describe('classifyConversationAttributes: happy path', () => {
+     const insertedValues = mockInsertValues.mock.calls[0][0]
+     expect(insertedValues.principalId).toBe('principal_quinn')
+   })
++
++  it('uses Luna completion options in the shared attribute-classification core', async () => {
++    mockGetChatModel.mockReturnValue('gpt-6-luna')
++    mockChat.mockResolvedValue({ results: [] })
++
++    await classifyConversationAttributes(conversationId, { trigger: 'handoff' })
++
++    expect(mockChat.mock.calls[0]?.[0].modelOptions).toEqual({
++      max_completion_tokens: 1500,
++      reasoning_effort: 'none',
++    })
++  })
+ })
