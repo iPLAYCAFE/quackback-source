@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "releaseId": "0.15.0-void.unified18-20261116",
+  "upstream": {
+    "repository": "https://github.com/QuackbackIO/quackback.git",
+    "tag": "v0.15.0",
+    "commit": "fe575ec7e4fdbdc506c37581f63f6f6fe0fa8d70",
+    "appVersion": "0.15.0",
+    "widgetSdkVersion": "0.1.6",
+    "bunLockSha256": "7eade1bd2963333a0f135bc8870239a36b245aa7ecce45f9b8724c0ffbe63354"
+  },
+  "toolchain": {
+    "bun": "1.4.0",
+    "buildImage": "oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6",
+    "runImage": "oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb",
+    "dockerfile": "apps/web/Dockerfile"
+  },
+  "overlayProfile": "unified18-workers-ai",
+  "servedImageDigest": "sha256:f366c34e58e4478aa5d499ab0662aeedeff4e40f9febe61ae3c2e250c0dd799e",
+  "servedAt": "all five iPLAYCAFE and brand feedback portals (feedback.iplaycafe.dev, feedback.iplaycafe.app, feedback.paikaan.app, feedback.qcaddy.app, feedback.rerolla.store)",
+  "patches": [
+    {
+      "order": 1,
+      "file": "patches/01-build-image-pins.patch",
+      "overlayId": null,
+      "sha256": "681e362cb7f0c9487290d6d76de11b04613de5c2ae0d24daa774a8180cf20e98",
+      "summary": "Digest-pinned oven/bun build and alpine runtime base images",
+      "status": "public"
+    },
+    {
+      "order": 2,
+      "file": "patches/02-unified-platform-overlay.patch",
+      "overlayId": "unified",
+      "sha256": "8410c052128151b4bbe3dac8da21d1d00ff33ebd1b28e52f223496b948044b4a",
+      "summary": "Unified Void platform overlay over v0.15.0 (rebased overlays 02-19, 26 + platform-mail adapter + Thai locale delta + migrations 0310-0315)",
+      "status": "public"
+    },
+    {
+      "order": 3,
+      "file": "patches/03-mail-issuance-expires-iso.patch",
+      "overlayId": "mailfix",
+      "sha256": "a6d8543ebf80b702c73e5d461dfff81ebfbe7582d0bacfe1478067f90e84ab09",
+      "summary": "Serialize email link/token expiry dates with .toISOString() across mail dispatch",
+      "status": "public"
+    },
+    {
+      "order": 4,
+      "file": "patches/04-ai-structured-output-nonstream.patch",
+      "overlayId": "ai-nonstream",
+      "sha256": "83483a1344da1b2e2b39929b490087d57db76ad649477f299d93bd304bf623a5",
+      "summary": "Add AI_STRUCTURED_OUTPUT_STREAM=false option to use one-shot structured chat output",
+      "status": "public"
+    },
+    {
+      "order": 5,
+      "file": "patches/05-ai-embedding-zero-pad.patch",
+      "overlayId": "embedding-zero-pad",
+      "sha256": "5eebafd9d27e03c965b49fef1cd90a5fc72c069a80aad4513ee80d2d82bba4ec",
+      "summary": "Add AI_EMBEDDING_ZERO_PAD=true option to zero-pad narrower embeddings to 1536 dimensions",
+      "status": "public"
+    },
+    {
+      "order": 6,
+      "file": "patches/06-api-mcp-list-suggestions.patch",
+      "overlayId": "list-suggestions",
+      "sha256": "1426f853fbfe08b3c1d50d64745e2cdbc6909c01984727a09bbaa456893aba15",
+      "summary": "Add GET /api/v1/suggestions public REST endpoint and MCP list_suggestions tool",
+      "status": "public"
+    },
+    {
+      "order": 7,
+      "file": null,
+      "overlayId": null,
+      "sha256": "b12b4c35304452a5a6df9406089e65248ec49be1b9c5ef8524ccb6e6615ba994",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "security embargo"
+    },
+    {
+      "order": 8,
+      "file": null,
+      "overlayId": null,
+      "sha256": "08846f5ef005bf1b91e6a7623226c7347094afc91d72ec9611d3680887eeb7d1",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "security embargo"
+    },
+    {
+      "order": 9,
+      "file": null,
+      "overlayId": null,
+      "sha256": "e966d044d3f3f2ce3b7e03fc9e604a7f5cae311dddd89858b39e3f0e327b68e2",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "depends on, and describes, a patch under security embargo"
+    }
+  ],
+  "complete": false
+}
