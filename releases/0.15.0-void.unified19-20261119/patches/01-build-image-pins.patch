@@ -1,0 +1,22 @@
+diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
+index 82e2f6b75a28258063b399543ec38b87b8fc416c..ffa8c029897d209b554d35ae74b843bc8986c143 100644
+--- a/apps/web/Dockerfile
++++ b/apps/web/Dockerfile
+@@ -13,7 +13,7 @@
+ # ============================================================================
+ 
+ # Base image with Bun
+-FROM oven/bun:1.4.0 AS base
++FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS base
+ WORKDIR /app
+ 
+ # ============================================================================
+@@ -97,7 +97,7 @@ RUN bun build apps/web/scripts/fleet-migrator.ts \
+ # ============================================================================
+ # Production runner
+ # ============================================================================
+-FROM oven/bun:1.4.0-alpine AS runner
++FROM oven/bun:1.4.4-alpine@sha256:4cf82f5686b196504fe119db3fcd9185b191f82ece82c40680e597228ec6070a AS runner
+ 
+ WORKDIR /app
+ 

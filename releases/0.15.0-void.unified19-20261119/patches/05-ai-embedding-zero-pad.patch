@@ -1,0 +1,252 @@
+diff --git a/.env.example b/.env.example
+index 18f102061a87e6796177484e77df28a4b056ae64..d3bce235cd71e54d46afe72f012f83c43c884097 100644
+--- a/.env.example
++++ b/.env.example
+@@ -274,6 +274,10 @@ AI_COMBINED_TOOLS_AND_SCHEMA=
+ # servers that drop the schema while streaming (e.g. Cloudflare Workers AI returns
+ # `{"results":}`); the request is then sent once with stream=false.
+ AI_STRUCTURED_OUTPUT_STREAM=
++# Some OpenAI-compatible embedding endpoints ignore `dimensions` and return their
++# native width (e.g. 1024). Set true to zero-pad shorter vectors to 1536; cosine
++# similarity is unchanged. Unset refuses (and logs) vectors of the wrong width.
++AI_EMBEDDING_ZERO_PAD=
+ 
+ # ============================================================================
+ # File Storage (for image uploads)
+diff --git a/apps/web/src/lib/server/config.ts b/apps/web/src/lib/server/config.ts
+index 516e773c850061ccb9c357f0094e48a128dc7ea8..fefb4e24fecbec295b843d2e2441e17d06cc2576 100644
+--- a/apps/web/src/lib/server/config.ts
++++ b/apps/web/src/lib/server/config.ts
+@@ -313,6 +313,7 @@ const configSchema = z
+     aiReasoningEffort: z.string().optional(),
+     aiCombinedToolsAndSchema: envBoolean,
+     aiStructuredOutputStream: envBoolean,
++    aiEmbeddingZeroPad: envBoolean,
+ 
+     // Telemetry (optional)
+     disableTelemetry: envBoolean,
+@@ -507,6 +508,7 @@ function buildConfigFromEnv(): unknown {
+     aiReasoningEffort: env('AI_REASONING_EFFORT'),
+     aiCombinedToolsAndSchema: env('AI_COMBINED_TOOLS_AND_SCHEMA'),
+     aiStructuredOutputStream: env('AI_STRUCTURED_OUTPUT_STREAM'),
++    aiEmbeddingZeroPad: env('AI_EMBEDDING_ZERO_PAD'),
+ 
+     // Telemetry
+     disableTelemetry: env('DISABLE_TELEMETRY'),
+@@ -840,6 +842,9 @@ export const config = {
+   get aiStructuredOutputStream() {
+     return loadConfig().aiStructuredOutputStream
+   },
++  get aiEmbeddingZeroPad() {
++    return loadConfig().aiEmbeddingZeroPad
++  },
+ 
+   // Telemetry
+   get disableTelemetry() {
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/embedding-dimensions.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/embedding-dimensions.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c4ea736ac0fdcb4095ae3974194ad979fc9cead
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/__tests__/embedding-dimensions.test.ts
+@@ -0,0 +1,44 @@
++import { describe, expect, it, vi } from 'vitest'
++
++const hoisted = vi.hoisted(() => ({ error: vi.fn() }))
++vi.mock('../config', () => ({ embeddingZeroPadEnabled: () => false }))
++vi.mock('@/lib/server/logger', () => {
++  const log = { info: () => {}, warn: () => {}, error: hoisted.error, debug: () => {}, child: () => log }
++  return { logger: log }
++})
++
++import { fitEmbeddingDimensions, padEmbedding } from '../embedding-dimensions'
++
++const ctx = { model: 'm', pipelineStep: 'test' }
++const cosine = (a: number[], b: number[]) => {
++  const dot = a.reduce((s, x, i) => s + x * b[i], 0)
++  const n = (v: number[]) => Math.sqrt(v.reduce((s, x) => s + x * x, 0))
++  return dot / (n(a) * n(b))
++}
++
++describe('fitEmbeddingDimensions', () => {
++  it('passes a vector of the right width through untouched', () => {
++    const v = [0.1, 0.2, 0.3]
++    expect(fitEmbeddingDimensions(v, 3, ctx)).toBe(v)
++  })
++
++  it('refuses a narrower vector unless padding is enabled', () => {
++    expect(fitEmbeddingDimensions([1, 2], 4, ctx, false)).toBeNull()
++    expect(hoisted.error).toHaveBeenCalled()
++    expect(fitEmbeddingDimensions([1, 2], 4, ctx, true)).toEqual([1, 2, 0, 0])
++  })
++
++  it('always refuses a wider vector', () => {
++    expect(fitEmbeddingDimensions([1, 2, 3], 2, ctx, true)).toBeNull()
++  })
++
++  it('returns null for a missing vector', () => {
++    expect(fitEmbeddingDimensions(undefined, 3, ctx, true)).toBeNull()
++  })
++
++  it('keeps cosine similarity exactly after padding', () => {
++    const a = [0.3, -0.2, 0.9]
++    const b = [0.1, 0.4, 0.5]
++    expect(cosine(padEmbedding(a, 8), padEmbedding(b, 8))).toBeCloseTo(cosine(a, b), 12)
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/ai/config.ts b/apps/web/src/lib/server/domains/ai/config.ts
+index b9f9a91fa7de34a42ed06aae72d2c6894b2b4900..999a4ea53c3fcd646cf8b9a2970c9ac31233fc17 100644
+--- a/apps/web/src/lib/server/domains/ai/config.ts
++++ b/apps/web/src/lib/server/domains/ai/config.ts
+@@ -187,3 +187,8 @@ export function reasoningEffortProviderOptions(): {
+     ? { reasoning: { effort } }
+     : {}
+ }
++
++/** `AI_EMBEDDING_ZERO_PAD`: pad narrower provider embeddings to the column width. */
++export function embeddingZeroPadEnabled(): boolean {
++  return config.aiEmbeddingZeroPad === true
++}
+diff --git a/apps/web/src/lib/server/domains/ai/embedding-dimensions.ts b/apps/web/src/lib/server/domains/ai/embedding-dimensions.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c73f619a83df727bb0a1174242389475561dac4
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/embedding-dimensions.ts
+@@ -0,0 +1,47 @@
++/**
++ * Fit a provider's embedding to the width of the pgvector columns.
++ *
++ * The `embedding` columns are `vector(1536)` and requests ask for
++ * `dimensions: 1536`, but several OpenAI-compatible servers ignore that
++ * parameter and return their model's native width (bge-m3 on Cloudflare
++ * Workers AI returns 1024). Writing that vector fails on insert, so similarity
++ * search, duplicate detection and help-center search silently stop working.
++ *
++ * With `AI_EMBEDDING_ZERO_PAD=true` a shorter vector is padded with zeros.
++ * Trailing zeros change neither dot products nor norms, so cosine similarity
++ * between padded vectors is exactly the model's own. A vector of any other
++ * width is refused with an error that names both widths.
++ */
++import { logger } from '@/lib/server/logger'
++import { embeddingZeroPadEnabled } from './config'
++
++const log = logger.child({ component: 'embeddings' })
++
++export function padEmbedding(vector: number[], dimensions: number): number[] {
++  if (vector.length >= dimensions) return vector
++  return vector.concat(new Array<number>(dimensions - vector.length).fill(0))
++}
++
++export function fitEmbeddingDimensions(
++  vector: number[] | undefined | null,
++  dimensions: number,
++  context: { model: string; pipelineStep?: string },
++  zeroPad?: boolean
++): number[] | null {
++  if (!vector) return null
++  if (vector.length === dimensions) return vector
++  if (vector.length < dimensions && (zeroPad ?? embeddingZeroPadEnabled()))
++    return padEmbedding(vector, dimensions)
++  log.error(
++    {
++      model: context.model,
++      pipeline_step: context.pipelineStep,
++      returned_dimensions: vector.length,
++      expected_dimensions: dimensions,
++    },
++    vector.length < dimensions
++      ? 'embedding is narrower than the vector column; set AI_EMBEDDING_ZERO_PAD=true to pad it'
++      : 'embedding is wider than the vector column'
++  )
++  return null
++}
+diff --git a/apps/web/src/lib/server/domains/embeddings/__tests__/embedding-merge-check-logging.test.ts b/apps/web/src/lib/server/domains/embeddings/__tests__/embedding-merge-check-logging.test.ts
+index 5fc4f74700818de60ff89e3cf737ce284835c4a0..7f1d8e89b308f2455de7e952b26307c2d564bff1 100644
+--- a/apps/web/src/lib/server/domains/embeddings/__tests__/embedding-merge-check-logging.test.ts
++++ b/apps/web/src/lib/server/domains/embeddings/__tests__/embedding-merge-check-logging.test.ts
+@@ -18,7 +18,7 @@ vi.mock('@/lib/server/domains/merge-suggestions/merge-check.service', () => ({
+ }))
+ vi.mock('@/lib/server/domains/ai/config', () => ({
+   getOpenAI: () => ({
+-    embeddings: { create: async () => ({ data: [{ embedding: [0.1, 0.2] }] }) },
++    embeddings: { create: async () => ({ data: [{ embedding: new Array(1536).fill(0.1) }] }) },
+   }),
+ }))
+ vi.mock('@/lib/server/domains/ai/models', () => ({
+diff --git a/apps/web/src/lib/server/domains/embeddings/embedding.service.ts b/apps/web/src/lib/server/domains/embeddings/embedding.service.ts
+index 37bd74647c6a9a6b723d3de7e56b6a9507e948d2..3b86c2c94663415cac441fb0b544e937ea70651e 100644
+--- a/apps/web/src/lib/server/domains/embeddings/embedding.service.ts
++++ b/apps/web/src/lib/server/domains/embeddings/embedding.service.ts
+@@ -11,6 +11,7 @@ import type { PostId, BoardId } from '@quackback/ids'
+ import { getOpenAI } from '@/lib/server/domains/ai/config'
+ import { getEmbeddingModel } from '@/lib/server/domains/ai/models'
+ import { withRetry } from '@/lib/server/domains/ai/retry'
++import { fitEmbeddingDimensions } from '@/lib/server/domains/ai/embedding-dimensions'
+ import { embeddingUsage, withUsageLogging } from '@/lib/server/domains/ai/usage-log'
+ import { isTestPost } from '@/lib/server/test-data'
+ import { logger } from '@/lib/server/logger'
+@@ -67,7 +68,10 @@ export async function generateEmbedding(
+         ),
+       (r) => embeddingUsage(r, truncated)
+     )
+-    return response.data[0]?.embedding ?? null
++    return fitEmbeddingDimensions(response.data[0]?.embedding, EMBEDDING_DIMENSIONS, {
++      model,
++      pipelineStep: logContext?.pipelineStep,
++    })
+   } catch (error) {
+     if (opts.signal?.aborted) {
+       log.debug({ pipeline_step: logContext?.pipelineStep }, 'embedding generation aborted')
+diff --git a/apps/web/src/lib/server/domains/help-center/__tests__/help-center-embedding-logging.test.ts b/apps/web/src/lib/server/domains/help-center/__tests__/help-center-embedding-logging.test.ts
+index 662817b9e43b47c8c089e38342e5706ed50b385f..6b4b6704736307438d6f74931233cb0c0f90d5aa 100644
+--- a/apps/web/src/lib/server/domains/help-center/__tests__/help-center-embedding-logging.test.ts
++++ b/apps/web/src/lib/server/domains/help-center/__tests__/help-center-embedding-logging.test.ts
+@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
+ 
+ const mockEmbeddingsCreate = vi.fn()
+ const mockWithUsageLogging = vi.fn()
++/** The column width: narrower vectors are refused without AI_EMBEDDING_ZERO_PAD. */
++const VECTOR = new Array(1536).fill(0.1)
+ 
+ vi.mock('@/lib/server/domains/ai/config', () => ({
+   getOpenAI: vi.fn(() => ({ embeddings: { create: mockEmbeddingsCreate } })),
+@@ -44,7 +46,7 @@ beforeEach(() => {
+     }
+   )
+   mockEmbeddingsCreate.mockResolvedValue({
+-    data: [{ embedding: [0.1, 0.2] }],
++    data: [{ embedding: VECTOR }],
+     usage: { prompt_tokens: 7, total_tokens: 7 },
+   })
+ })
+@@ -56,7 +58,7 @@ describe('generateKbEmbedding usage logging', () => {
+       metadata: { kbArticleId: 'article_1' },
+     })
+ 
+-    expect(result).toEqual([0.1, 0.2])
++    expect(result).toEqual(VECTOR)
+     expect(mockWithUsageLogging).toHaveBeenCalledOnce()
+     const [params] = mockWithUsageLogging.mock.calls[0]
+     expect(params).toMatchObject({
+@@ -104,8 +106,8 @@ describe('generateKbQueryEmbedding cache', () => {
+   it('serves repeats from cache without a second provider call', async () => {
+     const a = await generateKbQueryEmbedding('how do I vote')
+     const b = await generateKbQueryEmbedding('how do I vote')
+-    expect(a).toEqual([0.1, 0.2])
+-    expect(b).toEqual([0.1, 0.2])
++    expect(a).toEqual(VECTOR)
++    expect(b).toEqual(VECTOR)
+     expect(mockWithUsageLogging).toHaveBeenCalledOnce()
+   })
+ 
+@@ -119,7 +121,7 @@ describe('generateKbQueryEmbedding cache', () => {
+     mockWithUsageLogging.mockRejectedValueOnce(new Error('boom'))
+     expect(await generateKbQueryEmbedding('flaky query')).toBeNull()
+     // Second call retries the provider instead of returning a cached null.
+-    expect(await generateKbQueryEmbedding('flaky query')).toEqual([0.1, 0.2])
++    expect(await generateKbQueryEmbedding('flaky query')).toEqual(VECTOR)
+     expect(mockWithUsageLogging).toHaveBeenCalledTimes(2)
+   })
+ })
+diff --git a/apps/web/src/lib/server/domains/help-center/help-center-embedding.service.ts b/apps/web/src/lib/server/domains/help-center/help-center-embedding.service.ts
+index e7e3caa1b7ddf859990a07db3e8463ac051b72ad..b6bc9265d78396ad26a8deeab487f3a277003ac6 100644
+Binary files a/apps/web/src/lib/server/domains/help-center/help-center-embedding.service.ts and b/apps/web/src/lib/server/domains/help-center/help-center-embedding.service.ts differ

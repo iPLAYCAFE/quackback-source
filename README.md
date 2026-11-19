@@ -14,6 +14,7 @@ The upstream source together with these patches is the source of the program you
 
 | Release | Served at | Upstream | Patches |
 | --- | --- | --- | --- |
+| [`0.15.0-void.unified19-20261119`](releases/0.15.0-void.unified19-20261119/) | all five iPLAYCAFE and brand feedback portals (`feedback.iplaycafe.dev`, `feedback.iplaycafe.app`, `feedback.paikaan.app`, `feedback.qcaddy.app`, `feedback.rerolla.store`) | `main` (`v0.15.0+`) at `12379251837d47a67d8a4b389370602e826c07f9` | 9 in order: 6 published, 3 withheld for now |
 | [`0.15.0-void.unified18-20261116`](releases/0.15.0-void.unified18-20261116/) | all five iPLAYCAFE and brand feedback portals (`feedback.iplaycafe.dev`, `feedback.iplaycafe.app`, `feedback.paikaan.app`, `feedback.qcaddy.app`, `feedback.rerolla.store`) | `v0.15.0` at `fe575ec7e4fdbdc506c37581f63f6f6fe0fa8d70` | 9 in order: 6 published, 3 withheld for now |
 | [`0.14.1-void.serving.20261025p-u1`](releases/0.14.1-void.serving.20261025p-u1/) | the iPLAYCAFE feedback portal (`feedback.iplaycafe.dev`) | `v0.14.1` at `965e713431a3da83dd7caa63639c27dd064bea5d` | 18 in order: 15 published, 3 withheld for now |
 | [`0.14.1-native.18`](releases/0.14.1-native.18/) | the brand feedback portals (PaiKaan, qcaddy, rerolla) | `v0.14.1` at `965e713431a3da83dd7caa63639c27dd064bea5d` | 23 in order: 22 published, 1 withheld for now |
