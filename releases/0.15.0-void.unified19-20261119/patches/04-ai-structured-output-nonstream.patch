@@ -1,0 +1,151 @@
+diff --git a/.env.example b/.env.example
+index dc3b6fb6720f2dfcae024944a293cbd53853a5a0..18f102061a87e6796177484e77df28a4b056ae64 100644
+--- a/.env.example
++++ b/.env.example
+@@ -270,6 +270,10 @@ AI_REASONING_EXCLUDE=
+ # Some models can emit tool calls and the final JSON schema in one request.
+ # Leave unset to force a split (tools, then a structured finalization call).
+ AI_COMBINED_TOOLS_AND_SCHEMA=
++# Structured (json_schema) calls stream by default. Set false for OpenAI-compatible
++# servers that drop the schema while streaming (e.g. Cloudflare Workers AI returns
++# `{"results":}`); the request is then sent once with stream=false.
++AI_STRUCTURED_OUTPUT_STREAM=
+ 
+ # ============================================================================
+ # File Storage (for image uploads)
+diff --git a/apps/web/src/lib/server/config.ts b/apps/web/src/lib/server/config.ts
+index 58d4be9152e758ab73a097b3570b1b449027d651..516e773c850061ccb9c357f0094e48a128dc7ea8 100644
+--- a/apps/web/src/lib/server/config.ts
++++ b/apps/web/src/lib/server/config.ts
+@@ -312,6 +312,7 @@ const configSchema = z
+     aiReasoningExclude: envBoolean,
+     aiReasoningEffort: z.string().optional(),
+     aiCombinedToolsAndSchema: envBoolean,
++    aiStructuredOutputStream: envBoolean,
+ 
+     // Telemetry (optional)
+     disableTelemetry: envBoolean,
+@@ -505,6 +506,7 @@ function buildConfigFromEnv(): unknown {
+     aiReasoningExclude: env('AI_REASONING_EXCLUDE'),
+     aiReasoningEffort: env('AI_REASONING_EFFORT'),
+     aiCombinedToolsAndSchema: env('AI_COMBINED_TOOLS_AND_SCHEMA'),
++    aiStructuredOutputStream: env('AI_STRUCTURED_OUTPUT_STREAM'),
+ 
+     // Telemetry
+     disableTelemetry: env('DISABLE_TELEMETRY'),
+@@ -835,6 +837,9 @@ export const config = {
+   get aiCombinedToolsAndSchema() {
+     return loadConfig().aiCombinedToolsAndSchema
+   },
++  get aiStructuredOutputStream() {
++    return loadConfig().aiStructuredOutputStream
++  },
+ 
+   // Telemetry
+   get disableTelemetry() {
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+index 504dfbb0599cf789eaba299045e1c6caa859a505..e4fa9c5f94b7c41e3ad79c104d5f79e48ec83b42 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+@@ -14,6 +14,7 @@ const hoisted = vi.hoisted(() => ({
+     openaiBaseUrl: 'https://llm.internal/v1' as string | null,
+     aiRequireParameters: undefined,
+     aiReasoningEffort: undefined as string | undefined,
++    aiStructuredOutputStream: undefined as boolean | undefined,
+   },
+ }))
+ 
+@@ -36,6 +37,9 @@ vi.mock('@/lib/server/config', () => ({
+     get aiReasoningEffort() {
+       return hoisted.cfg.aiReasoningEffort
+     },
++    get aiStructuredOutputStream() {
++      return hoisted.cfg.aiStructuredOutputStream
++    },
+   },
+ }))
+ vi.mock('@/lib/server/logger', () => {
+@@ -53,6 +57,7 @@ import {
+   isResponseFormatRejection,
+   resetStructuredFallbackMemory,
+   structuredChat,
++  withStructuredOutputStreaming,
+ } from '../structured-chat'
+ 
+ const Schema = z.object({ sentiment: z.enum(['positive', 'negative']), confidence: z.number() })
+@@ -321,3 +326,33 @@ describe('isResponseFormatRejection', () => {
+     expect(isResponseFormatRejection('response_format')).toBe(false)
+   })
+ })
++
++describe('AI_STRUCTURED_OUTPUT_STREAM', () => {
++  const adapter = {
++    name: 'a',
++    structuredOutput: () => 'one-shot',
++    structuredOutputStream: () => 'stream',
++  }
++
++  it('keeps the streaming method unless the flag is false', () => {
++    expect(withStructuredOutputStreaming(adapter, undefined)).toBe(adapter)
++    expect(withStructuredOutputStreaming(adapter, true)).toBe(adapter)
++  })
++
++  it('hides structuredOutputStream when false so chat() uses the one-shot call', () => {
++    const wrapped = withStructuredOutputStreaming(adapter, false)
++    expect(wrapped.structuredOutputStream).toBeUndefined()
++    expect(wrapped.structuredOutput()).toBe('one-shot')
++    expect(wrapped.name).toBe('a')
++  })
++
++  it('passes the wrapped adapter to chat()', async () => {
++    hoisted.cfg.aiStructuredOutputStream = false
++    hoisted.chat.mockResolvedValueOnce({ sentiment: 'positive', confidence: 0.9 })
++    await structuredChat(base)
++    const sent = hoisted.chat.mock.calls.at(-1)![0].adapter
++    expect(sent.structuredOutputStream).toBeUndefined()
++    expect(sent.model).toBe('m')
++    hoisted.cfg.aiStructuredOutputStream = undefined
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/ai/structured-chat.ts b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+index bd427fe27bfb1fcdc8378512e94f418a4c31b818..bb87d7665b51e31135954f04f1f43bf494cbf5eb 100644
+--- a/apps/web/src/lib/server/domains/ai/structured-chat.ts
++++ b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+@@ -103,11 +103,36 @@ export interface StructuredChatInput<S extends z.ZodType> {
+   middleware?: ChatMiddleware[]
+ }
+ 
++/**
++ * `chat({ outputSchema })` uses the adapter's `structuredOutputStream` whenever
++ * it exists, so every structured call goes out as `json_schema` + `stream: true`.
++ * Some OpenAI-compatible servers (Cloudflare Workers AI, for one) ignore the
++ * schema while streaming and return text such as `{"results":}` that never
++ * parses. `AI_STRUCTURED_OUTPUT_STREAM=false` hides the streaming method, so
++ * `chat()` falls back to the adapter's one-shot `structuredOutput` with
++ * `stream: false`. Unset keeps today's behaviour.
++ */
++export function withStructuredOutputStreaming<A extends object>(
++  adapter: A,
++  streaming: boolean | undefined
++): A {
++  if (streaming !== false) return adapter
++  return new Proxy(adapter, {
++    get(target, prop, receiver) {
++      if (prop === 'structuredOutputStream') return undefined
++      return Reflect.get(target, prop, receiver)
++    },
++  })
++}
++
+ export async function structuredChat<S extends z.ZodType>(
+   input: StructuredChatInput<S>
+ ): Promise<z.infer<S>> {
+   const baseURL = config.openaiBaseUrl!
+-  const adapter = openaiCompatibleText(input.model, getOpenAIClientOptions(config))
++  const adapter = withStructuredOutputStreaming(
++    openaiCompatibleText(input.model, getOpenAIClientOptions(config)),
++    config.aiStructuredOutputStream
++  )
+   const common = {
+     adapter,
+     messages: input.messages,

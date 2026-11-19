@@ -1,0 +1,606 @@
+diff --git a/apps/web/src/lib/server/domains/api/schemas/posts.admin.ts b/apps/web/src/lib/server/domains/api/schemas/posts.admin.ts
+index 8de412b32dc5f243e36ca7436ee3f144d4cefc77..20038330971a2d92db3c9b8639e1e1f6cf73b2b2 100644
+--- a/apps/web/src/lib/server/domains/api/schemas/posts.admin.ts
++++ b/apps/web/src/lib/server/domains/api/schemas/posts.admin.ts
+@@ -7,6 +7,7 @@ import {
+   registerPath,
+   TypeIdSchema,
+   createItemResponseSchema,
++  createPaginatedResponseSchema,
+   createRequestBodySchema,
+   asSchema,
+ } from '../openapi'
+@@ -42,6 +43,30 @@ const AcceptBodySchema = createRequestBodySchema({
+   }),
+ })
+ 
++const MergeSuggestionPostSchema = z.object({
++  id: z.string(),
++  title: z.string(),
++  content: z.string().nullable(),
++  voteCount: z.number().int(),
++  commentCount: z.number().int(),
++  createdAt: TimestampSchema,
++  boardName: z.string().nullable(),
++  statusName: z.string().nullable(),
++  statusColor: z.string().nullable(),
++})
++
++const MergeSuggestionSchema = z.object({
++  id: TypeIdSchema,
++  status: z.string(),
++  hybridScore: z.number(),
++  llmConfidence: z.number(),
++  llmReasoning: z.string().nullable(),
++  createdAt: TimestampSchema,
++  updatedAt: TimestampSchema,
++  sourcePost: MergeSuggestionPostSchema,
++  targetPost: MergeSuggestionPostSchema,
++})
++
+ const postIdParam = {
+   name: 'postId',
+   in: 'path',
+@@ -114,6 +139,52 @@ registerPath('/posts/{postId}/merge', {
+   },
+ })
+ 
++registerPath('/suggestions', {
++  get: {
++    tags: ['Posts'],
++    summary: 'List pending merge suggestions',
++    description:
++      'Returns pending post-to-post merge suggestions sorted by creation time or hybrid duplicate relevance score. Requires the suggestion.view permission.',
++    parameters: [
++      {
++        name: 'sort',
++        in: 'query',
++        required: false,
++        schema: { type: 'string', enum: ['newest', 'relevance'] },
++        description: 'Sort order (default: newest)',
++      },
++      {
++        name: 'limit',
++        in: 'query',
++        required: false,
++        schema: { type: 'integer', minimum: 1, maximum: 100 },
++        description: 'Maximum number of suggestions to return (1-100, default: 50)',
++      },
++      {
++        name: 'postId',
++        in: 'query',
++        required: false,
++        schema: { type: 'string' },
++        description: 'Filter suggestions where the post is source or target (post_xxx)',
++      },
++    ],
++    responses: {
++      200: {
++        description: 'Pending merge suggestions',
++        content: {
++          'application/json': {
++            schema: createPaginatedResponseSchema(
++              MergeSuggestionSchema,
++              'List of pending merge suggestions'
++            ),
++          },
++        },
++      },
++      ...errorResponses(400, 401, 403),
++    },
++  },
++})
++
+ registerPath('/suggestions/{suggestionId}/accept', {
+   post: {
+     tags: ['Posts'],
+diff --git a/apps/web/src/lib/server/domains/merge-suggestions/merge-suggestion.service.ts b/apps/web/src/lib/server/domains/merge-suggestions/merge-suggestion.service.ts
+index 4b666006132522d0e8470e93ac7e496ed479229c..061f2665f09ef176adcd9dbb63414d7d4038987c 100644
+--- a/apps/web/src/lib/server/domains/merge-suggestions/merge-suggestion.service.ts
++++ b/apps/web/src/lib/server/domains/merge-suggestions/merge-suggestion.service.ts
+@@ -274,6 +274,7 @@ export async function getPendingSuggestionsForPost(postId: PostId): Promise<Merg
+ export async function getPendingMergeSuggestions(opts: {
+   sort?: 'newest' | 'relevance'
+   limit?: number
++  postId?: PostId
+ }): Promise<{
+   items: Array<{
+     id: string
+@@ -289,10 +290,19 @@ export async function getPendingMergeSuggestions(opts: {
+   total: number
+ }> {
+   log.debug(
+-    { sort: opts.sort ?? 'newest', limit: opts.limit ?? 50 },
++    { sort: opts.sort ?? 'newest', limit: opts.limit ?? 50, postId: opts.postId },
+     'get pending merge suggestions'
+   )
+   // Step 1: Fetch count + merge suggestion rows in parallel
++  const condition = opts.postId
++    ? and(
++        eq(mergeSuggestions.status, 'pending'),
++        or(
++          eq(mergeSuggestions.sourcePostId, opts.postId),
++          eq(mergeSuggestions.targetPostId, opts.postId)
++        )
++      )
++    : eq(mergeSuggestions.status, 'pending')
+   const orderBy =
+     opts.sort === 'relevance'
+       ? [desc(mergeSuggestions.hybridScore), desc(mergeSuggestions.createdAt)]
+@@ -302,11 +312,11 @@ export async function getPendingMergeSuggestions(opts: {
+     db
+       .select({ count: sql<number>`count(*)` })
+       .from(mergeSuggestions)
+-      .where(eq(mergeSuggestions.status, 'pending')),
++      .where(condition),
+     db
+       .select()
+       .from(mergeSuggestions)
+-      .where(eq(mergeSuggestions.status, 'pending'))
++      .where(condition)
+       .orderBy(...orderBy)
+       .limit(opts.limit ?? 50),
+   ])
+diff --git a/apps/web/src/lib/server/mcp/__tests__/handler.test.ts b/apps/web/src/lib/server/mcp/__tests__/handler.test.ts
+index ccc87ba7020d4c43073b38334b35b31b6b9011dc..45de6784d38ef10ed498ee166fdf5348d7c73dd2 100644
+--- a/apps/web/src/lib/server/mcp/__tests__/handler.test.ts
++++ b/apps/web/src/lib/server/mcp/__tests__/handler.test.ts
+@@ -205,6 +205,42 @@ vi.mock('@/lib/server/domains/activity/activity.service', () => ({
+ }))
+ 
+ vi.mock('@/lib/server/domains/merge-suggestions/merge-suggestion.service', () => ({
++  getPendingMergeSuggestions: vi.fn().mockResolvedValue({
++    items: [
++      {
++        id: 'post_merge_sug_01abc',
++        status: 'pending',
++        hybridScore: 0.9,
++        llmConfidence: 0.85,
++        llmReasoning: 'Duplicate request',
++        createdAt: new Date('2026-11-16T00:00:00.000Z'),
++        updatedAt: new Date('2026-11-16T00:00:00.000Z'),
++        sourcePost: {
++          id: 'post_src',
++          title: 'Source post',
++          content: null,
++          voteCount: 1,
++          commentCount: 0,
++          createdAt: new Date('2026-11-15T00:00:00.000Z'),
++          boardName: 'Features',
++          statusName: 'Open',
++          statusColor: '#22c55e',
++        },
++        targetPost: {
++          id: 'post_tgt',
++          title: 'Target post',
++          content: null,
++          voteCount: 3,
++          commentCount: 1,
++          createdAt: new Date('2026-11-14T00:00:00.000Z'),
++          boardName: 'Features',
++          statusName: 'Open',
++          statusColor: '#22c55e',
++        },
++      },
++    ],
++    total: 1,
++  }),
+   acceptMergeSuggestion: vi.fn().mockResolvedValue(undefined),
+   dismissMergeSuggestion: vi.fn().mockResolvedValue(undefined),
+   restoreMergeSuggestion: vi.fn().mockResolvedValue(undefined),
+@@ -728,6 +764,7 @@ describe('MCP HTTP Handler', () => {
+       expect(toolNames).toContain('create_changelog')
+       expect(toolNames).toContain('update_changelog')
+       expect(toolNames).toContain('delete_changelog')
++      expect(toolNames).toContain('list_suggestions')
+       expect(toolNames).toContain('update_comment')
+       expect(toolNames).toContain('delete_comment')
+       expect(toolNames).toContain('react_to_comment')
+@@ -755,7 +792,32 @@ describe('MCP HTTP Handler', () => {
+       expect(toolNames).toContain('navigate_workspace')
+       // Settings change directly through update_settings; no tool files a settings card.
+       expect(toolNames).not.toContain('propose_settings_change')
+-      expect(toolNames).toHaveLength(43)
++      expect(toolNames).toHaveLength(44)
++    })
++
++    it('list_suggestions lists pending merge suggestions without auditing a read-only call', async () => {
++      await setupValidAuth()
++      const { handleMcpRequest } = await import('../handler')
++      const response = await handleMcpRequest(
++        mcpRequest(
++          jsonRpcRequest('tools/call', {
++            name: 'list_suggestions',
++            arguments: { sort: 'relevance', limit: 10 },
++          })
++        )
++      )
++      expect(response.status).toBe(200)
++      const body = (await response.json()) as {
++        result: { isError?: boolean; content: Array<{ text: string }> }
++      }
++      expect(body.result.isError).toBeUndefined()
++      const parsed = JSON.parse(body.result.content[0]!.text) as {
++        suggestions: Array<{ id: string }>
++        total: number
++      }
++      expect(parsed.total).toBe(1)
++      expect(parsed.suggestions[0]!.id).toBe('post_merge_sug_01abc')
++      expect(mockAuditInsertValues).not.toHaveBeenCalled()
+     })
+ 
+     it('should handle resources/list request', async () => {
+diff --git a/apps/web/src/lib/server/mcp/required-scope.ts b/apps/web/src/lib/server/mcp/required-scope.ts
+index 9fd80e7f612e7cc914b959748677fc401f3a8f23..b67c8c604e8ad8c89c0d125ba5e4f96187a56373 100644
+--- a/apps/web/src/lib/server/mcp/required-scope.ts
++++ b/apps/web/src/lib/server/mcp/required-scope.ts
+@@ -23,6 +23,7 @@ export const TOOL_SCOPES: Readonly<Record<string, McpScope>> = {
+   create_changelog: 'write:changelog',
+   update_changelog: 'write:changelog',
+   delete_changelog: 'write:changelog',
++  list_suggestions: 'read:feedback',
+   accept_suggestion: 'write:feedback',
+   dismiss_suggestion: 'write:feedback',
+   restore_suggestion: 'write:feedback',
+diff --git a/apps/web/src/lib/server/mcp/tools/index.ts b/apps/web/src/lib/server/mcp/tools/index.ts
+index cd66eeb33bebcd483f56ea9db6e81654c8633da8..97c69f61c774c8b51a4b98ca9421851a80e82cbb 100644
+--- a/apps/web/src/lib/server/mcp/tools/index.ts
++++ b/apps/web/src/lib/server/mcp/tools/index.ts
+@@ -16,7 +16,8 @@
+  * - comments.ts      add_comment, update_comment, delete_comment,
+  *                    react_to_comment
+  * - changelog.ts     create_changelog, update_changelog, delete_changelog
+- * - suggestions.ts   accept_suggestion, dismiss_suggestion, restore_suggestion
++ * - suggestions.ts   list_suggestions, accept_suggestion, dismiss_suggestion,
++ *                    restore_suggestion
+  * - help-center.ts   create_article, update_article, delete_article,
+  *                    manage_category
+  * - conversations.ts list_conversations, get_conversation,
+diff --git a/apps/web/src/lib/server/mcp/tools/suggestions.ts b/apps/web/src/lib/server/mcp/tools/suggestions.ts
+index 89c596990f4a9608c4b4b835d2f02b3b5da1d360..d43ac4d903553997c5c2f38ad5cc3d3fffd22285 100644
+--- a/apps/web/src/lib/server/mcp/tools/suggestions.ts
++++ b/apps/web/src/lib/server/mcp/tools/suggestions.ts
+@@ -11,13 +11,21 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+ import {
+   acceptMergeSuggestion,
+   dismissMergeSuggestion,
++  getPendingMergeSuggestions,
+   restoreMergeSuggestion,
+ } from '@/lib/server/domains/merge-suggestions/merge-suggestion.service'
+ import { isTypeId } from '@quackback/ids'
+-import type { PostMergeSuggestionId } from '@quackback/ids'
++import type { PostId, PostMergeSuggestionId } from '@quackback/ids'
+ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
+ import type { McpAuthContext } from '../types'
+-import { registerTool, jsonResult, errorResult, WRITE } from './helpers'
++import {
++  registerTool,
++  jsonResult,
++  compactJsonResult,
++  errorResult,
++  READ_ONLY,
++  WRITE,
++} from './helpers'
+ 
+ /** Validate a merge-suggestion TypeID, owning the shared error message. */
+ function resolveMergeId(
+@@ -30,6 +38,24 @@ function resolveMergeId(
+   }
+ }
+ 
++const listSuggestionsSchema = {
++  sort: z
++    .enum(['newest', 'relevance'])
++    .optional()
++    .describe('Sort order: newest (default) or relevance (highest hybrid score first)'),
++  limit: z
++    .number()
++    .int()
++    .min(1)
++    .max(100)
++    .optional()
++    .describe('Maximum number of pending suggestions to return (default 50, max 100)'),
++  postId: z
++    .string()
++    .optional()
++    .describe('Optional post TypeID (post_xxx) to filter suggestions for a specific post'),
++}
++
+ const acceptSuggestionSchema = {
+   id: z.string().describe('Merge suggestion TypeID (post_merge_sug_xxx)'),
+   swapDirection: z.boolean().optional().describe('Swap merge direction (which post is kept)'),
+@@ -45,11 +71,38 @@ const restoreSuggestionSchema = {
+     .describe('Merge suggestion TypeID to restore from dismissed to pending (post_merge_sug_xxx)'),
+ }
+ 
++type ListSuggestionsArgs = { sort?: 'newest' | 'relevance'; limit?: number; postId?: string }
+ type AcceptSuggestionArgs = { id: string; swapDirection?: boolean }
+ type DismissSuggestionArgs = { id: string }
+ type RestoreSuggestionArgs = { id: string }
+ 
+ export function registerSuggestionTools(server: McpServer, auth: McpAuthContext) {
++  registerTool<ListSuggestionsArgs>(server, auth, {
++    name: 'list_suggestions',
++    permissions: [PERMISSIONS.SUGGESTION_VIEW],
++    description: `List pending post-to-post merge suggestions sorted by newest or relevance (hybrid duplicate score). Optionally filter by postId.
++
++Examples:
++- List newest pending suggestions: list_suggestions({})
++- Filter by relevance for one post: list_suggestions({ postId: "post_01abc...", sort: "relevance", limit: 20 })`,
++    schema: listSuggestionsSchema,
++    annotations: READ_ONLY,
++    scope: 'read:feedback',
++    teamOnly: true,
++    handler: async (args) => {
++      if (args.postId !== undefined && !isTypeId(args.postId, 'post')) {
++        return errorResult(new Error('Invalid post ID. Expected post_xxx format.'))
++      }
++      const limit = args.limit === undefined ? 50 : Math.min(100, Math.max(1, args.limit))
++      const result = await getPendingMergeSuggestions({
++        sort: args.sort,
++        limit,
++        postId: args.postId as PostId | undefined,
++      })
++      return compactJsonResult({ suggestions: result.items, total: result.total })
++    },
++  })
++
+   registerTool<AcceptSuggestionArgs>(server, auth, {
+     name: 'accept_suggestion',
+     permissions: [PERMISSIONS.SUGGESTION_MANAGE],
+diff --git a/apps/web/src/lib/server/mcp/untrusted.ts b/apps/web/src/lib/server/mcp/untrusted.ts
+index 506b61c0a8df6b15508bbdb918568a2940e1ac15..85339a1577f0e87fb9e9d482b6052dac0ecede29 100644
+--- a/apps/web/src/lib/server/mcp/untrusted.ts
++++ b/apps/web/src/lib/server/mcp/untrusted.ts
+@@ -277,6 +277,13 @@ export const UNTRUSTED_TOOL_FIELDS = {
+   update_changelog: NONE,
+   delete_changelog: NONE,
+ 
++  list_suggestions: [
++    'suggestions[].sourcePost.title',
++    'suggestions[].sourcePost.content',
++    'suggestions[].targetPost.title',
++    'suggestions[].targetPost.content',
++    'suggestions[].llmReasoning',
++  ],
+   accept_suggestion: NONE,
+   dismiss_suggestion: NONE,
+   restore_suggestion: NONE,
+diff --git a/apps/web/src/lib/server/policy/authz-matrix/MATRIX.md b/apps/web/src/lib/server/policy/authz-matrix/MATRIX.md
+index 4ddfab5c1e9148c29c943b021d9f99bd9377dcf8..3698bd22356e2a531ca15fd0814e3ae3e7b39649 100644
+--- a/apps/web/src/lib/server/policy/authz-matrix/MATRIX.md
++++ b/apps/web/src/lib/server/policy/authz-matrix/MATRIX.md
+@@ -878,7 +878,7 @@ Profiles: **Owner** = admin class + an admin-owned full API key (scoped keys hol
+ | `lib/server/functions/workspace-api-key-settings.ts`::fetchWorkspaceKeyRolesFn | api_key.manage |
+ | `lib/server/functions/workspace-wipe.ts`::wipeCloudWorkspaceFn | END_USER (any authenticated) |
+ 
+-### Public REST API (`withApiKeyAuth`) — 131 surfaces
++### Public REST API (`withApiKeyAuth`) — 132 surfaces
+ 
+ | Surface | Enforces |
+ | --- | --- |
+@@ -987,6 +987,7 @@ Profiles: **Owner** = admin class + an admin-owned full API key (scoped keys hol
+ | `routes/api/v1/suggestions/$suggestionId.accept.ts`::POST | suggestion.manage |
+ | `routes/api/v1/suggestions/$suggestionId.dismiss.ts`::POST | suggestion.manage |
+ | `routes/api/v1/suggestions/$suggestionId.restore.ts`::POST | suggestion.manage |
++| `routes/api/v1/suggestions/index.ts`::GET | suggestion.view |
+ | `routes/api/v1/tags/$tagId.ts`::GET | PUBLIC (any valid key) |
+ | `routes/api/v1/tags/$tagId.ts`::PATCH | tag.manage |
+ | `routes/api/v1/tags/$tagId.ts`::DELETE | tag.manage |
+@@ -1035,7 +1036,7 @@ Profiles: **Owner** = admin class + an admin-owned full API key (scoped keys hol
+ 
+ ## 3. MCP tools
+ 
+-43 tools. "Team" = requires an admin/member role in addition to the scope.
++44 tools. "Team" = requires an admin/member role in addition to the scope.
+ 
+ | Tool | Scope(s) | Team |
+ | --- | --- | :---: |
+@@ -1058,6 +1059,7 @@ Profiles: **Owner** = admin class + an admin-owned full API key (scoped keys hol
+ | get_ticket | read:chat | ✓ |
+ | link_ticket | write:chat | ✓ |
+ | list_conversations | read:chat | ✓ |
++| list_suggestions | read:feedback | ✓ |
+ | list_tickets | read:chat | ✓ |
+ | manage_category | write:article | ✓ |
+ | merge_post | write:feedback | ✓ |
+@@ -1095,7 +1097,7 @@ Key scopes are enforced: an API key holds exactly its stored scopes (owner permi
+ 
+ ## 4. Entry points without a requireAuth/key gate
+ 
+-233 of 1110 entry points hold no `requireAuth` / `withApiKeyAuth` / `requireTeamAuth` gate.
++233 of 1111 entry points hold no `requireAuth` / `withApiKeyAuth` / `requireTeamAuth` gate.
+ Each is expected to be intentionally public, a pre-auth flow, a signature-verified webhook, or a handler that delegates auth (e.g. the MCP route).
+ **Adding a row here is an access-control change** — confirm the new entry point is meant to be reachable without a gate.
+ 
+diff --git a/apps/web/src/routes/api/v1/suggestions/__tests__/index.test.ts b/apps/web/src/routes/api/v1/suggestions/__tests__/index.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e06fcb140e87b837f77bd1b541d58e14e58773d
+--- /dev/null
++++ b/apps/web/src/routes/api/v1/suggestions/__tests__/index.test.ts
+@@ -0,0 +1,98 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { PERMISSIONS } from '@/lib/shared/permissions'
++import type { PostId } from '@quackback/ids'
++
++const mockWithApiKeyAuth = vi.fn()
++const mockGetPendingMergeSuggestions = vi.fn()
++
++vi.mock('@tanstack/react-router', () => ({
++  createFileRoute: vi.fn(() => (opts: unknown) => ({ options: opts })),
++}))
++vi.mock('@/lib/server/domains/api/auth', () => ({
++  withApiKeyAuth: (...args: unknown[]) => mockWithApiKeyAuth(...args),
++}))
++vi.mock('@/lib/server/domains/merge-suggestions/merge-suggestion.service', () => ({
++  getPendingMergeSuggestions: (...args: unknown[]) => mockGetPendingMergeSuggestions(...args),
++}))
++
++import { Route } from '../index'
++
++type RouteOpts = { server: { handlers: { GET: (...args: unknown[]) => Promise<Response> } } }
++const GET = (Route as unknown as { options: RouteOpts }).options.server.handlers.GET
++
++const VALID_POST_ID = 'post_01kqhxq697fvgat0fn8rr1r7ew' as PostId
++
++describe('GET /api/v1/suggestions', () => {
++  beforeEach(() => {
++    mockWithApiKeyAuth.mockReset()
++    mockGetPendingMergeSuggestions.mockReset()
++    mockWithApiKeyAuth.mockResolvedValue({ principalId: 'principal_admin', role: 'admin' })
++    mockGetPendingMergeSuggestions.mockResolvedValue({
++      items: [
++        {
++          id: 'post_merge_sug_01kqhxq697fvgat0fn8rr1r7ex',
++          status: 'pending',
++          hybridScore: 0.91,
++          llmConfidence: 0.88,
++          llmReasoning: 'Same root cause',
++          createdAt: new Date('2026-11-16T00:00:00.000Z'),
++          updatedAt: new Date('2026-11-16T01:00:00.000Z'),
++          sourcePost: {
++            id: VALID_POST_ID,
++            title: 'Source',
++            content: 'Body',
++            voteCount: 3,
++            commentCount: 1,
++            createdAt: new Date('2026-11-15T00:00:00.000Z'),
++            boardName: 'Bugs',
++            statusName: 'Open',
++            statusColor: '#22c55e',
++          },
++          targetPost: {
++            id: 'post_01kqhxq697fvgat0fn8rr1r7ey',
++            title: 'Target',
++            content: 'Body 2',
++            voteCount: 5,
++            commentCount: 2,
++            createdAt: new Date('2026-11-14T00:00:00.000Z'),
++            boardName: 'Bugs',
++            statusName: 'Open',
++            statusColor: '#22c55e',
++          },
++        },
++      ],
++      total: 3,
++    })
++  })
++
++  it('requires SUGGESTION_VIEW permission and serializes dates and pagination total', async () => {
++    const res = await GET({
++      request: new Request(
++        `http://test/api/v1/suggestions?sort=relevance&limit=25&postId=${VALID_POST_ID}`
++      ),
++    })
++
++    expect(mockWithApiKeyAuth).toHaveBeenCalledWith(expect.any(Request), {
++      permission: PERMISSIONS.SUGGESTION_VIEW,
++    })
++    expect(mockGetPendingMergeSuggestions).toHaveBeenCalledWith({
++      sort: 'relevance',
++      limit: 25,
++      postId: VALID_POST_ID,
++    })
++    expect(res.status).toBe(200)
++    const body = await res.json()
++    expect(body.data).toHaveLength(1)
++    expect(body.data[0].createdAt).toBe('2026-11-16T00:00:00.000Z')
++    expect(body.data[0].sourcePost.createdAt).toBe('2026-11-15T00:00:00.000Z')
++    expect(body.meta).toEqual({ pagination: { cursor: null, hasMore: true, total: 3 } })
++  })
++
++  it('rejects invalid sort, limit, and postId values with 400', async () => {
++    for (const query of ['sort=bogus', 'limit=0', 'limit=abc', 'postId=not_a_post']) {
++      const res = await GET({ request: new Request(`http://test/api/v1/suggestions?${query}`) })
++      expect(res.status, query).toBe(400)
++    }
++    expect(mockGetPendingMergeSuggestions).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/web/src/routes/api/v1/suggestions/index.ts b/apps/web/src/routes/api/v1/suggestions/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c9c5318b75a6e73ebdb0e45d6562593ca38aa53
+--- /dev/null
++++ b/apps/web/src/routes/api/v1/suggestions/index.ts
+@@ -0,0 +1,81 @@
++import { createFileRoute } from '@tanstack/react-router'
++import { withApiKeyAuth } from '@/lib/server/domains/api/auth'
++import {
++  successResponse,
++  badRequestResponse,
++  handleDomainError,
++} from '@/lib/server/domains/api/responses'
++import { isValidTypeId } from '@quackback/ids'
++import type { PostId } from '@quackback/ids'
++import { PERMISSIONS } from '@/lib/shared/permissions'
++
++export const Route = createFileRoute('/api/v1/suggestions/')({
++  server: {
++    handlers: {
++      /**
++       * GET /api/v1/suggestions
++       * List pending post-to-post merge suggestions.
++       */
++      GET: async ({ request }) => {
++        try {
++          await withApiKeyAuth(request, { permission: PERMISSIONS.SUGGESTION_VIEW })
++
++          const url = new URL(request.url)
++          const sortParam = url.searchParams.get('sort') ?? undefined
++          if (sortParam !== undefined && sortParam !== 'newest' && sortParam !== 'relevance') {
++            return badRequestResponse('Invalid sort parameter. Expected newest or relevance')
++          }
++
++          const postIdParam = url.searchParams.get('postId') ?? undefined
++          if (postIdParam !== undefined && !isValidTypeId(postIdParam, 'post')) {
++            return badRequestResponse('Invalid postId format. Expected post_xxx')
++          }
++
++          const rawLimit = url.searchParams.get('limit')
++          const parsedLimit = rawLimit !== null ? parseInt(rawLimit, 10) : 50
++          if (rawLimit !== null && (!Number.isFinite(parsedLimit) || parsedLimit < 1)) {
++            return badRequestResponse('Invalid limit parameter. Expected a positive integer')
++          }
++          const limit = Math.min(100, Math.max(1, parsedLimit))
++
++          const { getPendingMergeSuggestions } =
++            await import('@/lib/server/domains/merge-suggestions/merge-suggestion.service')
++          const result = await getPendingMergeSuggestions({
++            sort: sortParam,
++            limit,
++            postId: postIdParam as PostId | undefined,
++          })
++
++          return successResponse(
++            result.items.map((item) => ({
++              id: item.id,
++              status: item.status,
++              hybridScore: item.hybridScore,
++              llmConfidence: item.llmConfidence,
++              llmReasoning: item.llmReasoning,
++              createdAt: item.createdAt.toISOString(),
++              updatedAt: item.updatedAt.toISOString(),
++              sourcePost: {
++                ...item.sourcePost,
++                createdAt: item.sourcePost.createdAt.toISOString(),
++              },
++              targetPost: {
++                ...item.targetPost,
++                createdAt: item.targetPost.createdAt.toISOString(),
++              },
++            })),
++            {
++              pagination: {
++                cursor: null,
++                hasMore: result.total > result.items.length,
++                total: result.total,
++              },
++            }
++          )
++        } catch (error) {
++          return handleDomainError(error)
++        }
++      },
++    },
++  },
++})
