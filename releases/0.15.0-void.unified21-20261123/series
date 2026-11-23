@@ -1,0 +1,10 @@
+01-build-image-pins.patch
+02-unified-platform-overlay.patch
+03-mail-issuance-expires-iso.patch
+04-ai-structured-output-nonstream.patch
+05-ai-embedding-zero-pad.patch
+06-api-mcp-list-suggestions.patch
+#WITHHELD 07-oauth-expansion-consent.patch sha256=635ebac25032b3b949ce0c394cf1f1cb44d1486b490936ca06b01431535ac8af
+#WITHHELD 08-customer-upload-policy.patch sha256=fe7295817aa9a572de786fdc0f5f5a22e08d3bb38c06f6cfb877c366cf741eba
+#WITHHELD 09-pipeline-files-proxy.patch sha256=817cf9b2ae12379a6edb113e91c9ef88ea81d46b4abbdd73ddeb09b76516b792
+10-customer-agent-same-origin-proxy.patch
