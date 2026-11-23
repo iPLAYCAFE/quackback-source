@@ -1,0 +1,149 @@
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/customer-agent-route.regression.node.ts b/apps/web/src/lib/server/domains/ai/__tests__/customer-agent-route.regression.node.ts
+index aa25d0e4162c30e8fa0c37d8058310a15b8a791e..bf54d6870f162264aee91cc3ca839c9fb6bf8eae 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/customer-agent-route.regression.node.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/customer-agent-route.regression.node.ts
+@@ -120,3 +120,64 @@ test('customer transport refuses another endpoint or model before forwarding and
+   assert.equal(seen.length, 1)
+   assert.equal(seen[0].redirect, 'error')
+ })
++
++test('same-origin /__ipc-ai/v1 proxy resolves with empty headers and enforces strict origin/header checks', async () => {
++  const sameOrigin = {
++    baseUrl: 'https://feedback.rerolla.store',
++    aiCustomerAgentBaseUrl: 'https://feedback.rerolla.store/__ipc-ai/v1',
++    aiCustomerAgentApiKey: 'synthetic-proxy-hmac',
++    aiCustomerAgentDefaultHeaders: '{}',
++    aiCustomerAgentModel: '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
++    aiCustomerAgentReasoningEffort: 'low',
++  }
++  const route = routeModule.resolveCustomerAgentRoute(sameOrigin)
++  assert.equal(route?.openaiBaseUrl, 'https://feedback.rerolla.store/__ipc-ai/v1')
++  assert.equal(route?.openaiApiKey, sameOrigin.aiCustomerAgentApiKey)
++  assert.equal(route?.model, sameOrigin.aiCustomerAgentModel)
++  assert.equal(route?.reasoningEffort, 'low')
++
++  const trailingSlash = routeModule.resolveCustomerAgentRoute({
++    ...sameOrigin,
++    aiCustomerAgentBaseUrl: 'https://feedback.rerolla.store/__ipc-ai/v1/',
++  })
++  assert.equal(trailingSlash?.openaiBaseUrl, 'https://feedback.rerolla.store/__ipc-ai/v1')
++
++  for (const invalid of [
++    { ...sameOrigin, baseUrl: undefined },
++    { ...sameOrigin, baseUrl: 'https://other.example.com' },
++    { ...sameOrigin, baseUrl: 'http://feedback.rerolla.store' },
++    { ...sameOrigin, aiCustomerAgentBaseUrl: 'http://feedback.rerolla.store/__ipc-ai/v1' },
++    { ...sameOrigin, aiCustomerAgentBaseUrl: 'https://feedback.rerolla.store/__ipc-ai/v2' },
++    { ...sameOrigin, aiCustomerAgentBaseUrl: 'https://feedback.rerolla.store/__ipc-ai/v1/extra' },
++    { ...sameOrigin, aiCustomerAgentBaseUrl: 'https://feedback.rerolla.store/__ipc-ai/v1?x=1' },
++    { ...sameOrigin, aiCustomerAgentDefaultHeaders: '{"Authorization":"Bearer bad"}' },
++    { ...sameOrigin, aiCustomerAgentDefaultHeaders: '{"cf-aig-authorization":"Bearer x"}' },
++    { ...sameOrigin, aiCustomerAgentDefaultHeaders: '{"cf-aig-gateway-id":"gw"}' },
++    { ...sameOrigin, aiCustomerAgentDefaultHeaders: '{"x-custom":"nope"}' },
++  ]) {
++    assert.equal(routeModule.resolveCustomerAgentRoute(invalid), null)
++  }
++
++  const seen: Request[] = []
++  const transport = routeModule.customerAgentFetch(route!, async (request: Request) => {
++    seen.push(request)
++    return Response.json({ synthetic: true })
++  })
++  const init = { method: 'POST', body: JSON.stringify({ model: sameOrigin.aiCustomerAgentModel }) }
++  await assert.rejects(
++    () => transport('https://other.example.com/__ipc-ai/v1/chat/completions', init),
++    { message: 'Customer agent transport refused' }
++  )
++  await assert.rejects(
++    () =>
++      transport(route!.openaiBaseUrl + '/chat/completions', {
++        ...init,
++        body: JSON.stringify({ model: 'other-model' }),
++      }),
++    { message: 'Customer agent transport refused' }
++  )
++  assert.equal(seen.length, 0)
++  await transport(route!.openaiBaseUrl + '/chat/completions', init)
++  assert.equal(seen.length, 1)
++  assert.equal(seen[0].redirect, 'error')
++})
+diff --git a/apps/web/src/lib/server/domains/ai/customer-agent-route.ts b/apps/web/src/lib/server/domains/ai/customer-agent-route.ts
+index 6f550261c852524ed464468c1fee14dcbeded9f9..8fcdf7706238646947f65997d9ea45b9eeaabfe1 100644
+--- a/apps/web/src/lib/server/domains/ai/customer-agent-route.ts
++++ b/apps/web/src/lib/server/domains/ai/customer-agent-route.ts
+@@ -1,5 +1,6 @@
+ /** Customer support has no implicit provider, credential, model or global fallback. */
+ export interface CustomerAgentConfig {
++  baseUrl?: string
+   aiCustomerAgentBaseUrl?: string
+   aiCustomerAgentApiKey?: string
+   aiCustomerAgentDefaultHeaders?: string
+@@ -15,6 +16,26 @@ export interface CustomerAgentRoute {
+   reasoningEffort: 'low' | 'high' | 'max'
+ }
+ 
++function isSameOriginAiProxyUrl(url: URL, appBaseUrl?: string): boolean {
++  const trimmed = appBaseUrl?.trim()
++  if (!trimmed || !/^\/__ipc-ai\/v1\/?$/.test(url.pathname)) return false
++  try {
++    const expected = new URL(trimmed)
++    if (
++      expected.protocol !== 'https:' ||
++      expected.username ||
++      expected.password ||
++      expected.search ||
++      expected.hash
++    ) {
++      return false
++    }
++    return url.origin === expected.origin
++  } catch {
++    return false
++  }
++}
++
+ export function resolveCustomerAgentRoute(config: CustomerAgentConfig): CustomerAgentRoute | null {
+   const baseURL = config.aiCustomerAgentBaseUrl?.trim()
+   const apiKey = config.aiCustomerAgentApiKey?.trim()
+@@ -28,7 +49,9 @@ export function resolveCustomerAgentRoute(config: CustomerAgentConfig): Customer
+     const url = new URL(baseURL)
+     if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash)
+       return null
++    const isSameOriginProxy = isSameOriginAiProxyUrl(url, config.baseUrl)
+     if (!(
++      isSameOriginProxy ||
+       (url.origin === 'https://gateway.ai.cloudflare.com' &&
+         /^\/v1\/[a-f0-9]{32}\/[A-Za-z0-9_-]+\/workers-ai\/v1\/?$/.test(url.pathname)) ||
+       (url.origin === 'https://api.cloudflare.com' &&
+@@ -40,22 +63,24 @@ export function resolveCustomerAgentRoute(config: CustomerAgentConfig): Customer
+     const headers: unknown = JSON.parse(rawHeaders)
+     if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return null
+     const seen = new Set<string>()
++    const allowedHeaders = isSameOriginProxy
++      ? ['x-stainless-lang']
++      : ['cf-aig-authorization', 'cf-aig-gateway-id', 'x-stainless-lang']
+     let gatewayId: unknown
+     for (const [name, value] of Object.entries(headers)) {
+       const key = name.toLowerCase()
+-      if (
+-        seen.has(key) ||
+-        !['cf-aig-authorization', 'cf-aig-gateway-id', 'x-stainless-lang'].includes(key)
+-      )
++      if (seen.has(key) || !allowedHeaders.includes(key))
+         return null
+       if (value !== null && typeof value !== 'string') return null
+       if (value !== null) new Headers([[key, value]])
+       if (key === 'cf-aig-gateway-id') gatewayId = value
+       seen.add(key)
+     }
+-    if (url.origin === 'https://api.cloudflare.com') {
+-      if (typeof gatewayId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(gatewayId)) return null
+-    } else if (gatewayId !== undefined && gatewayId !== url.pathname.split('/')[3]) return null
++    if (!isSameOriginProxy) {
++      if (url.origin === 'https://api.cloudflare.com') {
++        if (typeof gatewayId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(gatewayId)) return null
++      } else if (gatewayId !== undefined && gatewayId !== url.pathname.split('/')[3]) return null
++    }
+     return {
+       openaiBaseUrl: baseURL.replace(/\/$/, ''),
+       openaiApiKey: apiKey,
