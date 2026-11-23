@@ -1,0 +1,13 @@
+diff --git a/apps/web/src/lib/server/auth/mail-issuance-store.ts b/apps/web/src/lib/server/auth/mail-issuance-store.ts
+index 0d048930e6af2cbf16c60f124fd710fffa7cfe86..c8f9f690750921b2773e5e5fc49bc29883d36321 100644
+--- a/apps/web/src/lib/server/auth/mail-issuance-store.ts
++++ b/apps/web/src/lib/server/auth/mail-issuance-store.ts
+@@ -25,7 +25,7 @@ export async function claimMailIssuance(input:{operationKey:string;payloadSha:st
+       // Better Auth's magic-link verifier can look up/delete arbitrary tokens;
+       // a client-derivable namespace identifier would expose this dedupe fact.
+       // The value deliberately has no email/name/OTP/auth claim.
+-      await tx.execute(sql`INSERT INTO verification(id,identifier,value,expires_at,created_at,updated_at) VALUES(${id},${identifier},${value},${new Date(Date.now()+RETENTION_MS)},now(),now())`)
++      await tx.execute(sql`INSERT INTO verification(id,identifier,value,expires_at,created_at,updated_at) VALUES(${id},${identifier},${value},${new Date(Date.now()+RETENTION_MS).toISOString()},now(),now())`)
+       return {id,fresh:true}
+     })
+   }catch(error){
