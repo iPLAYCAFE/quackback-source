@@ -1,0 +1,632 @@
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/logging-wire.regression.node.mjs b/apps/web/src/lib/server/domains/ai/__tests__/logging-wire.regression.node.mjs
+index 782922fa1..89acc33f2 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/logging-wire.regression.node.mjs
++++ b/apps/web/src/lib/server/domains/ai/__tests__/logging-wire.regression.node.mjs
+@@ -84,7 +84,13 @@ try {
+         true,
+         'Internal provider error remains available for classification'
+       )
+-      assert.deepEqual(safeAIError(error), { httpStatus: 401 })
++      assert.deepEqual(safeAIError(error), {
++        httpStatus: 401,
++        errorClass: 'auth_error',
++        finishReason: null,
++        attempt: null,
++        stage: null,
++      })
+       return true
+     }
+   )
+@@ -122,12 +128,19 @@ try {
+       throw new Error(CANARY)
+     },
+   })
+-  assert.deepEqual(safeAIError(malformed), { httpStatus: null })
++  const closedUnknown = {
++    httpStatus: null,
++    errorClass: 'unknown',
++    finishReason: null,
++    attempt: null,
++    stage: null,
++  }
++  assert.deepEqual(safeAIError(malformed), closedUnknown)
+   const cycle = { message: CANARY }
+   cycle.cause = cycle
+-  assert.deepEqual(safeAIError(cycle), { httpStatus: null })
++  assert.deepEqual(safeAIError(cycle), closedUnknown)
+   for (const status of [0, 99, 600, '401', NaN])
+-    assert.deepEqual(safeAIError({ status, body: CANARY }), { httpStatus: null })
++    assert.deepEqual(safeAIError({ status, body: CANARY }), closedUnknown)
+   process.stdout.write(
+     'AI production logging: exact SDK/adapter errors,12 chat policies, closed status and canaries PASS; no remote fetch\n'
+   )
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/retry.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/retry.test.ts
+index b6c178fb6..fa2152d05 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/retry.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/retry.test.ts
+@@ -66,7 +66,13 @@ describe('retry', () => {
+             attempt: 1,
+             max_retries: 1,
+             delay_ms: 1,
+-            ai_error: { httpStatus: status },
++            ai_error: {
++              httpStatus: status,
++              errorClass: status === 429 ? 'rate_limited' : 'upstream_5xx',
++              finishReason: null,
++              attempt: 1,
++              stage: 'retry',
++            },
+           },
+           'retrying ai call'
+         )
+@@ -103,7 +109,13 @@ describe('retry', () => {
+             attempt: 1,
+             max_retries: 1,
+             delay_ms: 1,
+-            ai_error: { httpStatus: status },
++            ai_error: {
++              httpStatus: status,
++              errorClass: status === 429 ? 'rate_limited' : 'upstream_5xx',
++              finishReason: null,
++              attempt: 1,
++              stage: 'retry',
++            },
+           },
+           'retrying ai call'
+         )
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/safe-ai-error.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/safe-ai-error.test.ts
+new file mode 100644
+index 000000000..180054e4e
+--- /dev/null
++++ b/apps/web/src/lib/server/domains/ai/__tests__/safe-ai-error.test.ts
+@@ -0,0 +1,90 @@
++import { describe, it, expect } from 'vitest'
++import { safeAIError } from '../client-options'
++
++const PII_CANARY = 'secret-bearer-sk-live-123456-phusit.s@iplaycafe.app-prompt-leak'
++
++describe('safeAIError enumerated taxonomy', () => {
++  it('classifies Void controller daily/burst quota 429 as quota_refused without leaking text', () => {
++    const wrapped = new Error(`Chat failed: ${PII_CANARY}`, {
++      cause: {
++        status: 429,
++        headers: new Headers({ 'x-should-retry': 'false' }),
++        error: {
++          code: 'rate_limit_exceeded',
++          message: `AI burst rate limit exceeded ${PII_CANARY}`,
++        },
++      },
++    })
++    const out = safeAIError(wrapped, { stage: 'inbox_translation', attempt: 1 })
++    expect(out).toEqual({
++      httpStatus: 429,
++      errorClass: 'quota_refused',
++      finishReason: null,
++      attempt: 1,
++      stage: 'inbox_translation',
++    })
++    expect(JSON.stringify(out)).not.toContain(PII_CANARY)
++  })
++
++  it('classifies upstream 429 without quota markers as rate_limited', () => {
++    const out = safeAIError(
++      { status: 429, message: `Too many requests ${PII_CANARY}` },
++      { stage: 'classification' }
++    )
++    expect(out).toEqual({
++      httpStatus: 429,
++      errorClass: 'rate_limited',
++      finishReason: null,
++      attempt: null,
++      stage: 'classification',
++    })
++  })
++
++  it('covers all enumerated errorClass variants and sanitizes stage/finishReason/attempt', () => {
++    expect(safeAIError({ status: 403, message: PII_CANARY }).errorClass).toBe('auth_error')
++    expect(safeAIError({ status: 400, message: PII_CANARY }).errorClass).toBe('upstream_4xx')
++    expect(safeAIError({ status: 502, message: PII_CANARY }).errorClass).toBe('upstream_5xx')
++    expect(safeAIError({ status: 504, message: PII_CANARY }).errorClass).toBe('timeout')
++    expect(safeAIError(new DOMException(PII_CANARY, 'AbortError')).errorClass).toBe('timeout')
++    expect(safeAIError({ code: 'ECONNRESET', message: PII_CANARY }).errorClass).toBe(
++      'network_error'
++    )
++    expect(safeAIError({ name: 'ZodError', message: PII_CANARY }).errorClass).toBe('schema_invalid')
++    expect(
++      safeAIError({ message: PII_CANARY }, { finishReason: 'content_filter' }).errorClass
++    ).toBe('content_filtered')
++
++    const sanitized = safeAIError(new Error(PII_CANARY), {
++      stage: PII_CANARY,
++      finishReason: PII_CANARY,
++      attempt: -5,
++    })
++    expect(sanitized).toEqual({
++      httpStatus: null,
++      errorClass: 'unknown',
++      finishReason: null,
++      attempt: null,
++      stage: 'other',
++    })
++    expect(JSON.stringify(sanitized)).not.toContain(PII_CANARY)
++  })
++
++  it('survives circular cause chains and throwing getters safely', () => {
++    const cycle: Record<string, unknown> = { message: PII_CANARY }
++    cycle.cause = cycle
++    expect(safeAIError(cycle)).toEqual({
++      httpStatus: null,
++      errorClass: 'unknown',
++      finishReason: null,
++      attempt: null,
++      stage: null,
++    })
++
++    const poisoned = Object.defineProperty({}, 'status', {
++      get() {
++        throw new Error(PII_CANARY)
++      },
++    })
++    expect(safeAIError(poisoned).httpStatus).toBeNull()
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+index a1231dceb..31f862e79 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+@@ -105,8 +105,28 @@ describe('structuredChat', () => {
+     expect(hoisted.chat).toHaveBeenCalledTimes(3)
+     expect(hoisted.chat.mock.calls.every(([options]) => options.debug === false)).toBe(true)
+     expect(hoisted.warn.mock.calls.map(([fields]) => fields)).toEqual([
+-      { model: 'm', fallback: 'json_object', ai_error: { httpStatus: 400 } },
+-      { model: 'm', fallback: 'none', ai_error: { httpStatus: 400 } },
++      {
++        model: 'm',
++        fallback: 'json_object',
++        ai_error: {
++          httpStatus: 400,
++          errorClass: 'upstream_4xx',
++          finishReason: null,
++          attempt: null,
++          stage: null,
++        },
++      },
++      {
++        model: 'm',
++        fallback: 'none',
++        ai_error: {
++          httpStatus: 400,
++          errorClass: 'upstream_4xx',
++          finishReason: null,
++          attempt: null,
++          stage: null,
++        },
++      },
+     ])
+     expect(JSON.stringify(hoisted.warn.mock.calls)).not.toContain(canary)
+   })
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/usage-log.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/usage-log.test.ts
+index 8e118591d..fedfd15a7 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/usage-log.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/usage-log.test.ts
+@@ -147,7 +147,13 @@ describe('usage-log', () => {
+         expect.objectContaining({
+           pipelineStep: 'sentiment',
+           status: 'error',
+-          error: '{"httpStatus":null}',
++          error: JSON.stringify({
++            httpStatus: null,
++            errorClass: 'unknown',
++            finishReason: null,
++            attempt: 3,
++            stage: 'sentiment',
++          }),
+           retryCount: 3,
+           inputTokens: 0,
+           totalTokens: 0,
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/usage-middleware.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/usage-middleware.test.ts
+index e477fe442..35852a15e 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/usage-middleware.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/usage-middleware.test.ts
+@@ -65,7 +65,13 @@ describe('createUsageLoggingMiddleware', () => {
+     expect(logAiUsage).toHaveBeenCalledWith(
+       expect.objectContaining({
+         status: 'error',
+-        error: '{"httpStatus":null}',
++        error: JSON.stringify({
++          httpStatus: null,
++          errorClass: 'unknown',
++          finishReason: null,
++          attempt: null,
++          stage: 'extraction',
++        }),
+         inputTokens: 0,
+         totalTokens: 0,
+       })
+diff --git a/apps/web/src/lib/server/domains/ai/client-options.ts b/apps/web/src/lib/server/domains/ai/client-options.ts
+index eeb54c81b..7b1beb62d 100644
+--- a/apps/web/src/lib/server/domains/ai/client-options.ts
++++ b/apps/web/src/lib/server/domains/ai/client-options.ts
+@@ -93,14 +93,329 @@ export function getAIChatOptions() {
+   return { debug: false as const }
+ }
+ 
+-/** Logging-only projection: preserve the original error for internal classification. */
+-export function safeAIError(error: unknown): { httpStatus: number | null } {
++export type AiErrorClass =
++  | 'quota_refused'
++  | 'rate_limited'
++  | 'upstream_4xx'
++  | 'upstream_5xx'
++  | 'timeout'
++  | 'network_error'
++  | 'auth_error'
++  | 'schema_invalid'
++  | 'content_filtered'
++  | 'unknown'
++
++export type AiFinishReason =
++  'stop' | 'length' | 'content_filter' | 'tool_calls' | 'error' | 'unknown'
++
++export type AiErrorStage =
++  | 'assistant'
++  | 'help_center_answers'
++  | 'inbox_translation'
++  | 'classification'
++  | 'conversation_summary'
++  | 'extraction'
++  | 'sentiment'
++  | 'quality_gate'
++  | 'merge_check'
++  | 'merge_assessment'
++  | 'embedding'
++  | 'document_ingest'
++  | 'copilot_transform'
++  | 'copilot_summary'
++  | 'structured_chat'
++  | 'retry'
++  | 'other'
++
++export interface SafeAIErrorContext {
++  attempt?: unknown
++  stage?: unknown
++  finishReason?: unknown
++}
++
++export interface SafeAIErrorPayload {
++  httpStatus: number | null
++  errorClass: AiErrorClass
++  finishReason: AiFinishReason | null
++  attempt: number | null
++  stage: AiErrorStage | null
++}
++
++const VALID_FINISH_REASONS = new Set<string>([
++  'stop',
++  'length',
++  'content_filter',
++  'tool_calls',
++  'error',
++  'unknown',
++])
++
++const VALID_ERROR_STAGES = new Set<string>([
++  'assistant',
++  'help_center_answers',
++  'inbox_translation',
++  'classification',
++  'conversation_summary',
++  'extraction',
++  'sentiment',
++  'quality_gate',
++  'merge_check',
++  'merge_assessment',
++  'embedding',
++  'document_ingest',
++  'copilot_transform',
++  'copilot_summary',
++  'structured_chat',
++  'retry',
++  'other',
++])
++
++const NETWORK_ERROR_CODES = new Set<string>([
++  'ECONNRESET',
++  'ECONNREFUSED',
++  'ENOTFOUND',
++  'EAI_AGAIN',
++  'EPIPE',
++  'UND_ERR_SOCKET',
++  'UND_ERR_CONNECT',
++])
++
++function safeOwnValue(target: unknown, key: string): unknown {
++  if (!target || typeof target !== 'object') return undefined
+   try {
+-    const status = Object.getOwnPropertyDescriptor(error, 'status')?.value
+-    return {
+-      httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,
++    const desc = Object.getOwnPropertyDescriptor(target, key)
++    if (desc) {
++      return 'value' in desc ? desc.value : undefined
++    }
++    if (
++      (key === 'name' || key === 'message') &&
++      (target instanceof Error ||
++        (typeof DOMException === 'function' && target instanceof DOMException))
++    ) {
++      const value = key === 'name' ? target.name : target.message
++      return typeof value === 'string' ? value : undefined
+     }
++    return undefined
+   } catch {
+-    return { httpStatus: null }
++    return undefined
++  }
++}
++
++function safeLowerString(value: unknown): string {
++  return typeof value === 'string' ? value.toLowerCase() : ''
++}
++
++function safeHeaderValue(headers: unknown, name: string): string {
++  if (!headers || typeof headers !== 'object') return ''
++  try {
++    if (headers instanceof Headers) {
++      return (headers.get(name) ?? '').toLowerCase()
++    }
++    const lower = name.toLowerCase()
++    for (const key of Object.keys(headers as Record<string, unknown>)) {
++      if (key.toLowerCase() === lower) {
++        const val = safeOwnValue(headers, key)
++        if (typeof val === 'string') return val.toLowerCase()
++      }
++    }
++  } catch {
++    return ''
++  }
++  return ''
++}
++
++function extractHttpStatus(node: unknown): number | null {
++  for (const key of ['status', 'statusCode', 'responseStatus']) {
++    const raw = safeOwnValue(node, key)
++    if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 100 && raw <= 599) {
++      return raw
++    }
++  }
++  const response = safeOwnValue(node, 'response')
++  if (response && typeof response === 'object') {
++    const raw = safeOwnValue(response, 'status')
++    if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 100 && raw <= 599) {
++      return raw
++    }
++  }
++  return null
++}
++
++function extractFinishReason(value: unknown): AiFinishReason | null {
++  if (typeof value !== 'string') return null
++  const normalized = value.trim().toLowerCase()
++  return VALID_FINISH_REASONS.has(normalized) ? (normalized as AiFinishReason) : null
++}
++
++function extractAttempt(value: unknown): number | null {
++  if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100) {
++    return value
++  }
++  return null
++}
++
++function extractStage(value: unknown): AiErrorStage | null {
++  if (typeof value !== 'string') return null
++  const normalized = value.trim().toLowerCase()
++  if (!normalized) return null
++  return VALID_ERROR_STAGES.has(normalized) ? (normalized as AiErrorStage) : 'other'
++}
++
++function walkErrorChain(root: unknown): unknown[] {
++  const nodes: unknown[] = []
++  const seen = new WeakSet<object>()
++  let cursor: unknown = root
++  for (let depth = 0; depth < 6 && cursor && typeof cursor === 'object'; depth++) {
++    if (seen.has(cursor)) break
++    seen.add(cursor)
++    nodes.push(cursor)
++    cursor = safeOwnValue(cursor, 'cause')
++  }
++  return nodes
++}
++
++function classifyError(
++  nodes: unknown[],
++  httpStatus: number | null,
++  finishReason: AiFinishReason | null
++): AiErrorClass {
++  let sawQuota = false
++  let sawRateLimit = false
++  let sawAuth = false
++  let sawContentFilter = finishReason === 'content_filter'
++  let sawSchemaInvalid = false
++  let sawTimeout = false
++  let sawNetwork = false
++
++  for (const node of nodes) {
++    const name = safeLowerString(safeOwnValue(node, 'name'))
++    const codeRaw = safeOwnValue(node, 'code')
++    const code = safeLowerString(codeRaw)
++    const message = safeLowerString(safeOwnValue(node, 'message'))
++    const nestedError = safeOwnValue(node, 'error')
++    const nestedCode = safeLowerString(safeOwnValue(nestedError, 'code'))
++    const nestedType = safeLowerString(safeOwnValue(nestedError, 'type'))
++    const nestedMsg = safeLowerString(safeOwnValue(nestedError, 'message'))
++    const headers = safeOwnValue(node, 'headers')
++    const shouldRetryHeader = safeHeaderValue(headers, 'x-should-retry')
++
++    if (
++      code === 'quota_refused' ||
++      code === 'insufficient_quota' ||
++      code === 'ai_quota_misconfigured' ||
++      nestedCode === 'quota_refused' ||
++      nestedCode === 'insufficient_quota' ||
++      nestedCode === 'ai_quota_misconfigured' ||
++      name === 'quotaexceedederror' ||
++      /ai daily quota exceeded|ai burst rate limit exceeded|daily_limit|burst_limit|quota_refused|insufficient_quota/.test(
++        `${message} ${nestedMsg}`
++      ) ||
++      (httpStatus === 429 && shouldRetryHeader === 'false')
++    ) {
++      sawQuota = true
++    }
++
++    if (
++      code === 'rate_limit_exceeded' ||
++      nestedCode === 'rate_limit_exceeded' ||
++      name === 'ratelimiterror'
++    ) {
++      sawRateLimit = true
++    }
++
++    if (
++      name === 'authenticationerror' ||
++      name === 'permissiondeniederror' ||
++      code === 'invalid_api_key' ||
++      nestedCode === 'invalid_api_key' ||
++      nestedType === 'authentication_error'
++    ) {
++      sawAuth = true
++    }
++
++    if (
++      code === 'content_filter' ||
++      nestedCode === 'content_filter' ||
++      /content_filter|content_policy_violation/.test(`${message} ${nestedMsg}`)
++    ) {
++      sawContentFilter = true
++    }
++
++    if (
++      name === 'assistantcompletionerror' ||
++      name === 'zoderror' ||
++      code === 'structured-output-missing-result' ||
++      code === 'structured-output-parse-failed' ||
++      code === 'non_conformant_output'
++    ) {
++      sawSchemaInvalid = true
++    }
++
++    if (
++      name === 'aborterror' ||
++      name === 'timeouterror' ||
++      name === 'aitimeouterror' ||
++      code === 'etimedout' ||
++      code === 'und_err_connect_timeout' ||
++      /\b(timed?\s*out|timeout|aborted)\b/.test(message)
++    ) {
++      sawTimeout = true
++    }
++
++    if (
++      (typeof codeRaw === 'string' && NETWORK_ERROR_CODES.has(codeRaw.toUpperCase())) ||
++      name === 'apiconnectionerror' ||
++      /\b(econnreset|econnrefused|enotfound|eai_again|socket hang up|fetch failed|network error)\b/.test(
++        message
++      )
++    ) {
++      sawNetwork = true
++    }
++  }
++
++  if (sawQuota) return 'quota_refused'
++  if (httpStatus === 401 || httpStatus === 403 || sawAuth) return 'auth_error'
++  if (httpStatus === 429 || sawRateLimit) return 'rate_limited'
++  if (sawContentFilter) return 'content_filtered'
++  if (sawSchemaInvalid) return 'schema_invalid'
++  if (httpStatus === 408 || httpStatus === 504 || sawTimeout) return 'timeout'
++  if (sawNetwork) return 'network_error'
++  if (httpStatus !== null && httpStatus >= 500 && httpStatus <= 599) return 'upstream_5xx'
++  if (httpStatus !== null && httpStatus >= 400 && httpStatus <= 499) return 'upstream_4xx'
++  return 'unknown'
++}
++
++/**
++ * Logging-only strict enumerated error projection: never emits free-form error
++ * messages, URLs, headers, prompts, or response bodies. Preserve the original
++ * error for internal classification.
++ */
++export function safeAIError(error: unknown, context?: SafeAIErrorContext): SafeAIErrorPayload {
++  try {
++    const nodes = walkErrorChain(error)
++    let httpStatus: number | null = null
++    let finishReason = extractFinishReason(context?.finishReason)
++    let attempt = extractAttempt(context?.attempt)
++
++    for (const node of nodes) {
++      if (httpStatus === null) httpStatus = extractHttpStatus(node)
++      if (finishReason === null)
++        finishReason = extractFinishReason(safeOwnValue(node, 'finishReason'))
++      if (attempt === null) {
++        attempt = extractAttempt(safeOwnValue(node, 'retryCount') ?? safeOwnValue(node, 'attempt'))
++      }
++    }
++
++    const errorClass = classifyError(nodes, httpStatus, finishReason)
++    const stage = extractStage(context?.stage)
++    return { httpStatus, errorClass, finishReason, attempt, stage }
++  } catch {
++    return {
++      httpStatus: null,
++      errorClass: 'unknown',
++      finishReason: null,
++      attempt: null,
++      stage: null,
++    }
+   }
+ }
+diff --git a/apps/web/src/lib/server/domains/ai/retry.ts b/apps/web/src/lib/server/domains/ai/retry.ts
+index a6213cd02..cba85ff7b 100644
+--- a/apps/web/src/lib/server/domains/ai/retry.ts
++++ b/apps/web/src/lib/server/domains/ai/retry.ts
+@@ -60,7 +60,7 @@ export async function withRetry<T>(
+           attempt: attempt + 1,
+           max_retries: maxRetries,
+           delay_ms: Math.round(delay),
+-          ai_error: safeAIError(lastError),
++          ai_error: safeAIError(lastError, { attempt: attempt + 1, stage: 'retry' }),
+         },
+         'retrying ai call'
+       )
+diff --git a/apps/web/src/lib/server/domains/ai/usage-log.ts b/apps/web/src/lib/server/domains/ai/usage-log.ts
+index 9a96ffa03..38a6a2cb8 100644
+--- a/apps/web/src/lib/server/domains/ai/usage-log.ts
++++ b/apps/web/src/lib/server/domains/ai/usage-log.ts
+@@ -133,13 +133,15 @@ export async function withUsageLogging<T>(
+     return result
+   } catch (error) {
+     const durationMs = Date.now() - start
+-    const errorMessage = JSON.stringify(safeAIError(error))
+ 
+     // Extract retryCount from withRetry's error context if available
+     const retryCount =
+       error instanceof Error && 'retryCount' in error
+         ? (error as Error & { retryCount: number }).retryCount
+         : undefined
++    const errorMessage = JSON.stringify(
++      safeAIError(error, { stage: params.pipelineStep, attempt: retryCount })
++    )
+ 
+     await logAiUsage({
+       ...params,
+diff --git a/apps/web/src/lib/server/domains/ai/usage-middleware.ts b/apps/web/src/lib/server/domains/ai/usage-middleware.ts
+index 1d22ead3b..f5dbcd866 100644
+--- a/apps/web/src/lib/server/domains/ai/usage-middleware.ts
++++ b/apps/web/src/lib/server/domains/ai/usage-middleware.ts
+@@ -102,7 +102,7 @@ export function createUsageLoggingMiddleware(
+     onError(ctx: ChatMiddlewareContext, info: ErrorInfo) {
+       finalize(ctx, {
+         status: 'error',
+-        error: JSON.stringify(safeAIError(info.error)),
++        error: JSON.stringify(safeAIError(info.error, { stage: params.pipelineStep })),
+       })
+     },
+ 
