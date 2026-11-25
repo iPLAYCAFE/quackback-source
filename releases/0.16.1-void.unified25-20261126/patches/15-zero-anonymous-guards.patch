@@ -1,0 +1,260 @@
+diff --git a/apps/web/src/lib/server/functions/__tests__/conversation-anon-guard.test.ts b/apps/web/src/lib/server/functions/__tests__/conversation-anon-guard.test.ts
+new file mode 100644
+index 000000000..f31b29968
+--- /dev/null
++++ b/apps/web/src/lib/server/functions/__tests__/conversation-anon-guard.test.ts
+@@ -0,0 +1,121 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('@tanstack/react-start', () => ({
++  createServerOnlyFn: <T>(fn: T) => fn,
++  createServerFn: () => {
++    const chain = {
++      validator: () => chain,
++      handler: () => vi.fn(),
++    }
++    return chain
++  },
++}))
++
++const hoisted = vi.hoisted(() => ({
++  getSettings: vi.fn(),
++  isConversationsEnabledFor: vi.fn(),
++  resolvePortalAccessForRequest: vi.fn(),
++  isBlocked: vi.fn(),
++  assertConversationSendRate: vi.fn(),
++  policyActorFromAuth: vi.fn(),
++  sendVisitorMessage: vi.fn(),
++}))
++
++vi.mock('@/lib/server/functions/workspace', () => ({
++  getSettings: hoisted.getSettings,
++}))
++vi.mock('@/lib/server/domains/settings/settings.support', () => ({
++  isConversationsEnabledFor: hoisted.isConversationsEnabledFor,
++  isSupportTicketsEnabled: vi.fn(async () => false),
++}))
++vi.mock('@/lib/server/functions/portal-access', () => ({
++  resolvePortalAccessForRequest: hoisted.resolvePortalAccessForRequest,
++}))
++vi.mock('@/lib/server/domains/principals/blocking', () => ({
++  isBlocked: hoisted.isBlocked,
++}))
++vi.mock('@/lib/server/domains/conversation/conversation.ratelimit', () => ({
++  assertConversationSendRate: hoisted.assertConversationSendRate,
++}))
++vi.mock('@/lib/server/functions/auth-helpers', () => ({
++  getOptionalAuth: vi.fn(),
++  requireAuth: vi.fn(),
++  assertPermission: vi.fn(),
++  policyActorFromAuth: hoisted.policyActorFromAuth,
++  hasAuthCredentials: vi.fn(() => false),
++  normalizePrincipalType: (raw: string | null | undefined) =>
++    raw === 'anonymous' || raw === 'support' || raw === 'service' ? raw : 'user',
++}))
++vi.mock('@/lib/server/domains/conversation/conversation.service', () => ({
++  CSAT_CONVERSATION_OPEN: 'CSAT_CONVERSATION_OPEN',
++  sendVisitorMessage: hoisted.sendVisitorMessage,
++}))
++
++import { runSendConversationMessage } from '../conversation'
++import type { AuthContext } from '../auth-helpers'
++
++function makeCtx(principalType: string, role: 'user' | 'admin' = 'user'): AuthContext {
++  return {
++    settings: { id: 'ws_1', slug: 'test', name: 'Test', logoKey: null } as unknown as AuthContext['settings'],
++    user: { id: 'user_1', email: 'u@example.com', name: 'User', image: null } as AuthContext['user'],
++    principal: { id: 'principal_1', role, type: principalType } as AuthContext['principal'],
++    permissions: [],
++    scope: 'widget',
++  }
++}
++
++beforeEach(() => {
++  vi.clearAllMocks()
++  hoisted.isConversationsEnabledFor.mockResolvedValue(true)
++  hoisted.resolvePortalAccessForRequest.mockResolvedValue({ granted: true })
++  hoisted.isBlocked.mockResolvedValue(false)
++  hoisted.assertConversationSendRate.mockResolvedValue(undefined)
++  hoisted.policyActorFromAuth.mockResolvedValue({
++    principalId: 'p_1',
++    role: 'user',
++    principalType: 'anonymous',
++    segmentIds: [],
++  })
++  hoisted.sendVisitorMessage.mockResolvedValue({ ok: true, id: 'msg_1' })
++})
++
++describe('assertVisitorConversationAccess Zero-Anonymous guard', () => {
++  it('blocks anonymous principal when workspace allowAnonymous is false or unset', async () => {
++    hoisted.getSettings.mockResolvedValue({
++      id: 'ws_1',
++      portalConfig: JSON.stringify({ features: { allowAnonymous: false } }),
++    })
++    await expect(
++      runSendConversationMessage(makeCtx('anonymous'), { content: 'hello' } as never)
++    ).rejects.toThrow('Sign in to start a conversation')
++    expect(hoisted.sendVisitorMessage).not.toHaveBeenCalled()
++
++    hoisted.getSettings.mockResolvedValue({ id: 'ws_1' })
++    await expect(
++      runSendConversationMessage(makeCtx('anonymous'), { content: 'hello' } as never)
++    ).rejects.toThrow('Sign in to start a conversation')
++    expect(hoisted.sendVisitorMessage).not.toHaveBeenCalled()
++  })
++
++  it('allows anonymous principal when workspace allowAnonymous is explicitly true', async () => {
++    hoisted.getSettings.mockResolvedValue({
++      id: 'ws_1',
++      portalConfig: JSON.stringify({ features: { allowAnonymous: true } }),
++    })
++    await expect(
++      runSendConversationMessage(makeCtx('anonymous'), { content: 'hello' } as never)
++    ).resolves.toMatchObject({ ok: true })
++    expect(hoisted.sendVisitorMessage).toHaveBeenCalledTimes(1)
++  })
++
++  it('allows identified user principal even when allowAnonymous is false', async () => {
++    hoisted.getSettings.mockResolvedValue({
++      id: 'ws_1',
++      portalConfig: JSON.stringify({ features: { allowAnonymous: false } }),
++    })
++    await expect(
++      runSendConversationMessage(makeCtx('user'), { content: 'hello' } as never)
++    ).resolves.toMatchObject({ ok: true })
++    expect(hoisted.sendVisitorMessage).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/apps/web/src/lib/server/functions/conversation.ts b/apps/web/src/lib/server/functions/conversation.ts
+index 1aa19a5a2..48f6ff33f 100644
+--- a/apps/web/src/lib/server/functions/conversation.ts
++++ b/apps/web/src/lib/server/functions/conversation.ts
+@@ -270,6 +270,16 @@ async function assertConversationsEnabled(principalId: PrincipalId): Promise<voi
+  */
+ async function assertVisitorConversationAccess(ctx: AuthContext): Promise<void> {
+   await assertConversationsEnabled(ctx.principal.id)
++  if (!isTeamMember(ctx.principal.role) && ctx.principal.type === 'anonymous') {
++    const [{ getSettings }, { workspaceAllowsAnonymous }] = await Promise.all([
++      import('./workspace'),
++      import('@/lib/server/domains/settings/settings.types'),
++    ])
++    const settings = await getSettings()
++    if (!workspaceAllowsAnonymous(settings?.portalConfig)) {
++      throw new ForbiddenError('ANONYMOUS_DISABLED', 'Sign in to start a conversation')
++    }
++  }
+   if (isTeamMember(ctx.principal.role) || ctx.scope === 'widget') return
+   const { resolvePortalAccessForRequest } = await import('./portal-access')
+   const access = await resolvePortalAccessForRequest()
+diff --git a/apps/web/src/routes/api/widget/__tests__/kb-ask.test.ts b/apps/web/src/routes/api/widget/__tests__/kb-ask.test.ts
+index bb60c981b..73b48948d 100644
+--- a/apps/web/src/routes/api/widget/__tests__/kb-ask.test.ts
++++ b/apps/web/src/routes/api/widget/__tests__/kb-ask.test.ts
+@@ -49,6 +49,11 @@ vi.mock('@/lib/server/functions/workspace', () => ({
+   getSettings: (...args: unknown[]) => mockGetSettings(...args),
+ }))
+ 
++const mockResolveWidgetViewer = vi.fn()
++vi.mock('@/lib/server/widget/widget-viewer', () => ({
++  resolveWidgetViewer: (...args: unknown[]) => mockResolveWidgetViewer(...args),
++}))
++
+ import { ANONYMOUS_ACTOR } from '@/lib/server/policy/types'
+ import { handleKbAsk, handleKbAskProbe, KB_ASK_MAX_QUERY_CHARS, KB_ASK_RATE_LIMIT } from '../kb-ask'
+ import { makeKbArticle } from '@/lib/server/domains/assistant/__tests__/kb-fixtures'
+@@ -103,7 +108,11 @@ beforeEach(() => {
+   mockEnforceAiTokenBudget.mockResolvedValue(undefined)
+   mockLogAiUsage.mockResolvedValue(undefined)
+   mockGetChatModel.mockReturnValue('gpt-test')
+-  mockGetSettings.mockResolvedValue({ id: 'settings_1' })
++  mockGetSettings.mockResolvedValue({
++    id: 'settings_1',
++    portalConfig: JSON.stringify({ features: { allowAnonymous: true } }),
++  })
++  mockResolveWidgetViewer.mockResolvedValue(ANONYMOUS_ACTOR)
+   mockRetrieve.mockResolvedValue([makeKbArticle('article_1')])
+   mockSynthesize.mockResolvedValue({
+     kind: 'grounded',
+@@ -231,8 +240,43 @@ describe('POST /api/widget/kb-ask', () => {
+     expect(mockRetrieve).not.toHaveBeenCalled()
+   })
+ 
++  it('403s anonymous callers when allowAnonymous is disabled or unset, without consuming AI budget or retrieving', async () => {
++    mockGetSettings.mockResolvedValue({
++      id: 'settings_1',
++      portalConfig: JSON.stringify({ features: { allowAnonymous: false } }),
++    })
++    const resFalse = await handleKbAsk({ request: makePost('hello') })
++    expect(resFalse.status).toBe(403)
++    expect((await resFalse.json()).error.code).toBe('ANONYMOUS_DISABLED')
++    expect(mockEnforceAiTokenBudget).not.toHaveBeenCalled()
++    expect(mockRetrieve).not.toHaveBeenCalled()
++
++    mockGetSettings.mockResolvedValue({ id: 'settings_1' })
++    const resUnset = await handleKbAsk({ request: makePost('hello') })
++    expect(resUnset.status).toBe(403)
++    expect((await resUnset.json()).error.code).toBe('ANONYMOUS_DISABLED')
++  })
++
++  it('allows authenticated user callers even when allowAnonymous is false', async () => {
++    mockGetSettings.mockResolvedValue({
++      id: 'settings_1',
++      portalConfig: JSON.stringify({ features: { allowAnonymous: false } }),
++    })
++    mockResolveWidgetViewer.mockResolvedValue({
++      principalId: 'principal_user_1',
++      role: 'user',
++      principalType: 'user',
++      segmentIds: [],
++    })
++    const res = await handleKbAsk({ request: makePost('hello') })
++    expect(res.status).toBe(200)
++  })
++
+   it('keys the workspace bucket off the resolved workspace id, not a caller-supplied header', async () => {
+-    mockGetSettings.mockResolvedValue({ id: 'settings_evade_test' })
++    mockGetSettings.mockResolvedValue({
++      id: 'settings_evade_test',
++      portalConfig: JSON.stringify({ features: { allowAnonymous: true } }),
++    })
+     await handleKbAsk({ request: makePost('hello') })
+     const keys = mockIncrementBucket.mock.calls.map(([spec]) => spec.key)
+     expect(keys).toContain('kbask:workspace:settings_evade_test')
+diff --git a/apps/web/src/routes/api/widget/kb-ask.ts b/apps/web/src/routes/api/widget/kb-ask.ts
+index 155ad6228..c48211c56 100644
+--- a/apps/web/src/routes/api/widget/kb-ask.ts
++++ b/apps/web/src/routes/api/widget/kb-ask.ts
+@@ -56,6 +56,7 @@ import {
+ import { resolveWidgetViewer } from '@/lib/server/widget/widget-viewer'
+ import { isPortalOpenToRequest } from '@/lib/server/widget/portal-gate'
+ import { getSettings } from '@/lib/server/functions/workspace'
++import { workspaceAllowsAnonymous } from '@/lib/server/domains/settings/settings.types'
+ import type { Actor } from '@/lib/server/policy/types'
+ import { enforceAiTokenBudget } from '@/lib/server/domains/settings/tier-enforce'
+ import { TierLimitError } from '@/lib/server/errors/tier-limit-error'
+@@ -187,6 +188,14 @@ export async function handleKbAsk({ request }: { request: Request }): Promise<Re
+   const settings = await getSettings()
+   if (!settings) return widgetJsonError(503, 'WORKSPACE_UNAVAILABLE', 'Workspace unavailable')
+ 
++  // Identified widget users may answer from segment-gated categories they
++  // belong to; unidentified callers resolve anonymous and are refused when the
++  // workspace disables anonymous access (fail closed before spending rate/AI budget).
++  const viewer = await resolveWidgetViewer()
++  if (!workspaceAllowsAnonymous(settings.portalConfig) && viewer.principalType !== 'user') {
++    return widgetJsonError(403, 'ANONYMOUS_DISABLED', 'Sign in to ask AI')
++  }
++
+   const limited = await enforceWidgetQuota(request, {
+     keyPrefix: 'kbask',
+     workspaceKey: settings.id,
+@@ -207,10 +216,6 @@ export async function handleKbAsk({ request }: { request: Request }): Promise<Re
+   }
+ 
+   const retrievalStartedAt = Date.now()
+-  // Identified widget users may answer from segment-gated categories they
+-  // belong to; unidentified callers resolve anonymous and see only ungated
+-  // articles (fail closed).
+-  const viewer = await resolveWidgetViewer()
+   let articles
+   try {
+     articles = await retrieveKbArticles(query, { audience: 'public', viewer })
