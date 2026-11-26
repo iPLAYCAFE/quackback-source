@@ -48,10 +48,10 @@ index ecd9dbf43..5429656de 100644
          { id: 'files.tray.capReached', defaultMessage: 'You can attach up to {max} files' },
 diff --git a/apps/web/src/components/widget/__tests__/widget-messenger-sign-in.test.tsx b/apps/web/src/components/widget/__tests__/widget-messenger-sign-in.test.tsx
 new file mode 100644
-index 000000000..4b7f79e6d
+index 000000000..d6d464ecd
 --- /dev/null
 +++ b/apps/web/src/components/widget/__tests__/widget-messenger-sign-in.test.tsx
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,124 @@
 +// @vitest-environment happy-dom
 +/**
 + * With the workspace's anonymous switch off, the server refuses an anonymous
@@ -139,6 +139,23 @@ index 000000000..4b7f79e6d
 +  it('keeps the thread while identity is still resolving (no sign-in flash for a signed-in visitor)', () => {
 +    auth.identityResolved = false
 +    renderMessenger({ allowAnonymous: false })
++    expect(screen.queryByTestId('widget-sign-in-to-chat')).toBeNull()
++    expect(threadProps).toHaveBeenCalled()
++  })
++
++  it('gives way to the thread as soon as a late host identify lands', () => {
++    // The SDK's default anonymous identify resolves identity before a native
++    // host's identify ACK; the prompt then shows for that interval only.
++    const view = renderMessenger({ allowAnonymous: false })
++    expect(screen.getByTestId('widget-sign-in-to-chat')).toBeTruthy()
++    auth.user = { name: 'Owner' }
++    view.rerender(
++      <IntlProvider locale="en" messages={{}}>
++        <QueryClientProvider client={new QueryClient()}>
++          <WidgetMessenger allowAnonymous={false} />
++        </QueryClientProvider>
++      </IntlProvider>
++    )
 +    expect(screen.queryByTestId('widget-sign-in-to-chat')).toBeNull()
 +    expect(threadProps).toHaveBeenCalled()
 +  })
