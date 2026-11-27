@@ -18,7 +18,7 @@
   "overlayProfile": "unified27-workers-ai",
   "schemaDigest": "517f5bfb2d29ba3220b813cbdd0462645ec98b8e8e1c9b1c8eb327ad9661805d",
   "ledgerLength": 307,
-  "servedImageDigest": null,
+  "servedImageDigest": "sha256:86d572e300f395595ccc37074716da46f8d4ab9b255f90726ceefb8db40c24e5",
   "servedAt": null,
   "patches": [
     {
