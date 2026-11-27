@@ -14,6 +14,7 @@ The upstream source together with these patches is the source of the program you
 
 | Release | Served at | Upstream | Patches |
 | --- | --- | --- | --- |
+| [`0.16.1-void.unified26-20261127`](releases/0.16.1-void.unified26-20261127/) | published, not yet served | `v0.16.1` at `4f73e31823499db8626569369cff016d56be80c6` | 15 in order: 12 published, 3 withheld for now |
 | [`0.16.1-void.unified25-20261126`](releases/0.16.1-void.unified25-20261126/) | all five iPLAYCAFE and brand feedback portals (`feedback.iplaycafe.dev`, `feedback.iplaycafe.app`, `feedback.rerolla.store`, `feedback.qcaddy.app`, `feedback.paikaan.app`) from 2026-11-26 | `v0.16.1` at `4f73e31823499db8626569369cff016d56be80c6` | 14 in order: 11 published, 3 withheld for now |
 | [`0.16.1-void.unified24-20261125`](releases/0.16.1-void.unified24-20261125/) | all five iPLAYCAFE and brand feedback portals (`feedback.iplaycafe.dev`, `feedback.iplaycafe.app`, `feedback.rerolla.store`, `feedback.qcaddy.app`, `feedback.paikaan.app`) from 2026-11-24 20:11Z | `v0.16.1` at `4f73e31823499db8626569369cff016d56be80c6` | 14 in order: 11 published, 3 withheld for now |
 | [`0.16.1-void.unified23-20261124`](releases/0.16.1-void.unified23-20261124/) | all five iPLAYCAFE and brand feedback portals (`feedback.iplaycafe.dev`, `feedback.iplaycafe.app`, `feedback.paikaan.app`, `feedback.qcaddy.app`, `feedback.rerolla.store`) from 2026-11-24 | `v0.16.1` at `4f73e31823499db8626569369cff016d56be80c6` | 13 in order: 10 published, 3 withheld for now |
