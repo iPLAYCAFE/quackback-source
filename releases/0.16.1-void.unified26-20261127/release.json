@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "releaseId": "0.16.1-void.unified26-20261127",
+  "upstream": {
+    "repository": "https://github.com/QuackbackIO/quackback.git",
+    "tag": "v0.16.1",
+    "commit": "4f73e31823499db8626569369cff016d56be80c6",
+    "appVersion": "0.16.1",
+    "widgetSdkVersion": "0.1.6",
+    "bunLockSha256": "c76e185e81cfb63404c55daaf1ad0fdc90ce6ceeeab5b1813da6b338f79a4768"
+  },
+  "toolchain": {
+    "bun": "1.4.4",
+    "buildImage": "oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d",
+    "runImage": "oven/bun:1.4.4-alpine@sha256:4cf82f5686b196504fe119db3fcd9185b191f82ece82c40680e597228ec6070a",
+    "dockerfile": "apps/web/Dockerfile"
+  },
+  "overlayProfile": "unified26-workers-ai",
+  "schemaDigest": "517f5bfb2d29ba3220b813cbdd0462645ec98b8e8e1c9b1c8eb327ad9661805d",
+  "ledgerLength": 307,
+  "servedImageDigest": "sha256:a8bc1f0bca38cbfcb2119d62b7c44e618f304ffeb530ef5e8a2ac0c9a9736b49",
+  "servedAt": null,
+  "patches": [
+    {
+      "order": 1,
+      "file": "patches/01-build-image-pins.patch",
+      "overlayId": null,
+      "sha256": "d5dd0f741b557990fc7f4b92e017aa5e2d81575602c9a29f53f77709d2ee1828",
+      "summary": "Digest-pinned oven/bun 1.4.4 build and alpine runtime base images",
+      "status": "public"
+    },
+    {
+      "order": 2,
+      "file": "patches/02-unified-platform-overlay.patch",
+      "overlayId": "unified",
+      "sha256": "b868f2c4455233fa44a346a118f83abee53b14c8dc04ec1fdd1fc87095bd667e",
+      "summary": "Unified Void platform overlay over v0.16.1 4f73e318 (drops trusted-proxy-peers IP forwarding and replaces visitor-beacon/public-config with cookieless Layer-1 analytics, visitorDeviceTracking: false, qb_device expiry, and zero-cookie tracker)",
+      "status": "public"
+    },
+    {
+      "order": 3,
+      "file": "patches/03-mail-issuance-expires-iso.patch",
+      "overlayId": "mailfix",
+      "sha256": "a6d8543ebf80b702c73e5d461dfff81ebfbe7582d0bacfe1478067f90e84ab09",
+      "summary": "Serialize email link/token expiry dates with .toISOString() across mail dispatch",
+      "status": "public"
+    },
+    {
+      "order": 4,
+      "file": "patches/04-ai-structured-output-nonstream.patch",
+      "overlayId": "ai-nonstream",
+      "sha256": "fdd414cd717c0fdf7de6e9fbc7a5d79f919b505adf7edb926f6742fd3fbead78",
+      "summary": "Add AI_STRUCTURED_OUTPUT_STREAM=false option to use one-shot structured chat output",
+      "status": "public"
+    },
+    {
+      "order": 5,
+      "file": "patches/06-api-mcp-list-suggestions.patch",
+      "overlayId": "list-suggestions",
+      "sha256": "2ef4136b078e48f1b1ea8236f9d55c5752ed4a1a8abaa7200e0f03194be7a5b3",
+      "summary": "Add GET /api/v1/suggestions public REST endpoint and MCP list_suggestions tool",
+      "status": "public"
+    },
+    {
+      "order": 6,
+      "file": null,
+      "overlayId": null,
+      "sha256": "635ebac25032b3b949ce0c394cf1f1cb44d1486b490936ca06b01431535ac8af",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "security embargo"
+    },
+    {
+      "order": 7,
+      "file": null,
+      "overlayId": null,
+      "sha256": "fe7295817aa9a572de786fdc0f5f5a22e08d3bb38c06f6cfb877c366cf741eba",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "security embargo"
+    },
+    {
+      "order": 8,
+      "file": null,
+      "overlayId": null,
+      "sha256": "817cf9b2ae12379a6edb113e91c9ef88ea81d46b4abbdd73ddeb09b76516b792",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "depends on, and describes, a patch under security embargo"
+    },
+    {
+      "order": 9,
+      "file": "patches/10-customer-agent-same-origin-proxy.patch",
+      "overlayId": "customer-agent-same-origin",
+      "sha256": "70eb124b2a82d743a0654d42e90af76344a48eb83f52fb90f91dcda3750c1136",
+      "summary": "Allow same-origin /__ipc-ai/v1 customer agent endpoint gated by request BASE_URL origin",
+      "status": "public"
+    },
+    {
+      "order": 10,
+      "file": "patches/11-status-projection-batch-updates.patch",
+      "overlayId": "status-batch-updates",
+      "sha256": "e8820e7c2ef752ddd9ccf57d684777a481382f3cec91b74f3fa1ca99a0561002",
+      "summary": "Batch-fetch status_incident_updates once in projectIncidents to eliminate N+1 SSR latency on regional PG",
+      "status": "public"
+    },
+    {
+      "order": 11,
+      "file": "patches/12-generated-and-authz-coverage.patch",
+      "overlayId": "generated-authz",
+      "sha256": "9567c510f60fb05fa0e6b75db509865404315730c3df0fcf8d632bf4cd8e708d",
+      "summary": "Regenerate MATRIX.md and platform-schema.generated.json on unified25 (with embedding-zero-pad dropped); classify the native launcher host entry point and count list_suggestions in upstream authz guards",
+      "status": "public"
+    },
+    {
+      "order": 12,
+      "file": "patches/13-tanstack-ai-1x-overlay-tests.patch",
+      "overlayId": "tanstack-ai-1x-tests",
+      "sha256": "a826466db24fec4711dc29c44576ddbfc08794ea3681fa32a9c49ebbe25fea02",
+      "summary": "Overlay tests on the @tanstack/ai 1.x contract and AI_STRUCTURED_OUTPUT_STREAM=false (test only)",
+      "status": "public"
+    },
+    {
+      "order": 13,
+      "file": "patches/14-ai-error-taxonomy.patch",
+      "overlayId": "ai-error-taxonomy",
+      "sha256": "0daceb050ca1a6a041bb8fd4dd4d0bb1ac3db37ac1046a9128ec3eb22a6a0c0d",
+      "summary": "Emit strict enumerated error taxonomy {httpStatus, errorClass, finishReason, attempt, stage} from safeAIError with zero free-form text (T4)",
+      "status": "public"
+    },
+    {
+      "order": 14,
+      "file": "patches/15-zero-anonymous-guards.patch",
+      "overlayId": "zero-anonymous-guards",
+      "sha256": "86b1ace9897ffd30357a33356bdcd1b55c235d8461cae5a3e0a6b287d42f4fea",
+      "summary": "Enforce Zero-Anonymous session guards in conversation server functions and POST /api/widget/kb-ask (returns 403 ANONYMOUS_DISABLED when anonymous access is disabled)",
+      "status": "public"
+    },
+    {
+      "order": 15,
+      "file": "patches/16-widget-sign-in-to-chat.patch",
+      "overlayId": "widget-sign-in-to-chat",
+      "sha256": "e5a7f8a3894dfca79e4bc02ba1c941bdc19361448f99beed063d671d0e059508",
+      "summary": "Widget shows \"Sign in to chat\" and emits auth-required when anonymous access is off and the visitor is not identified; readable 413 (Over N MB) and 403 ANONYMOUS_DISABLED (Sign in to send files) upload refusals",
+      "status": "public"
+    }
+  ],
+  "complete": false
+}
