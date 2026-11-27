@@ -1,0 +1,103 @@
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+index b3c2ca5696cd7998c1ab0a6c25682ad3e2f8569d..a1231dceb654fd8910ece49d0b0c58a302657f50 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+@@ -99,7 +99,7 @@ describe('structuredChat', () => {
+     hoisted.chat
+       .mockRejectedValueOnce(rejection(`json_schema is unsupported ${canary}`))
+       .mockRejectedValueOnce(rejection(`json_object is unsupported ${canary}`, 'response_format'))
+-      .mockResolvedValueOnce('{"sentiment":"positive","confidence":1}')
++      .mockResolvedValueOnce(textResult('{"sentiment":"positive","confidence":1}'))
+ 
+     expect(await structuredChat(base)).toEqual({ sentiment: 'positive', confidence: 1 })
+     expect(hoisted.chat).toHaveBeenCalledTimes(3)
+@@ -263,7 +263,7 @@ describe('structuredChat', () => {
+     hoisted.chat
+       .mockRejectedValueOnce(rejection('response_format json_schema not supported'))
+       .mockRejectedValueOnce(rejection('response_format json_object not supported'))
+-      .mockResolvedValueOnce('{"sentiment":"positive","confidence":1}')
++      .mockResolvedValueOnce(textResult('{"sentiment":"positive","confidence":1}'))
+ 
+     await expect(structuredChat({ ...base, model: 'gpt-6-luna' })).resolves.toEqual({
+       sentiment: 'positive',
+diff --git a/apps/web/src/lib/server/domains/assistant/__tests__/synthesis-core.tanstack-contract.test.ts b/apps/web/src/lib/server/domains/assistant/__tests__/synthesis-core.tanstack-contract.test.ts
+index bc44b40d4c61ec8ad34fb2a29287b6b046e12307..079602ec54a477336c630c48f4d6797eed0e8567 100644
+--- a/apps/web/src/lib/server/domains/assistant/__tests__/synthesis-core.tanstack-contract.test.ts
++++ b/apps/web/src/lib/server/domains/assistant/__tests__/synthesis-core.tanstack-contract.test.ts
+@@ -93,8 +93,11 @@ function stubProvider(replies: Array<(body: Body) => Response>): void {
+   bodies = []
+   vi.stubGlobal(
+     'fetch',
+-    vi.fn(async (_url: unknown, init?: RequestInit) => {
+-      const body = JSON.parse(String(init?.body)) as Body
++    vi.fn(async (input: unknown, init?: RequestInit) => {
++      // The iPLAYCAFE no-train transport (getOpenAIClientOptions) passes a Request with the body
++      // inside it instead of (url, init); read whichever the SDK path produced.
++      const raw = init?.body ?? (input instanceof Request ? await input.text() : undefined)
++      const body = JSON.parse(String(raw)) as Body
+       bodies.push(body)
+       const reply = replies.shift()
+       if (!reply) throw new Error('unexpected extra provider request')
+@@ -169,7 +172,7 @@ describe('synthesis-core on the real TanStack AI engine', () => {
+       'stream',
+       'stream_options',
+     ])
+-    expect(bodies[0].provider).toEqual({ require_parameters: true })
++    expect(bodies[0].provider).toEqual({ require_parameters: true, data_collection: 'deny' })
+   })
+ 
+   it('runs the tool loop and the structured finalization as separate requests', async () => {
+@@ -297,3 +300,53 @@ describe('structuredChat on the real TanStack AI engine', () => {
+     expect(bodies[1].response_format).toEqual({ type: 'json_object' })
+   })
+ })
++
++// iPLAYCAFE: the portals run with AI_STRUCTURED_OUTPUT_STREAM=false (controller ai-adapter.ts), which
++// patch 04 implements by hiding the adapter's structuredOutputStream so the engine falls back to the
++// one-shot structuredOutput. Hold that path, and the prompt-only { text } fallback, to the real engine.
++describe('structuredChat with AI_STRUCTURED_OUTPUT_STREAM=false on the real TanStack AI engine', () => {
++  beforeEach(() => {
++    ;(mockConfig as Record<string, unknown>).aiStructuredOutputStream = false
++  })
++  afterEach(() => {
++    delete (mockConfig as Record<string, unknown>).aiStructuredOutputStream
++  })
++
++  it('sends a one-shot json_schema request and returns the validated object', async () => {
++    stubProvider([(body) => (body.stream ? sse([delta({ role: 'assistant', content: '{"text":"no"}' }), delta({}, 'stop'), USAGE]) : completion('{"text":"ok"}'))])
++
++    const result = await structuredChat({
++      model: 'm-nonstream',
++      systemPrompts: ['sys'],
++      messages: [{ role: 'user', content: 'hi' }],
++      schema: OutputSchema,
++      maxTokens: 100,
++    })
++
++    expect(result).toEqual({ text: 'ok' })
++    expect(bodies).toHaveLength(1)
++    expect(bodies[0].stream).toBeFalsy()
++    expect(bodies[0]).toHaveProperty('response_format')
++  })
++
++  it('falls back to the prompt-described schema and reads the { text } result', async () => {
++    const rejection = () =>
++      new Response(
++        JSON.stringify({ error: { message: 'response_format json_schema is not supported', param: 'response_format' } }),
++        { status: 400, headers: { 'content-type': 'application/json' } }
++      )
++    stubProvider([rejection, (body) => (body.stream ? sse([delta({ role: 'assistant', content: '{"text":"ok"}' }), delta({}, 'stop'), USAGE]) : completion('{"text":"ok"}'))])
++
++    const result = await structuredChat({
++      model: 'm-nonstream-fallback',
++      systemPrompts: ['sys'],
++      messages: [{ role: 'user', content: 'hi' }],
++      schema: OutputSchema,
++      maxTokens: 100,
++    })
++
++    expect(result).toEqual({ text: 'ok' })
++    expect(bodies).toHaveLength(2)
++    expect(bodies[1].response_format).toEqual({ type: 'json_object' })
++  })
++})

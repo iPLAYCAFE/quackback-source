@@ -1,0 +1,468 @@
+diff --git a/apps/web/src/components/widget/__tests__/widget-native-capture-contract.test.tsx b/apps/web/src/components/widget/__tests__/widget-native-capture-contract.test.tsx
+new file mode 100644
+index 000000000..fe8e95c31
+--- /dev/null
++++ b/apps/web/src/components/widget/__tests__/widget-native-capture-contract.test.tsx
+@@ -0,0 +1,34 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { act, renderHook } from '@testing-library/react'
++import { configureNativeCapture, useNativeCaptureAction } from '../widget-native-capture'
++
++const origin = 'https://app.example.test'
++afterEach(() => {
++  act(() => configureNativeCapture('', { enabled: false }))
++  vi.restoreAllMocks()
++})
++
++describe('native capture request echoes the armed host contract', () => {
++  it.each([
++    [undefined, 'iplaycafe.feedback/native-1'],
++    ['iplaycafe.feedback/native-1', 'iplaycafe.feedback/native-1'],
++    ['iplaycafe.feedback/native-2', 'iplaycafe.feedback/native-2'],
++  ] as const)('armed with %s posts %s', (armed, expected) => {
++    const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
++    const { result } = renderHook(() => useNativeCaptureAction())
++    act(() =>
++      armed
++        ? configureNativeCapture(origin, { enabled: true }, armed)
++        : configureNativeCapture(origin, { enabled: true })
++    )
++    act(() => result.current!.request())
++    expect(post).toHaveBeenCalledWith(
++      {
++        type: 'quackback:event',
++        name: 'native-capture-request',
++        payload: { contract: expected, audience: window.location.origin, hostOrigin: origin },
++      },
++      origin
++    )
++  })
++})
+diff --git a/apps/web/src/components/widget/widget-native-capture.tsx b/apps/web/src/components/widget/widget-native-capture.tsx
+index 7e3ca730c..25a89cda4 100644
+--- a/apps/web/src/components/widget/widget-native-capture.tsx
++++ b/apps/web/src/components/widget/widget-native-capture.tsx
+@@ -1,18 +1,26 @@
+ import { useSyncExternalStore } from 'react'
+ import { NATIVE_HOST_CONTRACT } from '@/lib/shared/widget/native-host'
++import type { NativeHostContract } from '@/lib/shared/widget/native-host'
+ 
+-let config: { origin: string; enabled: boolean; label: string } = {
++let config: { origin: string; enabled: boolean; label: string; contract: NativeHostContract } = {
+   origin: '',
+   enabled: false,
+   label: '',
++  contract: NATIVE_HOST_CONTRACT,
+ }
+ const listeners = new Set<() => void>()
+-const empty = { origin: '', enabled: false, label: '' }
+-export function configureNativeCapture(origin: string, payload: Record<string, unknown>) {
++const empty = { origin: '', enabled: false, label: '', contract: NATIVE_HOST_CONTRACT }
++/** `contract` is the armed host's contract; the capture request echoes it. */
++export function configureNativeCapture(
++  origin: string,
++  payload: Record<string, unknown>,
++  contract: NativeHostContract = NATIVE_HOST_CONTRACT
++) {
+   config = {
+     origin,
+     enabled: payload.enabled === true,
+     label: typeof payload.label === 'string' ? payload.label.slice(0, 100) : 'Report an issue',
++    contract,
+   }
+   for (const listener of listeners) listener()
+ }
+@@ -40,7 +48,7 @@ export function useNativeCaptureAction(): { label: string; request: () => void }
+           type: 'quackback:event',
+           name: 'native-capture-request',
+           payload: {
+-            contract: NATIVE_HOST_CONTRACT,
++            contract: value.contract,
+             audience: window.location.origin,
+             hostOrigin: value.origin,
+           },
+diff --git a/apps/web/src/lib/client/__tests__/native-host-controller-contracts.test.ts b/apps/web/src/lib/client/__tests__/native-host-controller-contracts.test.ts
+new file mode 100644
+index 000000000..015367c13
+--- /dev/null
++++ b/apps/web/src/lib/client/__tests__/native-host-controller-contracts.test.ts
+@@ -0,0 +1,104 @@
++import { describe, it, expect, vi } from 'vitest'
++import { createNativeHostController } from '../native-host-controller'
++import { nativeHostCommandSchema, nativeHostContextSchema } from '@/lib/shared/widget/native-host'
++import type { NativeHostContext } from '@/lib/shared/widget/native-host'
++
++const V1 = 'iplaycafe.feedback/native-1'
++const V2 = 'iplaycafe.feedback/native-2'
++const origin = 'https://app.example.test'
++const audience = 'https://feedback.example.test'
++function command(contract: string, type: string, payload = {}) {
++  return {contract, operationId: crypto.randomUUID(), type, payload}
++}
++function ports() {
++  return {audience, clearIdentity: vi.fn(() => 'previous'), applyIdentity: vi.fn(),
++    identify: vi.fn(async (_payload: Record<string, unknown>, context: NativeHostContext, _previous: string | null): Promise<Record<string, unknown>> => ({
++      sessionToken: 'native-session', user: {id: 'u'}, nativeAck: {...context, audience, jti: crypto.randomUUID()}})),
++    action: vi.fn(async (): Promise<Record<string, unknown>> => ({loggedOut: true})), respond: vi.fn(), configureCapture: vi.fn()}
++}
++const replies = (p: ReturnType<typeof ports>, operationId: string) =>
++  p.respond.mock.calls.filter(([, , value]) => value.operationId === operationId).map(([, , value]) => value)
++
++describe('native host contracts: exactly native-1 and native-2', () => {
++  it('accepts both literals and nothing else', () => {
++    for (const contract of [V1, V2]) {
++      expect(nativeHostCommandSchema.safeParse(command(contract, 'identify')).success).toBe(true)
++      expect(nativeHostContextSchema.safeParse({contract, operationId: crypto.randomUUID(), hostOrigin: origin}).success).toBe(true)
++    }
++    for (const contract of ['iplaycafe.feedback/native-3', 'iplaycafe.feedback/native-', 'native-2', '', 'IPLAYCAFE.FEEDBACK/NATIVE-2']) {
++      expect(nativeHostCommandSchema.safeParse(command(contract, 'identify')).success).toBe(false)
++      expect(nativeHostContextSchema.safeParse({contract, operationId: crypto.randomUUID(), hostOrigin: origin}).success).toBe(false)
++    }
++  })
++  it('ignores a command with an unknown contract entirely', async () => {
++    const p = ports(); await createNativeHostController(p).receive(command('iplaycafe.feedback/native-9', 'identify'), origin)
++    expect(p.identify).not.toHaveBeenCalled(); expect(p.respond).not.toHaveBeenCalled()
++  })
++  it('identifies a native-2 host in native-2 and echoes native-2 in the reply', async () => {
++    const p = ports(); const bridge = createNativeHostController(p); const op = command(V2, 'identify')
++    await bridge.receive(op, origin)
++    expect(p.identify.mock.calls[0][1]).toEqual({contract: V2, operationId: op.operationId, hostOrigin: origin})
++    expect(replies(p, op.operationId)).toEqual([expect.objectContaining({contract: V2, success: true, type: 'identify'})])
++  })
++  it('keeps native-1 replies in native-1', async () => {
++    const p = ports(); const bridge = createNativeHostController(p); const op = command(V1, 'identify')
++    await bridge.receive(op, origin)
++    expect(replies(p, op.operationId)).toEqual([expect.objectContaining({contract: V1, success: true})])
++  })
++  it('runs native-2 actions and capture-config with the native-2 context', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command(V2, 'identify'), origin)
++    p.action.mockResolvedValueOnce({id: 'ticket'})
++    const ticket = command(V2, 'create-ticket', {title: 't'})
++    await bridge.receive(ticket, origin)
++    expect(p.action).toHaveBeenLastCalledWith('create-ticket', {title: 't'}, {contract: V2, operationId: ticket.operationId, hostOrigin: origin})
++    expect(replies(p, ticket.operationId)).toEqual([expect.objectContaining({contract: V2, success: true, result: {id: 'ticket'}})])
++    await bridge.receive(command(V2, 'capture-config', {enabled: true}), origin)
++    expect(p.configureCapture).toHaveBeenLastCalledWith(origin, {enabled: true}, V2)
++  })
++  it.each([[V1, V2], [V2, V1]])('refuses a %s identity being driven by %s commands (CONTRACT_MISMATCH, no action, no fence)', async (made, used) => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command(made, 'identify'), origin)
++    for (const type of ['create-ticket', 'list-tickets', 'upload-attachment', 'capture-config']) {
++      const op = command(used, type)
++      await bridge.receive(op, origin)
++      expect(replies(p, op.operationId)).toEqual([expect.objectContaining({contract: used, success: false, error: 'CONTRACT_MISMATCH'})])
++    }
++    expect(p.action).not.toHaveBeenCalled()
++    expect(p.configureCapture).toHaveBeenCalledTimes(1) // only the identify fence
++    const ok = command(made, 'list-tickets'); p.action.mockResolvedValueOnce({tickets: []})
++    await bridge.receive(ok, origin)
++    expect(replies(p, ok.operationId)).toEqual([expect.objectContaining({contract: made, success: true})])
++  })
++  it('re-identifying in the other contract first retires the old session in its own contract', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command(V1, 'identify'), origin)
++    const upgrade = command(V2, 'identify')
++    await bridge.receive(upgrade, origin)
++    expect(p.action).toHaveBeenCalledWith('logout', {}, {contract: V1, operationId: upgrade.operationId, hostOrigin: origin}, 'previous')
++    expect(p.action.mock.invocationCallOrder[0]).toBeLessThan(p.identify.mock.invocationCallOrder[1])
++    expect(p.identify.mock.calls[1][1]).toEqual(expect.objectContaining({contract: V2}))
++    expect(replies(p, upgrade.operationId)).toEqual([expect.objectContaining({contract: V2, success: true})])
++    const ticket = command(V2, 'list-tickets'); p.action.mockResolvedValueOnce({tickets: []})
++    await bridge.receive(ticket, origin)
++    expect(replies(p, ticket.operationId)).toEqual([expect.objectContaining({success: true})])
++  })
++  it('accepts a logout in either contract and replies in the logout command contract', async () => {
++    const p = ports(); const bridge = createNativeHostController(p)
++    await bridge.receive(command(V2, 'identify'), origin)
++    const logout = command(V1, 'logout')
++    await bridge.receive(logout, origin)
++    expect(p.action).toHaveBeenCalledWith('logout', {}, {contract: V2, operationId: logout.operationId, hostOrigin: origin}, 'previous')
++    expect(replies(p, logout.operationId)).toEqual([expect.objectContaining({contract: V1, success: true, result: {loggedOut: true}})])
++  })
++  it('refuses an identify ACK whose contract differs from the command and retires that session', async () => {
++    const p = ports()
++    p.identify.mockImplementationOnce(async (_payload, context) => ({sessionToken: 'other', user: {id: 'u'},
++      nativeAck: {...context, contract: V1, audience, jti: crypto.randomUUID()}}))
++    const op = command(V2, 'identify')
++    await createNativeHostController(p).receive(op, origin)
++    expect(p.applyIdentity).not.toHaveBeenCalled()
++    expect(p.action).toHaveBeenCalledWith('logout', {}, {contract: V2, operationId: op.operationId, hostOrigin: origin}, 'other')
++    expect(replies(p, op.operationId)).toEqual([expect.objectContaining({contract: V2, success: false, error: 'ACK_INVALID'})])
++  })
++})
+diff --git a/apps/web/src/lib/client/native-host-controller.ts b/apps/web/src/lib/client/native-host-controller.ts
+index 04ab6804b..88fdb8c33 100644
+--- a/apps/web/src/lib/client/native-host-controller.ts
++++ b/apps/web/src/lib/client/native-host-controller.ts
+@@ -1,5 +1,5 @@
+ import { nativeHostCommandSchema, NATIVE_HOST_CONTRACT } from '@/lib/shared/widget/native-host'
+-import type { NativeHostContext } from '@/lib/shared/widget/native-host'
++import type { NativeHostContext, NativeHostContract } from '@/lib/shared/widget/native-host'
+ 
+ interface Ports {
+   audience: string
+@@ -8,20 +8,34 @@ interface Ports {
+   identify(payload: Record<string, unknown>, context: NativeHostContext, previous: string | null): Promise<Record<string, unknown>>
+   action(type: string, payload: Record<string, unknown>, context: NativeHostContext, token?: string | null): Promise<unknown>
+   respond(origin: string, event: string, payload: Record<string, unknown>): void
+-  configureCapture(origin: string, payload: Record<string, unknown>): void
++  configureCapture(origin: string, payload: Record<string, unknown>, contract?: NativeHostContract): void
+ }
+ 
+-/** One controller per iframe. Identity changes fence every older async result. */
++/** One controller per iframe. Identity changes fence every older async result.
++ *
++ * Contracts (native-1 and native-2 carry the same protocol under two labels):
++ * - every reply and event echoes the contract of the host command it answers;
++ * - identify and logout are accepted in either contract, and a re-identify in the
++ *   other contract still retires the previous session first (the upgrade path);
++ * - every other command must use the contract the current identity was made in,
++ *   or it is refused with CONTRACT_MISMATCH (the server binding has no contract
++ *   column, so this per-command rule is enforced here; the token's `ipc.contract`
++ *   must equal the redeeming context's contract on the server). */
+ export function createNativeHostController(ports: Ports) {
+   let generation = 0
+   let identityOrigin: string | null = null
++  let identityContract: NativeHostContract = NATIVE_HOST_CONTRACT
+   let retirement: {token: string | null; context: NativeHostContext; promise: Promise<void> | null} | null = null
+   const inFlight = new Set<string>()
+   const identifying = new Set<Promise<void>>()
+-  function fence() { generation += 1; identityOrigin = null; ports.configureCapture('', {enabled: false}) }
+-  function beginRetirement(token: string | null, hostOrigin: string, operationId: string = crypto.randomUUID()): Promise<void> {
++  function fence() {
++    generation += 1; identityOrigin = null; identityContract = NATIVE_HOST_CONTRACT
++    ports.configureCapture('', {enabled: false})
++  }
++  function beginRetirement(token: string | null, hostOrigin: string, operationId: string = crypto.randomUUID(),
++    contract: NativeHostContract = NATIVE_HOST_CONTRACT): Promise<void> {
+     if (retirement?.promise) return retirement.promise
+-    const owned = retirement ?? {token, context: {contract: NATIVE_HOST_CONTRACT, operationId, hostOrigin}, promise: null}
++    const owned = retirement ?? {token, context: {contract, operationId, hostOrigin}, promise: null}
+     const pending = (async () => {
+       if (!owned.token) throw new Error('NATIVE_SESSION_TOKEN_REQUIRED')
+       const result = await ports.action('logout', {}, owned.context, owned.token)
+@@ -40,9 +54,10 @@ export function createNativeHostController(ports: Ports) {
+   /** Ordinary SDK logout/handoff retires only our own exact bound issuer. */
+   async function retire(): Promise<void> {
+     const previousOrigin = identityOrigin
++    const previousContract = identityContract
+     fence()
+     const earlier = [...identifying]
+-    if (previousOrigin) await beginRetirement(ports.clearIdentity(), previousOrigin)
++    if (previousOrigin) await beginRetirement(ports.clearIdentity(), previousOrigin, undefined, previousContract)
+     else if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
+     await Promise.all(earlier)
+     if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
+@@ -51,11 +66,12 @@ export function createNativeHostController(ports: Ports) {
+     const parsed = nativeHostCommandSchema.safeParse(raw)
+     if (!parsed.success || origin === 'null') return
+     const command = parsed.data
+-    const context: NativeHostContext = {contract: NATIVE_HOST_CONTRACT,
++    const context: NativeHostContext = {contract: command.contract,
+       operationId: command.operationId, hostOrigin: origin}
+     if (inFlight.has(command.operationId)) return
+     inFlight.add(command.operationId)
+     const previousOrigin = identityOrigin
++    const previousContract = identityContract
+     if (command.type === 'identify' || command.type === 'logout') fence()
+     const current = generation
+     const reply = (success: boolean, result?: unknown, error?: string) => ports.respond(origin, 'native-result', {
+@@ -65,20 +81,21 @@ export function createNativeHostController(ports: Ports) {
+     try {
+       if (command.type === 'capture-config') {
+         if (identityOrigin !== origin) throw new Error('IDENTITY_REQUIRED')
+-        ports.configureCapture(origin, command.payload)
++        if (identityContract !== command.contract) throw new Error('CONTRACT_MISMATCH')
++        ports.configureCapture(origin, command.payload, command.contract)
+         reply(true, {configured: true})
+       } else if (command.type === 'identify') {
+         const earlier = [...identifying]
+         const work = (async () => {
+           const previous = ports.clearIdentity()
+-          if (previousOrigin) await beginRetirement(previous, previousOrigin, command.operationId)
++          if (previousOrigin) await beginRetirement(previous, previousOrigin, command.operationId, previousContract)
+           else if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
+           await Promise.all(earlier)
+           if (generation !== current) return
+           const result = await ports.identify(command.payload, context, previousOrigin ? null : previous)
+           if (generation !== current) {
+             // The late server session must not survive a switch/logout.
+-            await beginRetirement(result.sessionToken as string, origin, command.operationId)
++            await beginRetirement(result.sessionToken as string, origin, command.operationId, command.contract)
+             return
+           }
+           const ack = result.nativeAck as Record<string, unknown> | undefined
+@@ -87,11 +104,12 @@ export function createNativeHostController(ports: Ports) {
+               ack.hostOrigin !== origin || ack.audience !== ports.audience || typeof ack.jti !== 'string' ||
+               typeof result.sessionToken !== 'string' || result.sessionToken.length === 0 ||
+               !user || typeof user.id !== 'string' || user.id.length === 0) {
+-            if (typeof result.sessionToken === 'string') await beginRetirement(result.sessionToken, origin, command.operationId)
++            if (typeof result.sessionToken === 'string') await beginRetirement(result.sessionToken, origin, command.operationId, command.contract)
+             throw new Error('ACK_INVALID')
+           }
+           ports.applyIdentity(result)
+           identityOrigin = origin
++          identityContract = command.contract
+           reply(true, {jti: ack.jti, user: result.user})
+         })()
+         identifying.add(work)
+@@ -99,13 +117,14 @@ export function createNativeHostController(ports: Ports) {
+       } else if (command.type === 'logout') {
+         const token = ports.clearIdentity()
+         const earlier = [...identifying]
+-        if (previousOrigin) await beginRetirement(token, previousOrigin, command.operationId)
++        if (previousOrigin) await beginRetirement(token, previousOrigin, command.operationId, previousContract)
+         else if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
+         await Promise.all(earlier)
+         if (retirement) await beginRetirement(retirement.token, retirement.context.hostOrigin, retirement.context.operationId)
+         if (generation === current) reply(true, {loggedOut: true})
+       } else {
+         if (identityOrigin !== origin) throw new Error('IDENTITY_REQUIRED')
++        if (identityContract !== command.contract) throw new Error('CONTRACT_MISMATCH')
+         const result = await ports.action(command.type, command.payload, context)
+         if (generation === current) reply(true, result)
+       }
+diff --git a/apps/web/src/lib/server/widget/__tests__/native-host-contracts.integration.test.ts b/apps/web/src/lib/server/widget/__tests__/native-host-contracts.integration.test.ts
+new file mode 100644
+index 000000000..29a0fc2a8
+--- /dev/null
++++ b/apps/web/src/lib/server/widget/__tests__/native-host-contracts.integration.test.ts
+@@ -0,0 +1,52 @@
++import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { createId } from '@quackback/ids'
++vi.mock('@/lib/server/db', async original => ({
++  ...await original<typeof import('@/lib/server/db')>(),
++  db: (await import('@/lib/server/__tests__/db-test-fixture')).testDb,
++}))
++vi.mock('@/lib/server/config', () => ({config: {baseUrl: 'https://feedback.example.test'}}))
++import { createDbTestFixture, testDb } from '@/lib/server/__tests__/db-test-fixture'
++import { session, user, widgetIdentifiedSession, sql } from '@/lib/server/db'
++import { bindNativeHostSession, consumeNativeHostToken, readNativeHostClaims, requireBoundNativeHostSession, retireNativeHostSession } from '../native-host-token'
++
++const audience = 'https://feedback.example.test'
++const hostOrigin = 'https://app.example.test'
++const V1 = 'iplaycafe.feedback/native-1' as const
++const V2 = 'iplaycafe.feedback/native-2' as const
++const fixture = await createDbTestFixture({probe: async db => {await db.execute(sql`select 1 from ipc_native_session_binding limit 0`)}})
++afterAll(fixture.close)
++
++function signed(contract: typeof V1 | typeof V2) {
++  const now = Math.floor(Date.now() / 1000)
++  const ipc = {contract, operationId: crypto.randomUUID(), hostOrigin}
++  return {ipc, claims: {aud: audience, jti: crypto.randomUUID(), iat: now, exp: now + 60, ipc}}
++}
++
++describe.skipIf(!fixture.available)('native-2 tokens on real PostgreSQL', () => {
++  beforeEach(fixture.begin)
++  afterEach(fixture.rollback)
++  it('redeems a native-2 token once; a replay of the same jti is refused in either contract', async () => {
++    const {ipc, claims} = signed(V2)
++    const read = readNativeHostClaims(claims, ipc, audience)
++    expect(read).not.toBeNull()
++    expect(await consumeNativeHostToken(read!)).toBe(true)
++    expect(await consumeNativeHostToken(read!)).toBe(false)
++    // The same jti relabelled native-1 is refused by the contract match before it reaches the store.
++    expect(readNativeHostClaims(claims, {...ipc, contract: V1}, audience)).toBeNull()
++  })
++  it('binds a native-2 session and serves and retires it from a native-2 context', async () => {
++    const {ipc, claims} = signed(V2)
++    const userId = createId('user'), principalId = createId('principal'), sessionId = crypto.randomUUID(), token = crypto.randomUUID()
++    await testDb.insert(user).values({id: userId, name: 'Synthetic native-2 session'})
++    await testDb.insert(session).values({id: sessionId, token, userId, scope: 'widget',
++      expiresAt: new Date(Date.now() + 60_000), createdAt: new Date(), updatedAt: new Date()})
++    await testDb.insert(widgetIdentifiedSession).values({sessionId, hmacVerified: true, identitySource: 'hmac'})
++    const read = readNativeHostClaims(claims, ipc, audience)!
++    expect(await consumeNativeHostToken(read)).toBe(true)
++    await bindNativeHostSession(sessionId, principalId, read)
++    await expect(requireBoundNativeHostSession(principalId, ipc, token)).resolves.toBe(sessionId)
++    await expect(retireNativeHostSession(token, ipc)).resolves.toEqual({loggedOut: true})
++    await expect(retireNativeHostSession(token, ipc)).resolves.toEqual({loggedOut: true})
++    await expect(requireBoundNativeHostSession(principalId, ipc, token)).rejects.toThrow('NATIVE_SESSION_BINDING_REQUIRED')
++  })
++})
+diff --git a/apps/web/src/lib/server/widget/__tests__/native-host-token.test.ts b/apps/web/src/lib/server/widget/__tests__/native-host-token.test.ts
+index 565e6429b..e805d9d73 100644
+--- a/apps/web/src/lib/server/widget/__tests__/native-host-token.test.ts
++++ b/apps/web/src/lib/server/widget/__tests__/native-host-token.test.ts
+@@ -33,3 +33,19 @@ describe('native host SSO constraints after signature verification', () => {
+     expect(readNativeHostClaims(invalid, context, claims.aud, 1020)).toBeNull()
+   })
+ })
++
++describe('native-2 tokens and claim/context contract matching', () => {
++  const context2 = { ...context, contract: 'iplaycafe.feedback/native-2' }
++  const claims2 = { ...claims, ipc: context2 }
++  it('accepts a native-2 claim redeemed by a native-2 host context', () => {
++    expect(readNativeHostClaims(claims2, context2, claims.aud, 1020)?.ipc.contract).toBe('iplaycafe.feedback/native-2')
++  })
++  it('refuses a native-1 token redeemed by a native-2 context, and the reverse', () => {
++    expect(readNativeHostClaims(claims, context2, claims.aud, 1020)).toBeNull()
++    expect(readNativeHostClaims(claims2, context, claims.aud, 1020)).toBeNull()
++  })
++  it.each(['iplaycafe.feedback/native-3', 'native-2', ''])('refuses the unknown contract %j in claim or context', (contract) => {
++    expect(readNativeHostClaims({ ...claims, ipc: { ...context, contract } }, { ...context, contract }, claims.aud, 1020)).toBeNull()
++    expect(readNativeHostClaims(claims, { ...context, contract }, claims.aud, 1020)).toBeNull()
++  })
++})
+diff --git a/apps/web/src/lib/server/widget/native-host-token.ts b/apps/web/src/lib/server/widget/native-host-token.ts
+index 2d7ee5a5a..0cd31823e 100644
+--- a/apps/web/src/lib/server/widget/native-host-token.ts
++++ b/apps/web/src/lib/server/widget/native-host-token.ts
+@@ -23,6 +23,8 @@ export function readNativeHostClaims(
+   const value = claim.data
+   if (value.aud !== audience || value.exp <= now || value.iat > now + 5 ||
+       value.exp - value.iat <= 0 || value.exp - value.iat > 60 ||
++      // A token minted for one contract is redeemed only by a host speaking it.
++      value.ipc.contract !== host.data.contract ||
+       value.ipc.operationId !== host.data.operationId ||
+       value.ipc.hostOrigin !== host.data.hostOrigin) return null
+   return value
+diff --git a/apps/web/src/lib/shared/widget/native-host.ts b/apps/web/src/lib/shared/widget/native-host.ts
+index 4e3177146..4e15b84bf 100644
+--- a/apps/web/src/lib/shared/widget/native-host.ts
++++ b/apps/web/src/lib/shared/widget/native-host.ts
+@@ -1,6 +1,13 @@
+ import { z } from 'zod'
+ 
++/** The original host contract; the default a host speaks unless it says otherwise. */
+ export const NATIVE_HOST_CONTRACT = 'iplaycafe.feedback/native-1' as const
++/** Same host↔iframe protocol under the native-2 label (lynx-template Wave 2B). */
++export const NATIVE_HOST_CONTRACT_V2 = 'iplaycafe.feedback/native-2' as const
++/** Exactly these literals are accepted; any other string is refused. */
++export const NATIVE_HOST_CONTRACTS = [NATIVE_HOST_CONTRACT, NATIVE_HOST_CONTRACT_V2] as const
++export type NativeHostContract = (typeof NATIVE_HOST_CONTRACTS)[number]
++export const nativeHostContractSchema = z.enum(NATIVE_HOST_CONTRACTS)
+ export const nativeOriginSchema = z.string().refine((value) => {
+   try {
+     const url = new URL(value)
+@@ -9,14 +16,14 @@ export const nativeOriginSchema = z.string().refine((value) => {
+   } catch { return false }
+ })
+ export const nativeHostContextSchema = z.object({
+-  contract: z.literal(NATIVE_HOST_CONTRACT),
++  contract: nativeHostContractSchema,
+   operationId: z.uuid(),
+   hostOrigin: nativeOriginSchema,
+ }).strict()
+ export type NativeHostContext = z.infer<typeof nativeHostContextSchema>
+ 
+ export const nativeHostCommandSchema = z.object({
+-  contract: z.literal(NATIVE_HOST_CONTRACT),
++  contract: nativeHostContractSchema,
+   operationId: z.uuid(),
+   type: z.enum(['identify', 'logout', 'create-ticket', 'list-tickets', 'read-ticket', 'reply-ticket', 'capture-config', 'upload-attachment']),
+   payload: z.record(z.string(), z.unknown()),
+diff --git a/packages/widget/src/index.ts b/packages/widget/src/index.ts
+index 0442c95cc..9aa467a23 100644
+--- a/packages/widget/src/index.ts
++++ b/packages/widget/src/index.ts
+@@ -38,7 +38,7 @@ export const Quackback = {
+     sdk.dispatch('logout')
+   },
+   native(command: {
+-    contract: 'iplaycafe.feedback/native-1'
++    contract: 'iplaycafe.feedback/native-1' | 'iplaycafe.feedback/native-2'
+     operationId: string
+     type: string
+     payload: Record<string, unknown>
