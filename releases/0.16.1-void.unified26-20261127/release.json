@@ -19,7 +19,7 @@
   "schemaDigest": "517f5bfb2d29ba3220b813cbdd0462645ec98b8e8e1c9b1c8eb327ad9661805d",
   "ledgerLength": 307,
   "servedImageDigest": "sha256:a8bc1f0bca38cbfcb2119d62b7c44e618f304ffeb530ef5e8a2ac0c9a9736b49",
-  "servedAt": null,
+  "servedAt": "two iPLAYCAFE feedback portals: feedback.iplaycafe.dev from 2026-11-27T07:54Z and feedback.iplaycafe.app from 2026-11-27T08:11Z (the other three portals serve 0.16.1-void.unified25-20261126)",
   "patches": [
     {
       "order": 1,
