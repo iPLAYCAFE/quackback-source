@@ -1,0 +1,15 @@
+01-build-image-pins.patch
+02-unified-platform-overlay.patch
+03-mail-issuance-expires-iso.patch
+04-ai-structured-output-nonstream.patch
+06-api-mcp-list-suggestions.patch
+#WITHHELD 07-oauth-expansion-consent.patch sha256=e57115d3bd6d9b2eff9733e44210bc9c451c959c0fbdbbbb29e0cdad84e3fc99
+#WITHHELD 08-customer-upload-policy.patch sha256=e3e45ee5670b71a12302cdc48a742b4db1f6b5730de4f7cf399cb4ce9c04ee53
+#WITHHELD 09-pipeline-files-proxy.patch sha256=e72dbdc690d02aca2ce6c663a2458c8d405de882f3e85dd840d2d1deff106906
+10-customer-agent-same-origin-proxy.patch
+11-status-projection-batch-updates.patch
+12-generated-and-authz-coverage.patch
+14-ai-error-taxonomy.patch
+15-zero-anonymous-guards.patch
+16-widget-sign-in-to-chat.patch
+17-native-host-contract-v2.patch

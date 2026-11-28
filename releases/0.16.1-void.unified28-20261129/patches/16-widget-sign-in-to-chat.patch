@@ -1,0 +1,691 @@
+diff --git a/apps/web/src/components/shared/__tests__/composer-attachment-tray.test.tsx b/apps/web/src/components/shared/__tests__/composer-attachment-tray.test.tsx
+index a1ee000d9..19ef5905e 100644
+--- a/apps/web/src/components/shared/__tests__/composer-attachment-tray.test.tsx
++++ b/apps/web/src/components/shared/__tests__/composer-attachment-tray.test.tsx
+@@ -337,6 +337,27 @@ describe('ComposerAttachmentTray', () => {
+       expect(screen.queryByText('Over 25.0 MB')).not.toBeInTheDocument()
+     })
+ 
++    it('maps a sign_in_required reason to the sign-in message', () => {
++      render(
++        <ComposerAttachmentTray
++          items={[
++            item({
++              name: 'shot.png',
++              family: 'image',
++              status: 'error',
++              file: undefined,
++              error: 'Authentication is required for this endpoint.',
++              errorReason: 'sign_in_required',
++              retryable: false,
++            }),
++          ]}
++          onRemove={vi.fn()}
++          onRetry={vi.fn()}
++        />
++      )
++      expect(screen.getByText('Sign in to send files')).toBeInTheDocument()
++    })
++
+     it('maps empty and blocked reasons to their localized messages', () => {
+       render(
+         <ComposerAttachmentTray
+diff --git a/apps/web/src/components/shared/composer-attachment-tray.tsx b/apps/web/src/components/shared/composer-attachment-tray.tsx
+index ecd9dbf43..5429656de 100644
+--- a/apps/web/src/components/shared/composer-attachment-tray.tsx
++++ b/apps/web/src/components/shared/composer-attachment-tray.tsx
+@@ -49,6 +49,11 @@ function localizedError(item: ComposerAttachmentItem, intl: IntlShape): string {
+         id: 'files.upload.error.rateLimited',
+         defaultMessage: 'Too many uploads. Try again in a minute.',
+       })
++    case 'sign_in_required':
++      return intl.formatMessage({
++        id: 'files.upload.error.signInRequired',
++        defaultMessage: 'Sign in to send files',
++      })
+     case 'cap':
+       return intl.formatMessage(
+         { id: 'files.tray.capReached', defaultMessage: 'You can attach up to {max} files' },
+diff --git a/apps/web/src/components/widget/__tests__/widget-messenger-sign-in.test.tsx b/apps/web/src/components/widget/__tests__/widget-messenger-sign-in.test.tsx
+new file mode 100644
+index 000000000..d6d464ecd
+--- /dev/null
++++ b/apps/web/src/components/widget/__tests__/widget-messenger-sign-in.test.tsx
+@@ -0,0 +1,124 @@
++// @vitest-environment happy-dom
++/**
++ * With the workspace's anonymous switch off, the server refuses an anonymous
++ * conversation (and the anonymous session it would need). The messenger says
++ * so up front: an unidentified visitor gets "Sign in to chat" instead of a
++ * composer whose send would fail, and the button asks the host page to sign
++ * them in (`auth-required`). Never before identity resolves, so a visitor the
++ * host is still identifying is not told to sign in.
++ */
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { IntlProvider } from 'react-intl'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++
++const threadProps = vi.fn()
++const emitEvent = vi.fn()
++const auth = {
++  user: null as { name: string } | null,
++  identityResolved: true,
++}
++
++vi.mock('@/components/shared/conversation/visitor-conversation-thread', () => ({
++  VisitorConversationThread: (props: Record<string, unknown>) => {
++    threadProps(props)
++    return <div data-testid="thread" />
++  },
++}))
++vi.mock('../widget-auth-provider', () => ({
++  useWidgetAuth: () => ({
++    user: auth.user,
++    identityResolved: auth.identityResolved,
++    ensureSession: vi.fn(),
++    sessionVersion: 0,
++    emitEvent,
++  }),
++}))
++vi.mock('../use-messenger-presence', () => ({
++  useConversationPresence: () => ({ online: false }),
++  markAgentPresentInCache: vi.fn(),
++}))
++vi.mock('../use-widget-file-upload', () => ({ useWidgetFileUpload: () => ({ upload: vi.fn() }) }))
++
++const { WidgetMessenger } = await import('../widget-messenger')
++
++function renderMessenger(props: Record<string, unknown>, messages: Record<string, string> = {}) {
++  return render(
++    <IntlProvider locale="en" messages={messages}>
++      <QueryClientProvider client={new QueryClient()}>
++        <WidgetMessenger {...props} />
++      </QueryClientProvider>
++    </IntlProvider>
++  )
++}
++
++beforeEach(() => {
++  auth.user = null
++  auth.identityResolved = true
++  threadProps.mockClear()
++  emitEvent.mockClear()
++})
++afterEach(cleanup)
++
++describe('WidgetMessenger with anonymous access off', () => {
++  it('asks an unidentified visitor to sign in instead of showing a composer', () => {
++    renderMessenger({ allowAnonymous: false })
++    expect(screen.getByTestId('widget-sign-in-to-chat')).toBeTruthy()
++    expect(screen.getByText('Sign in to chat')).toBeTruthy()
++    expect(threadProps).not.toHaveBeenCalled()
++  })
++
++  it('hands the sign-in to the host page with the auth-required event', () => {
++    renderMessenger({ allowAnonymous: false })
++    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }))
++    expect(emitEvent).toHaveBeenCalledTimes(1)
++    expect(emitEvent).toHaveBeenCalledWith('auth-required', { reason: 'conversation' })
++  })
++
++  it('reads the Thai catalog', async () => {
++    const th = (await import('@/locales/th.json')).default as Record<string, string>
++    renderMessenger({ allowAnonymous: false }, th)
++    expect(screen.getByText('เข้าสู่ระบบเพื่อแชท')).toBeTruthy()
++    expect(screen.getByRole('button', { name: 'เข้าสู่ระบบ' })).toBeTruthy()
++  })
++
++  it('keeps the thread while identity is still resolving (no sign-in flash for a signed-in visitor)', () => {
++    auth.identityResolved = false
++    renderMessenger({ allowAnonymous: false })
++    expect(screen.queryByTestId('widget-sign-in-to-chat')).toBeNull()
++    expect(threadProps).toHaveBeenCalled()
++  })
++
++  it('gives way to the thread as soon as a late host identify lands', () => {
++    // The SDK's default anonymous identify resolves identity before a native
++    // host's identify ACK; the prompt then shows for that interval only.
++    const view = renderMessenger({ allowAnonymous: false })
++    expect(screen.getByTestId('widget-sign-in-to-chat')).toBeTruthy()
++    auth.user = { name: 'Owner' }
++    view.rerender(
++      <IntlProvider locale="en" messages={{}}>
++        <QueryClientProvider client={new QueryClient()}>
++          <WidgetMessenger allowAnonymous={false} />
++        </QueryClientProvider>
++      </IntlProvider>
++    )
++    expect(screen.queryByTestId('widget-sign-in-to-chat')).toBeNull()
++    expect(threadProps).toHaveBeenCalled()
++  })
++
++  it('shows the thread to an identified visitor', () => {
++    auth.user = { name: 'Owner' }
++    renderMessenger({ allowAnonymous: false })
++    expect(screen.queryByTestId('widget-sign-in-to-chat')).toBeNull()
++    expect(threadProps).toHaveBeenCalled()
++  })
++})
++
++describe('WidgetMessenger with anonymous access on (upstream default)', () => {
++  it('shows the composer thread to an anonymous visitor, as before', () => {
++    renderMessenger({})
++    expect(screen.queryByTestId('widget-sign-in-to-chat')).toBeNull()
++    expect(threadProps).toHaveBeenCalled()
++    expect(emitEvent).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/web/src/components/widget/widget-messenger.tsx b/apps/web/src/components/widget/widget-messenger.tsx
+index 229e31ae0..28d37eb50 100644
+--- a/apps/web/src/components/widget/widget-messenger.tsx
++++ b/apps/web/src/components/widget/widget-messenger.tsx
+@@ -9,6 +9,7 @@ import { widgetVisitorRpc } from '@/lib/client/widget-visitor-rpc'
+ import { useConversationPresence, markAgentPresentInCache } from './use-messenger-presence'
+ import { useWidgetFileUpload } from './use-widget-file-upload'
+ import { frameRequestCredentials } from '@/lib/client/widget-frame'
++import { WidgetSignInToChat } from './widget-sign-in-to-chat'
+ 
+ interface WidgetMessengerProps {
+   /** Whether the help center is available (gates in-conversation article suggestions). */
+@@ -24,6 +25,9 @@ interface WidgetMessengerProps {
+   initialDraft?: string
+   /** Whether a reply can reach this visitor by email (see the thread's prop). */
+   onReplyByEmailChange?: (canReplyByEmail: boolean) => void
++  /** The workspace's anonymous switch. When off, an unidentified visitor sees
++   *  a sign-in prompt instead of a composer the server would refuse. */
++  allowAnonymous?: boolean
+ }
+ 
+ /**
+@@ -39,9 +43,10 @@ export function WidgetMessenger({
+   autofocusComposer = false,
+   initialDraft,
+   onReplyByEmailChange,
++  allowAnonymous = true,
+ }: WidgetMessengerProps = {}) {
+   const queryClient = useQueryClient()
+-  const { user, ensureSession, sessionVersion, emitEvent } = useWidgetAuth()
++  const { user, ensureSession, sessionVersion, identityResolved, emitEvent } = useWidgetAuth()
+   // Presence (online/offline + office hours) comes from the one shared query —
+   // SSR-seeded, polled once, and shared with every other widget surface.
+   const presence = useConversationPresence(true)
+@@ -72,6 +77,17 @@ export function WidgetMessenger({
+     }
+   }, [helpEnabled, onArticleSelect, sessionVersion])
+ 
++  const requestSignIn = useCallback(
++    () => emitEvent('auth-required', { reason: 'conversation' }),
++    [emitEvent]
++  )
++
++  // Only once identity has resolved: until the host's identify settles, a
++  // signed-in visitor is not known yet and must not be told to sign in.
++  if (!allowAnonymous && identityResolved && !user) {
++    return <WidgetSignInToChat onSignIn={requestSignIn} />
++  }
++
+   return (
+     <VisitorSurfaceRpcProvider value={widgetVisitorRpc}>
+       <VisitorConversationThread
+diff --git a/apps/web/src/components/widget/widget-sign-in-to-chat.tsx b/apps/web/src/components/widget/widget-sign-in-to-chat.tsx
+new file mode 100644
+index 000000000..06c2de787
+--- /dev/null
++++ b/apps/web/src/components/widget/widget-sign-in-to-chat.tsx
+@@ -0,0 +1,41 @@
++import { FormattedMessage } from 'react-intl'
++import { ChatBubbleOvalLeftEllipsisIcon } from '@heroicons/react/24/solid'
++
++interface WidgetSignInToChatProps {
++  /** Asks the host page to sign the visitor in (the `auth-required` event). */
++  onSignIn: () => void
++}
++
++/**
++ * Stands in for the messenger composer when the workspace has anonymous access
++ * off and the visitor is not identified. The server refuses an anonymous
++ * conversation anyway; this says so before anything is typed, and hands the
++ * sign-in to the host page, which owns the visitor's account. Help articles,
++ * boards and updates stay readable in the other tabs.
++ */
++export function WidgetSignInToChat({ onSignIn }: WidgetSignInToChatProps) {
++  return (
++    <div
++      className="flex h-full flex-col items-center justify-center px-6 py-16 text-center animate-in fade-in duration-200 motion-reduce:animate-none"
++      data-testid="widget-sign-in-to-chat"
++    >
++      <ChatBubbleOvalLeftEllipsisIcon className="mb-2 h-8 w-8 text-muted-foreground/30" />
++      <p className="text-sm font-medium text-foreground">
++        <FormattedMessage id="widget.signInToChat.title" defaultMessage="Sign in to chat" />
++      </p>
++      <p className="mt-1 text-xs text-muted-foreground">
++        <FormattedMessage
++          id="widget.signInToChat.body"
++          defaultMessage="Conversations are for signed-in users. Help articles, feedback and updates stay open to everyone."
++        />
++      </p>
++      <button
++        type="button"
++        onClick={onSignIn}
++        className="mt-4 inline-flex items-center gap-2 rounded-full bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm transition-transform hover:scale-[1.03] active:scale-[0.98]"
++      >
++        <FormattedMessage id="widget.signInToChat.action" defaultMessage="Sign in" />
++      </button>
++    </div>
++  )
++}
+diff --git a/apps/web/src/lib/client/files/__tests__/upload-file-refusals.test.ts b/apps/web/src/lib/client/files/__tests__/upload-file-refusals.test.ts
+new file mode 100644
+index 000000000..f9e1a2aac
+--- /dev/null
++++ b/apps/web/src/lib/client/files/__tests__/upload-file-refusals.test.ts
+@@ -0,0 +1,99 @@
++// @vitest-environment happy-dom
++/**
++ * Definitive refusals that used to surface as a bare "Upload failed":
++ * - 413 from anything in front of the app (often an HTML page, not JSON) is a
++ *   size refusal, so the tile names the family's limit;
++ * - 403 ANONYMOUS_DISABLED (a signed-in only workspace) asks for a sign-in.
++ */
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { uploadFile, UploadError } from '../upload-file'
++
++class FakeXHR {
++  static instances: FakeXHR[] = []
++  status = 0
++  responseText = ''
++  upload = { onprogress: null }
++  onload: (() => void) | null = null
++  onerror: (() => void) | null = null
++  onabort: (() => void) | null = null
++  constructor() {
++    FakeXHR.instances.push(this)
++  }
++  open() {}
++  setRequestHeader() {}
++  send() {}
++  abort() {}
++}
++
++function respond(status: number, responseText: string) {
++  const xhr = FakeXHR.instances.at(-1)
++  if (!xhr) throw new Error('no XHR was constructed')
++  xhr.status = status
++  xhr.responseText = responseText
++  xhr.onload?.()
++}
++
++function file(name: string, size: number, type: string): File {
++  const f = new File([new Uint8Array(16)], name, { type })
++  Object.defineProperty(f, 'size', { value: size })
++  return f
++}
++
++beforeEach(() => {
++  FakeXHR.instances = []
++  vi.stubGlobal('XMLHttpRequest', FakeXHR)
++})
++
++afterEach(() => {
++  vi.unstubAllGlobals()
++})
++
++describe('uploadFile refusals', () => {
++  it('maps a proxy 413 (HTML body) to too_large with the video limit', async () => {
++    const promise = uploadFile(file('clip.mp4', 99 * 1024 * 1024, 'video/mp4'), {
++      endpoint: '/api/widget/files',
++    })
++    respond(413, '<html><body>413 Request Entity Too Large</body></html>')
++    const error = await promise.catch((e: unknown) => e)
++    expect(error).toBeInstanceOf(UploadError)
++    expect((error as UploadError).reason).toBe('too_large')
++    expect((error as UploadError).message).toBe('Over 100 MB')
++  })
++
++  it('maps a JSON 413 to too_large as well, whatever its message', async () => {
++    const promise = uploadFile(file('shot.png', 2048, 'image/png'), {
++      endpoint: '/api/widget/files',
++    })
++    respond(413, JSON.stringify({ error: 'Payload too large' }))
++    const error = (await promise.catch((e: unknown) => e)) as UploadError
++    expect(error.reason).toBe('too_large')
++    expect(error.message).toMatch(/^Over /)
++  })
++
++  it('maps 403 ANONYMOUS_DISABLED to sign_in_required', async () => {
++    const promise = uploadFile(file('shot.png', 2048, 'image/png'), {
++      endpoint: '/api/widget/files',
++    })
++    respond(
++      403,
++      JSON.stringify({
++        error: {
++          code: 'ANONYMOUS_DISABLED',
++          message: 'Authentication is required for this endpoint.',
++        },
++      })
++    )
++    const error = (await promise.catch((e: unknown) => e)) as UploadError
++    expect(error.reason).toBe('sign_in_required')
++  })
++
++  it('leaves any other 403 as before: the server text, no reason', async () => {
++    const promise = uploadFile(file('shot.png', 2048, 'image/png'), {
++      endpoint: '/api/widget/files',
++    })
++    respond(403, JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Not allowed' } }))
++    const error = (await promise.catch((e: unknown) => e)) as UploadError
++    expect(error.reason).toBeUndefined()
++    expect(error.message).toBe('Not allowed')
++  })
++})
+diff --git a/apps/web/src/lib/client/files/upload-file.ts b/apps/web/src/lib/client/files/upload-file.ts
+index 22934ac66..3c32a0cdb 100644
+--- a/apps/web/src/lib/client/files/upload-file.ts
++++ b/apps/web/src/lib/client/files/upload-file.ts
+@@ -9,7 +9,8 @@ import { familyFor, formatBytes, maxBytesForFamily } from '@/lib/shared/files/fi
+ import type { UploadedFile } from '@/lib/shared/conversation/types'
+ 
+ /** A rejected upload. `reason` mirrors the server's FileRejectedError reason
+- *  (empty | too_large | blocked) when the rejection is definitive — a
++ *  (empty | too_large | blocked), or sign_in_required for an anonymous upload a
++ *  signed-in only workspace refuses, when the rejection is definitive — a
+  *  pre-check or a server refusal that will fail again unchanged. No reason
+  *  means a transient failure (network, abort-adjacent, a 500): worth a retry. */
+ export class UploadError extends Error {
+@@ -48,6 +49,18 @@ function errorMessageFrom(error: unknown): string | undefined {
+   return undefined
+ }
+ 
++/** The `code` of a widget-endpoint error body (`{ error: { code } }`), if any. */
++function errorCodeFrom(error: unknown): string | undefined {
++  if (
++    error &&
++    typeof error === 'object' &&
++    typeof (error as { code?: unknown }).code === 'string'
++  ) {
++    return (error as { code: string }).code
++  }
++  return undefined
++}
++
+ /** Clipboard pastes often hand over a nameless Blob. Give it a name that
+  *  matches its declared type so the server (and the tray) show something
+  *  sensible instead of a bare extension-less "file". */
+@@ -108,6 +121,20 @@ export function uploadFile(file: File, options: UploadFileOptions): Promise<Uplo
+         reject(new UploadError(message ?? 'Too many uploads, slow down', 'rate_limited'))
+         return
+       }
++      // A body-size refusal can come from a proxy in front of the app (an HTML
++      // page, no JSON), so the status alone decides: the tile then says the
++      // family's limit instead of a bare "Upload failed".
++      if (xhr.status === 413) {
++        const maxBytes = maxBytesForFamily(familyFor(name, file.type))
++        reject(new UploadError(`Over ${formatBytes(maxBytes)}`, 'too_large'))
++        return
++      }
++      // Signed-in only workspaces refuse anonymous uploads with this code; the
++      // fix is signing in, not retrying.
++      if (xhr.status === 403 && errorCodeFrom(body.error) === 'ANONYMOUS_DISABLED') {
++        reject(new UploadError(message ?? 'Sign in to send files', 'sign_in_required'))
++        return
++      }
+       reject(new UploadError(message ?? 'Upload failed', body.reason))
+     }
+     xhr.send(file)
+diff --git a/apps/web/src/lib/shared/widget/types.ts b/apps/web/src/lib/shared/widget/types.ts
+index 25979433f..b69041f6f 100644
+--- a/apps/web/src/lib/shared/widget/types.ts
++++ b/apps/web/src/lib/shared/widget/types.ts
+@@ -34,6 +34,9 @@ export interface WidgetEventMap {
+   'email-submitted': {
+     email: string
+   }
++  /** The visitor asked to do something that needs a sign-in the workspace
++   *  requires (anonymous access is off); the host may open its own sign-in. */
++  'auth-required': { reason: 'conversation' }
+ }
+ 
+ export type WidgetEventName = keyof WidgetEventMap
+diff --git a/apps/web/src/locales/ar.json b/apps/web/src/locales/ar.json
+index f71f75087..68b299698 100644
+--- a/apps/web/src/locales/ar.json
++++ b/apps/web/src/locales/ar.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "تم تحديث تفضيلاتك.",
+   "unsubscribe.error.missing.message": "لم يتم تقديم رمز إلغاء الاشتراك. يرجى استخدام الرابط الموجود في رسالتك.",
+   "unsubscribe.error.failed.message": "تعذّرت معالجة طلبك. يرجى المحاولة لاحقًا.",
+-  "unsubscribe.error.expired.message": "تم استخدام رابط إلغاء الاشتراك هذا بالفعل أو انتهت صلاحيته."
++  "unsubscribe.error.expired.message": "تم استخدام رابط إلغاء الاشتراك هذا بالفعل أو انتهت صلاحيته.",
++  "widget.signInToChat.title": "سجّل الدخول للدردشة",
++  "widget.signInToChat.body": "المحادثات متاحة للمستخدمين المسجّلين فقط. تبقى مقالات المساعدة والملاحظات والتحديثات متاحة للجميع.",
++  "widget.signInToChat.action": "تسجيل الدخول",
++  "files.upload.error.signInRequired": "سجّل الدخول لإرسال الملفات"
+ }
+diff --git a/apps/web/src/locales/de.json b/apps/web/src/locales/de.json
+index c9d85ccfb..813d08daa 100644
+--- a/apps/web/src/locales/de.json
++++ b/apps/web/src/locales/de.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Deine Einstellungen wurden aktualisiert.",
+   "unsubscribe.error.missing.message": "Es wurde kein Abmelde-Token übergeben. Bitte verwende den Link aus deiner E-Mail.",
+   "unsubscribe.error.failed.message": "Wir konnten deine Anfrage nicht verarbeiten. Bitte versuche es später erneut.",
+-  "unsubscribe.error.expired.message": "Dieser Abmeldelink wurde bereits verwendet oder ist abgelaufen."
++  "unsubscribe.error.expired.message": "Dieser Abmeldelink wurde bereits verwendet oder ist abgelaufen.",
++  "widget.signInToChat.title": "Melde dich an, um zu chatten",
++  "widget.signInToChat.body": "Unterhaltungen sind angemeldeten Nutzern vorbehalten. Hilfeartikel, Feedback und Neuigkeiten bleiben für alle offen.",
++  "widget.signInToChat.action": "Anmelden",
++  "files.upload.error.signInRequired": "Melde dich an, um Dateien zu senden"
+ }
+diff --git a/apps/web/src/locales/en.json b/apps/web/src/locales/en.json
+index 325d91867..5b9fa6754 100644
+--- a/apps/web/src/locales/en.json
++++ b/apps/web/src/locales/en.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Your preferences have been updated.",
+   "unsubscribe.error.missing.message": "No unsubscribe token was provided. Please use the link from your email.",
+   "unsubscribe.error.failed.message": "We couldn't process your request. Please try again later.",
+-  "unsubscribe.error.expired.message": "This unsubscribe link has already been used or has expired."
++  "unsubscribe.error.expired.message": "This unsubscribe link has already been used or has expired.",
++  "widget.signInToChat.title": "Sign in to chat",
++  "widget.signInToChat.body": "Conversations are for signed-in users. Help articles, feedback and updates stay open to everyone.",
++  "widget.signInToChat.action": "Sign in",
++  "files.upload.error.signInRequired": "Sign in to send files"
+ }
+diff --git a/apps/web/src/locales/es.json b/apps/web/src/locales/es.json
+index ebfa5c0c6..89f0ea7d0 100644
+--- a/apps/web/src/locales/es.json
++++ b/apps/web/src/locales/es.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Tus preferencias se han actualizado.",
+   "unsubscribe.error.missing.message": "No se proporcionó ningún token de cancelación. Usa el enlace de tu correo.",
+   "unsubscribe.error.failed.message": "No pudimos procesar tu solicitud. Inténtalo de nuevo más tarde.",
+-  "unsubscribe.error.expired.message": "Este enlace para cancelar la suscripción ya se usó o ha caducado."
++  "unsubscribe.error.expired.message": "Este enlace para cancelar la suscripción ya se usó o ha caducado.",
++  "widget.signInToChat.title": "Inicia sesión para chatear",
++  "widget.signInToChat.body": "Las conversaciones son para usuarios con sesión iniciada. Los artículos de ayuda, los comentarios y las novedades siguen abiertos para todos.",
++  "widget.signInToChat.action": "Iniciar sesión",
++  "files.upload.error.signInRequired": "Inicia sesión para enviar archivos"
+ }
+diff --git a/apps/web/src/locales/fr.json b/apps/web/src/locales/fr.json
+index c2ee8678c..005de3b57 100644
+--- a/apps/web/src/locales/fr.json
++++ b/apps/web/src/locales/fr.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Vos préférences ont été mises à jour.",
+   "unsubscribe.error.missing.message": "Aucun jeton de désabonnement n'a été fourni. Utilisez le lien de votre e-mail.",
+   "unsubscribe.error.failed.message": "Nous n'avons pas pu traiter votre demande. Réessayez plus tard.",
+-  "unsubscribe.error.expired.message": "Ce lien de désabonnement a déjà été utilisé ou a expiré."
++  "unsubscribe.error.expired.message": "Ce lien de désabonnement a déjà été utilisé ou a expiré.",
++  "widget.signInToChat.title": "Connectez-vous pour discuter",
++  "widget.signInToChat.body": "Les conversations sont réservées aux utilisateurs connectés. Les articles d’aide, les retours et les nouveautés restent ouverts à tous.",
++  "widget.signInToChat.action": "Se connecter",
++  "files.upload.error.signInRequired": "Connectez-vous pour envoyer des fichiers"
+ }
+diff --git a/apps/web/src/locales/nl.json b/apps/web/src/locales/nl.json
+index b8b9dd621..bc551b4b2 100644
+--- a/apps/web/src/locales/nl.json
++++ b/apps/web/src/locales/nl.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Je voorkeuren zijn bijgewerkt.",
+   "unsubscribe.error.missing.message": "Er is geen afmeldtoken meegegeven. Gebruik de link uit je e-mail.",
+   "unsubscribe.error.failed.message": "We konden je verzoek niet verwerken. Probeer het later opnieuw.",
+-  "unsubscribe.error.expired.message": "Deze afmeldlink is al gebruikt of verlopen."
++  "unsubscribe.error.expired.message": "Deze afmeldlink is al gebruikt of verlopen.",
++  "widget.signInToChat.title": "Log in om te chatten",
++  "widget.signInToChat.body": "Gesprekken zijn voor ingelogde gebruikers. Helpartikelen, feedback en updates blijven voor iedereen open.",
++  "widget.signInToChat.action": "Inloggen",
++  "files.upload.error.signInRequired": "Log in om bestanden te versturen"
+ }
+diff --git a/apps/web/src/locales/pl.json b/apps/web/src/locales/pl.json
+index 0f83c8d04..b26c6003e 100644
+--- a/apps/web/src/locales/pl.json
++++ b/apps/web/src/locales/pl.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Twoje preferencje zostały zaktualizowane.",
+   "unsubscribe.error.missing.message": "Nie podano tokenu wypisania. Użyj linku z wiadomości e-mail.",
+   "unsubscribe.error.failed.message": "Nie udało się przetworzyć żądania. Spróbuj ponownie później.",
+-  "unsubscribe.error.expired.message": "Ten link do wypisania został już użyty lub wygasł."
++  "unsubscribe.error.expired.message": "Ten link do wypisania został już użyty lub wygasł.",
++  "widget.signInToChat.title": "Zaloguj się, aby czatować",
++  "widget.signInToChat.body": "Rozmowy są dostępne dla zalogowanych użytkowników. Artykuły pomocy, opinie i aktualności pozostają otwarte dla wszystkich.",
++  "widget.signInToChat.action": "Zaloguj się",
++  "files.upload.error.signInRequired": "Zaloguj się, aby wysyłać pliki"
+ }
+diff --git a/apps/web/src/locales/pt-br.json b/apps/web/src/locales/pt-br.json
+index b7cb9b932..99445fd5c 100644
+--- a/apps/web/src/locales/pt-br.json
++++ b/apps/web/src/locales/pt-br.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Suas preferências foram atualizadas.",
+   "unsubscribe.error.missing.message": "Nenhum token de cancelamento foi informado. Use o link do seu e-mail.",
+   "unsubscribe.error.failed.message": "Não foi possível processar sua solicitação. Tente novamente mais tarde.",
+-  "unsubscribe.error.expired.message": "Este link de cancelamento já foi usado ou expirou."
++  "unsubscribe.error.expired.message": "Este link de cancelamento já foi usado ou expirou.",
++  "widget.signInToChat.title": "Entre para conversar",
++  "widget.signInToChat.body": "As conversas são para usuários conectados. Artigos de ajuda, feedback e novidades continuam abertos a todos.",
++  "widget.signInToChat.action": "Entrar",
++  "files.upload.error.signInRequired": "Entre para enviar arquivos"
+ }
+diff --git a/apps/web/src/locales/ru.json b/apps/web/src/locales/ru.json
+index eb8b66350..9ce6947c5 100644
+--- a/apps/web/src/locales/ru.json
++++ b/apps/web/src/locales/ru.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Ваши настройки обновлены.",
+   "unsubscribe.error.missing.message": "Токен отписки не передан. Воспользуйтесь ссылкой из письма.",
+   "unsubscribe.error.failed.message": "Не удалось обработать запрос. Попробуйте позже.",
+-  "unsubscribe.error.expired.message": "Эта ссылка для отписки уже использована или срок её действия истёк."
++  "unsubscribe.error.expired.message": "Эта ссылка для отписки уже использована или срок её действия истёк.",
++  "widget.signInToChat.title": "Войдите, чтобы начать чат",
++  "widget.signInToChat.body": "Чат доступен только вошедшим пользователям. Статьи справки, отзывы и обновления открыты для всех.",
++  "widget.signInToChat.action": "Войти",
++  "files.upload.error.signInRequired": "Войдите, чтобы отправлять файлы"
+ }
+diff --git a/apps/web/src/locales/th.json b/apps/web/src/locales/th.json
+index 641d0f3bb..ed912d43f 100644
+--- a/apps/web/src/locales/th.json
++++ b/apps/web/src/locales/th.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "อัปเดตค่ากำหนดแล้ว",
+   "unsubscribe.error.missing.message": "ไม่มีโทเค็นเลิกรับ กรุณาใช้ลิงก์จากอีเมล",
+   "unsubscribe.error.failed.message": "ดำเนินการตามคำขอไม่ได้ กรุณาลองอีกครั้งภายหลัง",
+-  "unsubscribe.error.expired.message": "ลิงก์เลิกรับนี้ถูกใช้แล้วหรือหมดอายุ"
++  "unsubscribe.error.expired.message": "ลิงก์เลิกรับนี้ถูกใช้แล้วหรือหมดอายุ",
++  "widget.signInToChat.title": "เข้าสู่ระบบเพื่อแชท",
++  "widget.signInToChat.body": "การสนทนาสำหรับผู้ที่เข้าสู่ระบบแล้ว บทความช่วยเหลือ ความคิดเห็น และอัปเดตยังเปิดให้ทุกคนอ่านได้",
++  "widget.signInToChat.action": "เข้าสู่ระบบ",
++  "files.upload.error.signInRequired": "เข้าสู่ระบบเพื่อส่งไฟล์"
+ }
+diff --git a/apps/web/src/locales/uk.json b/apps/web/src/locales/uk.json
+index aefd92b78..37d9ebe16 100644
+--- a/apps/web/src/locales/uk.json
++++ b/apps/web/src/locales/uk.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "Your preferences have been updated.",
+   "unsubscribe.error.missing.message": "No unsubscribe token was provided. Please use the link from your email.",
+   "unsubscribe.error.failed.message": "We couldn't process your request. Please try again later.",
+-  "unsubscribe.error.expired.message": "This unsubscribe link has already been used or has expired."
++  "unsubscribe.error.expired.message": "This unsubscribe link has already been used or has expired.",
++  "widget.signInToChat.title": "Увійдіть, щоб почати чат",
++  "widget.signInToChat.body": "Чат доступний лише користувачам, які увійшли. Статті довідки, відгуки й оновлення відкриті для всіх.",
++  "widget.signInToChat.action": "Увійти",
++  "files.upload.error.signInRequired": "Увійдіть, щоб надсилати файли"
+ }
+diff --git a/apps/web/src/locales/zh-cn.json b/apps/web/src/locales/zh-cn.json
+index 0cc6081fb..b0cbc307e 100644
+--- a/apps/web/src/locales/zh-cn.json
++++ b/apps/web/src/locales/zh-cn.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "你的偏好设置已更新。",
+   "unsubscribe.error.missing.message": "未提供退订令牌。请使用邮件中的链接。",
+   "unsubscribe.error.failed.message": "无法处理你的请求，请稍后再试。",
+-  "unsubscribe.error.expired.message": "此退订链接已被使用或已过期。"
++  "unsubscribe.error.expired.message": "此退订链接已被使用或已过期。",
++  "widget.signInToChat.title": "登录后即可聊天",
++  "widget.signInToChat.body": "登录用户才能发起对话。帮助文章、反馈和更新对所有人开放。",
++  "widget.signInToChat.action": "登录",
++  "files.upload.error.signInRequired": "登录后即可发送文件"
+ }
+diff --git a/apps/web/src/locales/zh-tw.json b/apps/web/src/locales/zh-tw.json
+index ba2d50721..2ba55c5f6 100644
+--- a/apps/web/src/locales/zh-tw.json
++++ b/apps/web/src/locales/zh-tw.json
+@@ -2388,5 +2388,9 @@
+   "unsubscribe.success.default.message": "你的偏好設定已更新。",
+   "unsubscribe.error.missing.message": "未提供取消訂閱權杖。請使用電子郵件中的連結。",
+   "unsubscribe.error.failed.message": "無法處理你的要求，請稍後再試。",
+-  "unsubscribe.error.expired.message": "此取消訂閱連結已被使用或已過期。"
++  "unsubscribe.error.expired.message": "此取消訂閱連結已被使用或已過期。",
++  "widget.signInToChat.title": "登入後即可聊天",
++  "widget.signInToChat.body": "登入的使用者才能發起對話。說明文章、意見回饋和更新對所有人開放。",
++  "widget.signInToChat.action": "登入",
++  "files.upload.error.signInRequired": "登入後即可傳送檔案"
+ }
+diff --git a/apps/web/src/routes/widget/index.tsx b/apps/web/src/routes/widget/index.tsx
+index c5c5451e7..b0fb9041a 100644
+--- a/apps/web/src/routes/widget/index.tsx
++++ b/apps/web/src/routes/widget/index.tsx
+@@ -355,6 +355,10 @@ export const Route = createFileRoute('/widget/')({
+       // False when the Messages tab is off — tickets-only workspaces hide
+       // the chat-start affordances (agents/email initiate).
+       messengerEnabled: messengerTabEnabled,
++      // The workspace anonymous switch (client-safe; the server gates every
++      // anonymous write on it regardless). Off: the messenger asks an
++      // unidentified visitor to sign in instead of offering a composer.
++      allowAnonymous: settings?.publicPortalConfig?.features?.allowAnonymous !== false,
+       // The portal's own origin (BASE_URL env), resolved server-side so the
+       // widget handoff URL always points at the portal host — not at the widget
+       // iframe origin, which may differ in self-hosted deployments.
+@@ -466,6 +470,7 @@ function WidgetPage() {
+     assistant,
+     team,
+     messengerEnabled,
++    allowAnonymous,
+     showPoweredBy,
+   } = Route.useLoaderData()
+   const { board: initialBoardSlug } = Route.useSearch()
+@@ -1078,6 +1083,7 @@ function WidgetPage() {
+               messengerDraft?.focusConversationId
+             )}
+             onReplyByEmailChange={setCanReplyByEmail}
++            allowAnonymous={allowAnonymous}
+           />
+         </ViewTransition>
+       )}
+diff --git a/packages/widget/src/types.ts b/packages/widget/src/types.ts
+index d619c2dd0..6db4e838e 100644
+--- a/packages/widget/src/types.ts
++++ b/packages/widget/src/types.ts
+@@ -185,6 +185,10 @@ export interface EventMap {
+     /** The reply as plain text. */
+     preview: string
+   }
++  /** The visitor needs to sign in for what they tried (the workspace has
++   *  anonymous access off, e.g. starting a conversation). Hosts that own the
++   *  visitor's sign-in can open it; the widget shows a sign-in prompt either way. */
++  'auth-required': { reason: 'conversation' }
+ }
+ 
+ export type EventName = keyof EventMap
