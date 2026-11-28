@@ -1,0 +1,254 @@
+diff --git a/.env.example b/.env.example
+index d2fc861d9..bbd065380 100644
+--- a/.env.example
++++ b/.env.example
+@@ -291,6 +291,10 @@ AI_MAX_TOKENS_PARAM=
+ # Some models can emit tool calls and the final JSON schema in one request.
+ # Leave unset to force a split (tools, then a structured finalization call).
+ AI_COMBINED_TOOLS_AND_SCHEMA=
++# Structured (json_schema) calls stream by default. Set false for OpenAI-compatible
++# servers that drop the schema while streaming (e.g. Cloudflare Workers AI returns
++# `{"results":}`); the request is then sent once with stream=false.
++AI_STRUCTURED_OUTPUT_STREAM=
+ 
+ # ============================================================================
+ # File Storage (for image uploads)
+diff --git a/apps/web/src/lib/server/config.ts b/apps/web/src/lib/server/config.ts
+index 73c82700e..79d99f620 100644
+--- a/apps/web/src/lib/server/config.ts
++++ b/apps/web/src/lib/server/config.ts
+@@ -319,6 +319,7 @@ const configSchema = z
+     aiReasoningEffort: z.string().optional(),
+     aiMaxTokensParam: z.string().optional(),
+     aiCombinedToolsAndSchema: envBoolean,
++    aiStructuredOutputStream: envBoolean,
+ 
+     // Telemetry (optional)
+     disableTelemetry: envBoolean,
+@@ -514,6 +515,7 @@ function buildConfigFromEnv(): unknown {
+     aiReasoningEffort: env('AI_REASONING_EFFORT'),
+     aiMaxTokensParam: env('AI_MAX_TOKENS_PARAM'),
+     aiCombinedToolsAndSchema: env('AI_COMBINED_TOOLS_AND_SCHEMA'),
++    aiStructuredOutputStream: env('AI_STRUCTURED_OUTPUT_STREAM'),
+ 
+     // Telemetry
+     disableTelemetry: env('DISABLE_TELEMETRY'),
+@@ -853,6 +855,9 @@ export const config = {
+   get aiCombinedToolsAndSchema() {
+     return loadConfig().aiCombinedToolsAndSchema
+   },
++  get aiStructuredOutputStream() {
++    return loadConfig().aiStructuredOutputStream
++  },
+ 
+   // Telemetry
+   get disableTelemetry() {
+diff --git a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+index 0f4bceb39..a1231dceb 100644
+--- a/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
++++ b/apps/web/src/lib/server/domains/ai/__tests__/structured-chat.test.ts
+@@ -14,6 +14,7 @@ const hoisted = vi.hoisted(() => ({
+     openaiBaseUrl: 'https://llm.internal/v1' as string | null,
+     aiRequireParameters: undefined,
+     aiReasoningEffort: undefined as string | undefined,
++    aiStructuredOutputStream: undefined as boolean | undefined,
+   },
+ }))
+ 
+@@ -36,6 +37,9 @@ vi.mock('@/lib/server/config', () => ({
+     get aiReasoningEffort() {
+       return hoisted.cfg.aiReasoningEffort
+     },
++    get aiStructuredOutputStream() {
++      return hoisted.cfg.aiStructuredOutputStream
++    },
+   },
+ }))
+ vi.mock('@/lib/server/logger', () => {
+@@ -53,6 +57,7 @@ import {
+   isResponseFormatRejection,
+   resetStructuredFallbackMemory,
+   structuredChat,
++  withStructuredOutputStreaming,
+ } from '../structured-chat'
+ 
+ const Schema = z.object({ sentiment: z.enum(['positive', 'negative']), confidence: z.number() })
+@@ -94,7 +99,7 @@ describe('structuredChat', () => {
+     hoisted.chat
+       .mockRejectedValueOnce(rejection(`json_schema is unsupported ${canary}`))
+       .mockRejectedValueOnce(rejection(`json_object is unsupported ${canary}`, 'response_format'))
+-      .mockResolvedValueOnce('{"sentiment":"positive","confidence":1}')
++      .mockResolvedValueOnce(textResult('{"sentiment":"positive","confidence":1}'))
+ 
+     expect(await structuredChat(base)).toEqual({ sentiment: 'positive', confidence: 1 })
+     expect(hoisted.chat).toHaveBeenCalledTimes(3)
+@@ -258,7 +263,7 @@ describe('structuredChat', () => {
+     hoisted.chat
+       .mockRejectedValueOnce(rejection('response_format json_schema not supported'))
+       .mockRejectedValueOnce(rejection('response_format json_object not supported'))
+-      .mockResolvedValueOnce('{"sentiment":"positive","confidence":1}')
++      .mockResolvedValueOnce(textResult('{"sentiment":"positive","confidence":1}'))
+ 
+     await expect(structuredChat({ ...base, model: 'gpt-6-luna' })).resolves.toEqual({
+       sentiment: 'positive',
+@@ -326,3 +331,33 @@ describe('isResponseFormatRejection', () => {
+     expect(isResponseFormatRejection('response_format')).toBe(false)
+   })
+ })
++
++describe('AI_STRUCTURED_OUTPUT_STREAM', () => {
++  const adapter = {
++    name: 'a',
++    structuredOutput: () => 'one-shot',
++    structuredOutputStream: () => 'stream',
++  }
++
++  it('keeps the streaming method unless the flag is false', () => {
++    expect(withStructuredOutputStreaming(adapter, undefined)).toBe(adapter)
++    expect(withStructuredOutputStreaming(adapter, true)).toBe(adapter)
++  })
++
++  it('hides structuredOutputStream when false so chat() uses the one-shot call', () => {
++    const wrapped = withStructuredOutputStreaming(adapter, false)
++    expect(wrapped.structuredOutputStream).toBeUndefined()
++    expect(wrapped.structuredOutput()).toBe('one-shot')
++    expect(wrapped.name).toBe('a')
++  })
++
++  it('passes the wrapped adapter to chat()', async () => {
++    hoisted.cfg.aiStructuredOutputStream = false
++    hoisted.chat.mockResolvedValueOnce({ sentiment: 'positive', confidence: 0.9 })
++    await structuredChat(base)
++    const sent = hoisted.chat.mock.calls.at(-1)![0].adapter
++    expect(sent.structuredOutputStream).toBeUndefined()
++    expect(sent.model).toBe('m')
++    hoisted.cfg.aiStructuredOutputStream = undefined
++  })
++})
+diff --git a/apps/web/src/lib/server/domains/ai/structured-chat.ts b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+index 6510d37c8..269727d42 100644
+--- a/apps/web/src/lib/server/domains/ai/structured-chat.ts
++++ b/apps/web/src/lib/server/domains/ai/structured-chat.ts
+@@ -105,11 +105,40 @@ export interface StructuredChatInput<S extends z.ZodType> {
+   middleware?: ChatMiddleware[]
+ }
+ 
++/**
++ * `chat({ outputSchema })` uses the adapter's `structuredOutputStream` whenever
++ * it exists, so every structured call goes out as `json_schema` + `stream: true`.
++ * Some OpenAI-compatible servers (Cloudflare Workers AI, for one) ignore the
++ * schema while streaming and return text such as `{"results":}` that never
++ * parses. `AI_STRUCTURED_OUTPUT_STREAM=false` hides the streaming method, so
++ * `chat()` falls back to the adapter's one-shot `structuredOutput` with
++ * `stream: false`. Unset keeps today's behaviour.
++ */
++export function withStructuredOutputStreaming<A extends object>(
++  adapter: A,
++  streaming: boolean | undefined
++): A {
++  if (streaming !== false) return adapter
++  return new Proxy(adapter, {
++    get(target, prop, receiver) {
++      // @tanstack/ai 1.x first asks supportsCombinedToolsAndSchema() and, when it answers true,
++      // sends the schema inside the regular streamed chatStream request, bypassing both
++      // structuredOutputStream and structuredOutput. Hide it too so the engine takes the
++      // finalization path, which falls back to the one-shot structuredOutput (stream: false).
++      if (prop === 'structuredOutputStream' || prop === 'supportsCombinedToolsAndSchema') return undefined
++      return Reflect.get(target, prop, receiver)
++    },
++  })
++}
++
+ export async function structuredChat<S extends z.ZodType>(
+   input: StructuredChatInput<S>
+ ): Promise<z.infer<S>> {
+   const baseURL = config.openaiBaseUrl!
+-  const adapter = openaiCompatibleText(input.model, getOpenAIClientOptions(config))
++  const adapter = withStructuredOutputStreaming(
++    openaiCompatibleText(input.model, getOpenAIClientOptions(config)),
++    config.aiStructuredOutputStream
++  )
+   const common = {
+     adapter,
+     messages: input.messages,
+diff --git a/apps/web/src/lib/server/domains/assistant/__tests__/synthesis-core.tanstack-contract.test.ts b/apps/web/src/lib/server/domains/assistant/__tests__/synthesis-core.tanstack-contract.test.ts
+index 81165b58c..c8392e7db 100644
+--- a/apps/web/src/lib/server/domains/assistant/__tests__/synthesis-core.tanstack-contract.test.ts
++++ b/apps/web/src/lib/server/domains/assistant/__tests__/synthesis-core.tanstack-contract.test.ts
+@@ -96,8 +96,11 @@ function stubProvider(replies: Array<(body: Body) => Response>): void {
+   bodies = []
+   vi.stubGlobal(
+     'fetch',
+-    vi.fn(async (_url: unknown, init?: RequestInit) => {
+-      const body = JSON.parse(String(init?.body)) as Body
++    vi.fn(async (input: unknown, init?: RequestInit) => {
++      // The iPLAYCAFE no-train transport (getOpenAIClientOptions) passes a Request with the body
++      // inside it instead of (url, init); read whichever the SDK path produced.
++      const raw = init?.body ?? (input instanceof Request ? await input.text() : undefined)
++      const body = JSON.parse(String(raw)) as Body
+       bodies.push(body)
+       const reply = replies.shift()
+       if (!reply) throw new Error('unexpected extra provider request')
+@@ -174,7 +177,7 @@ describe('synthesis-core on the real TanStack AI engine', () => {
+       'stream',
+       'stream_options',
+     ])
+-    expect(bodies[0].provider).toEqual({ require_parameters: true })
++    expect(bodies[0].provider).toEqual({ require_parameters: true, data_collection: 'deny' })
+   })
+ 
+   it('runs the tool loop and the structured finalization as separate requests', async () => {
+@@ -356,3 +359,53 @@ describe('requests to api.openai.com', () => {
+     expect(bodies[0]).not.toHaveProperty('provider')
+   })
+ })
++
++// iPLAYCAFE: the portals run with AI_STRUCTURED_OUTPUT_STREAM=false (controller ai-adapter.ts), which
++// patch 04 implements by hiding the adapter's structuredOutputStream so the engine falls back to the
++// one-shot structuredOutput. Hold that path, and the prompt-only { text } fallback, to the real engine.
++describe('structuredChat with AI_STRUCTURED_OUTPUT_STREAM=false on the real TanStack AI engine', () => {
++  beforeEach(() => {
++    ;(mockConfig as Record<string, unknown>).aiStructuredOutputStream = false
++  })
++  afterEach(() => {
++    delete (mockConfig as Record<string, unknown>).aiStructuredOutputStream
++  })
++
++  it('sends a one-shot json_schema request and returns the validated object', async () => {
++    stubProvider([(body) => (body.stream ? sse([delta({ role: 'assistant', content: '{"text":"no"}' }), delta({}, 'stop'), USAGE]) : completion('{"text":"ok"}'))])
++
++    const result = await structuredChat({
++      model: 'm-nonstream',
++      systemPrompts: ['sys'],
++      messages: [{ role: 'user', content: 'hi' }],
++      schema: OutputSchema,
++      maxTokens: 100,
++    })
++
++    expect(result).toEqual({ text: 'ok' })
++    expect(bodies).toHaveLength(1)
++    expect(bodies[0].stream).toBeFalsy()
++    expect(bodies[0]).toHaveProperty('response_format')
++  })
++
++  it('falls back to the prompt-described schema and reads the { text } result', async () => {
++    const rejection = () =>
++      new Response(
++        JSON.stringify({ error: { message: 'response_format json_schema is not supported', param: 'response_format' } }),
++        { status: 400, headers: { 'content-type': 'application/json' } }
++      )
++    stubProvider([rejection, (body) => (body.stream ? sse([delta({ role: 'assistant', content: '{"text":"ok"}' }), delta({}, 'stop'), USAGE]) : completion('{"text":"ok"}'))])
++
++    const result = await structuredChat({
++      model: 'm-nonstream-fallback',
++      systemPrompts: ['sys'],
++      messages: [{ role: 'user', content: 'hi' }],
++      schema: OutputSchema,
++      maxTokens: 100,
++    })
++
++    expect(result).toEqual({ text: 'ok' })
++    expect(bodies).toHaveLength(2)
++    expect(bodies[1].response_format).toEqual({ type: 'json_object' })
++  })
++})

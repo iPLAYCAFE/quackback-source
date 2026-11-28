@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "releaseId": "0.16.1-void.unified28-20261129",
+  "upstream": {
+    "repository": "https://github.com/QuackbackIO/quackback.git",
+    "tag": "v0.16.1",
+    "commit": "02fc3c8a665ccdc70702df4ce106cfb515519b0c",
+    "appVersion": "0.16.1",
+    "widgetSdkVersion": "0.1.6",
+    "bunLockSha256": "c816dc59d2010fb758dfc804b0545134470a3692feb49869e48025067fb242cf"
+  },
+  "toolchain": {
+    "bun": "1.4.5",
+    "buildImage": "oven/bun:1.4.5@sha256:3aa040e5445efa09d75bb428a64ba50db13e2b3ac9b6b0c7f145615f62b2ee18",
+    "runImage": "oven/bun:1.4.5-alpine@sha256:da816670775f4c2b4e990b6b1847cf5540dcdc721a42033dd331ce7a88ba6a3b",
+    "dockerfile": "apps/web/Dockerfile"
+  },
+  "overlayProfile": "unified28-workers-ai",
+  "schemaDigest": "30e3cc8faa7a361251e77df705fac9cb21d860cfb8f2f90d3a3173a52e02aaf0",
+  "ledgerLength": 308,
+  "servedImageDigest": "sha256:cb3984b213cc287fe44f58affa9a3331af83b186c15cc703024c9f36aafb1957",
+  "servedAt": "all five iPLAYCAFE and brand feedback portals: feedback.iplaycafe.dev, feedback.iplaycafe.app, feedback.rerolla.store, feedback.qcaddy.app, feedback.paikaan.app (2026-11-29)",
+  "patches": [
+    {
+      "order": 1,
+      "file": "patches/01-build-image-pins.patch",
+      "overlayId": null,
+      "sha256": "0cffa40c7779f6bc4a0930317c231096949da5c0fda9b65312eb731d156e3146",
+      "summary": "Digest-pinned oven/bun 1.4.5 build and alpine runtime base images",
+      "status": "public"
+    },
+    {
+      "order": 2,
+      "file": "patches/02-unified-platform-overlay.patch",
+      "overlayId": "unified",
+      "sha256": "1d4ca8c87607d9ac05961594962bbc1ee9076b2c34565e15a485592ba037a32f",
+      "summary": "Unified Void platform overlay over v0.16.1 02fc3c8a (cookieless Layer-1 analytics, zero-cookie tracker, outputBudgetOptions+classificationModelOptions, Drizzle 0324_changelog_announce_on_launcher idx 307)",
+      "status": "public"
+    },
+    {
+      "order": 3,
+      "file": "patches/03-mail-issuance-expires-iso.patch",
+      "overlayId": "mailfix",
+      "sha256": "0c6ce376d04880318f1341d0eeb37fde15da632f4b47911fab65919bba384282",
+      "summary": "Serialize email link/token expiry dates with .toISOString() across mail dispatch",
+      "status": "public"
+    },
+    {
+      "order": 4,
+      "file": "patches/04-ai-structured-output-nonstream.patch",
+      "overlayId": "ai-nonstream",
+      "sha256": "0a757d03478809493ecc8e4feb4062360759edec7972a79d807f1cdda609917a",
+      "summary": "Add AI_STRUCTURED_OUTPUT_STREAM=false option for one-shot structured chat output and its @tanstack/ai 1.x contract tests",
+      "status": "public"
+    },
+    {
+      "order": 5,
+      "file": "patches/06-api-mcp-list-suggestions.patch",
+      "overlayId": "list-suggestions",
+      "sha256": "a2d23dffb236f009c7a76bbddf3f23f82ab115dde4a63d5e6aae9495f825d46a",
+      "summary": "Add GET /api/v1/suggestions public REST endpoint and MCP list_suggestions tool",
+      "status": "public"
+    },
+    {
+      "order": 6,
+      "file": null,
+      "overlayId": null,
+      "sha256": "e57115d3bd6d9b2eff9733e44210bc9c451c959c0fbdbbbb29e0cdad84e3fc99",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "security embargo"
+    },
+    {
+      "order": 7,
+      "file": null,
+      "overlayId": null,
+      "sha256": "e3e45ee5670b71a12302cdc48a742b4db1f6b5730de4f7cf399cb4ce9c04ee53",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "security embargo"
+    },
+    {
+      "order": 8,
+      "file": null,
+      "overlayId": null,
+      "sha256": "e72dbdc690d02aca2ce6c663a2458c8d405de882f3e85dd840d2d1deff106906",
+      "summary": "Withheld under coordinated disclosure; published when the embargo ends.",
+      "status": "withheld",
+      "reason": "depends on, and describes, a patch under security embargo"
+    },
+    {
+      "order": 9,
+      "file": "patches/10-customer-agent-same-origin-proxy.patch",
+      "overlayId": "customer-agent-same-origin",
+      "sha256": "0c6e358f11c24a8888e78fce12b925b6136f204d8184116f2b8472e6c92db2a6",
+      "summary": "Allow same-origin /__ipc-ai/v1 customer agent endpoint gated by request BASE_URL origin",
+      "status": "public"
+    },
+    {
+      "order": 10,
+      "file": "patches/11-status-projection-batch-updates.patch",
+      "overlayId": "status-batch-updates",
+      "sha256": "de88a5c926e6862637560d6bdf9650a28d85cb80691ec59b622f4b87d4ccf7fa",
+      "summary": "Batch-fetch status_incident_updates once in projectIncidents to eliminate N+1 SSR latency on regional PG",
+      "status": "public"
+    },
+    {
+      "order": 11,
+      "file": "patches/12-generated-and-authz-coverage.patch",
+      "overlayId": "generated-authz",
+      "sha256": "0e0be9c53e7f975f476fea0a0d00160ca0f9fe46bb2b17eda9385ed203b96d5d",
+      "summary": "Regenerate MATRIX.md and platform-schema.generated.json on unified28; classify native launcher host entry point and count list_suggestions in upstream authz guards",
+      "status": "public"
+    },
+    {
+      "order": 12,
+      "file": "patches/14-ai-error-taxonomy.patch",
+      "overlayId": "ai-error-taxonomy",
+      "sha256": "0daceb050ca1a6a041bb8fd4dd4d0bb1ac3db37ac1046a9128ec3eb22a6a0c0d",
+      "summary": "Emit strict enumerated error taxonomy {httpStatus, errorClass, finishReason, attempt, stage} from safeAIError with zero free-form text (T4)",
+      "status": "public"
+    },
+    {
+      "order": 13,
+      "file": "patches/15-zero-anonymous-guards.patch",
+      "overlayId": "zero-anonymous-guards",
+      "sha256": "7f25bcc14e759d1d0b08001ad721e57b618a6e931f77882eea1270853cc9e990",
+      "summary": "Enforce Zero-Anonymous session guards in conversation server functions and POST /api/widget/kb-ask (returns 403 ANONYMOUS_DISABLED when anonymous access is disabled)",
+      "status": "public"
+    },
+    {
+      "order": 14,
+      "file": "patches/16-widget-sign-in-to-chat.patch",
+      "overlayId": "widget-sign-in-to-chat",
+      "sha256": "d80db61c592dff35c451c7d43ff3aea206a31dd30e325c8b6793a4fcde35a33c",
+      "summary": "Widget shows \"Sign in to chat\" and emits auth-required when anonymous access is off and the visitor is not identified; readable 413 (Over N MB) and 403 ANONYMOUS_DISABLED upload refusals",
+      "status": "public"
+    },
+    {
+      "order": 15,
+      "file": "patches/17-native-host-contract-v2.patch",
+      "overlayId": "native-host-contract-v2",
+      "sha256": "996c31fe4fbcfbc3c6337b9b2ad2de4650385626af5ce370c7a1ce3b442cd18e",
+      "summary": "Native host accepts iplaycafe.feedback/native-1 and native-2 contracts with synchronous fast-path retireIfActive when no native session is active",
+      "status": "public"
+    }
+  ],
+  "complete": false
+}
